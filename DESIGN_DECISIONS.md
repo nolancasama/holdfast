@@ -502,3 +502,121 @@ not against voices already sounding, so a full voice cap would starve player
 damage. It is unreachable at current rate limits - a 36-enemy siege peaks at 9
 of 18 voices and 5 player hits produced 5 damage cues - so it is recorded as a
 latent risk rather than fixed.
+
+---
+
+## 2026-09-17 — Road exposure pass
+
+### D48 — Road geometry is judged by tower exposure, not by shape
+**Decision:** a road feature succeeds only if a buildable tower site near it can
+shoot at an enemy walking that road for substantially longer than beside a
+straight road. Visual complexity (reversals, bends, self-approach) earns nothing.
+D41's "sustained direction reversal" check is retired as a success criterion.
+**Why (measured before any change, 6 seeds):**
+1. The knots have three generator causes. Seeded waypoints off the eventual route
+   make a leg go out to the waypoint and return along its own cheap road, leaving
+   dead-end stubs. Routes carved separately snap together through short parallel
+   strands and small triangular junction loops. And D41's test counted vertical
+   reversals, which a stub satisfies, so the test rewarded exactly the stubs.
+2. The bends buy nothing. The best buildable site on every seed saw 16-20 tiles
+   of enemy path within range and line of sight; a tower beside a straight road
+   already sees ~14.5. No map had a single site at 1.75x the straight baseline.
+3. Enemies do not walk an open U-turn. Lane fields price road at 0.32 and open
+   ground at 1.0, so an enemy crosses a U at its neck whenever that is cheaper
+   than walking round, which for any long U is always. Synthetic check, legs
+   running to the map edge: a U with plain or marsh inside - enemy cuts across at
+   the neck, 0 tiles of exposure at the interior site. The same U with a one-tile
+   deep-water or cliff spine inside, stopping 5 tiles short of the bend - enemy
+   follows 94-100% on road, best pocket site 23-33 tiles (1.6-2.3x straight).
+**Consequence:** a real hairpin, switchback or horseshoe needs an impassable
+spine (rock spur, water inlet, river) between its legs from the neck to near the
+bend, and the tower site is the pocket past the spine's tip. This is terrain
+causality, not a TD track template: roads wrap round the tip of an obstacle they
+cannot cross.
+**Rejected:** strengthening the lane discount so enemies stay on any bend (changes
+all pathing and road adherence globally); hairpin/bend damage bonuses (the brief
+forbids them, and they would hide a geometry that does not work); marsh-filled
+bend interiors (measured: enemies still cut the neck).
+
+### D49 — How road exposure is measured
+**Decision:**
+- *Exposure of a site* = the length of path an enemy actually walks that lies
+  within base weapon range (level-0 `TOWER.weapon.range`) of the site AND in line
+  of sight from it (`hasLineOfSight`: cliffs, forest-unless-above). Summed per
+  segment at segment midpoints.
+- *The path an enemy actually walks* is not the carved route polyline, which can
+  contain stubs and detours enemies skip. For each road route passing near a
+  site, take the route window around the site (extended by a margin) and trace
+  the lane-field descent between the window's ends. A cut-across or an unused
+  stub therefore scores what it is actually worth.
+- A site counts only if it passes the terrain part of tower placement (footprint
+  not cliff, deep water or road; not too steep) - the same rules `canPlaceAt`
+  uses, from one shared function so they cannot drift.
+- *Straight baseline* = the chord a straight road gives a tower 2 tiles from its
+  centreline: 2*sqrt(R^2 - 2^2), ~14.5 tiles at R 7.5. Derived from range, not
+  hard-coded.
+- *Useful* >= 1.35x baseline; *strong* >= 1.75x. Strong sites within 8 tiles are
+  one feature.
+- *Knot* = a dead-end road stub, a small enclosed loop, or a braid (strands 0-1
+  tiles apart running alongside). Defects within 6 tiles are one knot.
+**Why:** it answers the brief's question directly - how long would an enemy on
+this road stay targetable from here - and it cannot be satisfied by shape alone.
+
+### D50 — Exposure windows and feature labels use deterministic geometric heuristics
+**Decision:** when one route passes a site more than once, its measurement window
+runs from the first nearby route point to the last, then expands by the D49 point
+margin. This deliberately retains both legs and the intervening bend so lane
+descent can expose a neck shortcut. Debug `counted` ranges are inclusive segment
+index ranges. Feature labels use
+counted segment headings: antiparallel means at least 150 degrees, horseshoe
+radius variation may be at most 28% of its mean, and label priority is switchback,
+horseshoe, hairpin, s-bend, terrain-loop, bend. Defect and feature clustering is
+deterministic in scan/score order.
+**Why:** D49 specifies the measurements and label meanings but leaves these
+boundary cases and the meaning of debug index ranges open. Fixing them here keeps
+the report, tests and future overlay consistent without affecting generation.
+
+### D51 — Knots are removed at their cause, then cleaned up locally
+**Decision:** after the road network is carved, every route and connector path
+has its out-and-back revisits erased, the road layer is rebuilt from those
+paths, remaining dead ends are pruned, and near each remaining small loop or
+braid one path is moved onto road another path already provides - kept only if
+the D49 knot count falls.
+**Why:** measured. Stubs came from seeded waypoints: a leg went out to the
+waypoint and returned along its own road, and the stored route kept both
+directions. Loop erasure alone took the 20 test seeds from 1-8 knots each to 0
+on 13; the local merge takes it to 0 on 18 (GOLF and KILO keep one small loop).
+Some parallel "runs" the D44 gate counted were braids, so a few seeds now need
+more regeneration attempts to pass it.
+**Rejected:** rewriting the carve costs to prevent near-parallel strands (a
+global change to every road for a local defect).
+
+### D52 — Exposure features are laid round an authored spine, after validation
+**Decision:** once a map's road network validates, up to 2-4 exposure features
+are attempted. Each stamps a short impassable spine - a rock spur or a water
+inlet - across a straight road stretch and re-lays that stretch (for every route
+sharing it) as an explicit U round the spine's tip: legs ~8 tiles apart, bend
+~5 past the tip, the bend interior cleared to buildable ground. A feature is
+kept only if the D49 measurement finds a strong (>= 1.75x) readable buildable
+site there, enemies' walked lane through it is >= 90% road, no knot appears and
+the map still validates; otherwise the snapshot is restored exactly. Feature
+placement never reads deposits or income.
+**Why:** D48 showed a U needs a spine or enemies cut its neck. Three things were
+tried and measured before this shape:
+1. A whole-map gate requiring 2-4 features (Codex attempt) forced regeneration
+   and took ~9s per map. Authoring after validation undoes a failed feature
+   locally instead.
+2. Letting the carve pathfinder route round the spine failed two ways: distant
+   cheap road beat rounding the tip (the stretch simply merged elsewhere), and
+   when confined it hugged the spine so tightly no 3-tile tower footprint fit
+   (best site 1.19x).
+3. With the U laid explicitly, every attempt that got past the geometry checks
+   was strong (1.75-2.25x). Supply of free space is the limit, not quality.
+**Result (20 test seeds, shipped as-is at the user's request):** strong
+features per map 0-4 - 9 maps have 2-4, 6 have 1, 5 have 0; best-site ratios on
+maps with a feature 1.78-2.25x against a 14.46-tile straight baseline. Enemy
+lanes stay 95-98% on road (was 94-97%). Generation mean ~470ms, max ~1.1s
+(was ~100ms / 420ms).
+**Known gaps:** 5 of 20 maps get no strong feature (crowded roads leave no room
+for a U); no debug overlay for exposure was built; the D41 reversal test was not
+replaced by exposure tests; feature counts are not a validation requirement.

@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-09-16 (third implementation pass)
+Last updated: 2026-09-17 (road exposure pass, shipped as-is)
 
 ## What this is
 
@@ -168,6 +168,23 @@ reminds quietly every 2.6s, and is silent while paused.
 originally worked). Contested dash: 8t covered 29 HP lost, 13t covered 25, 20t
 uncovered 53, 28t uncovered dead.
 
+## Road exposure pass - measured, 2026-09-17 (shipped as-is)
+
+Road shape is now judged by how long a tower can shoot enemies walking it
+(D48-D52), not by how twisty it looks. `npm test`: 48 passed. `npm run
+road-report` prints per-seed features, exposure ratios and knot counts.
+
+- **Knots:** before, every one of the 20 test seeds had 1-8 (stubs, small
+  loops, braids). Now 18 have 0; GOLF and KILO keep one small loop each.
+- **Exposure features:** rock-spur and water-inlet hairpins/horseshoes. Straight
+  road baseline 14.46 tiles of path in range. Strong features per map 0-4
+  (9 maps with 2-4, 6 with 1, 5 with 0); best ratios 1.78-2.25x where present.
+  Before the pass, 18 of 20 maps had no strong site at all.
+- **Enemies still use roads:** walked lanes 95-98% on road on 7 seeds.
+- **Generation time:** mean ~470ms, max ~1.1s (was ~100ms / 420ms).
+- Browser smoke: game loads and plays waves on NOVEMBER with no console errors;
+  hairpins read clearly at full-map scale.
+
 ## Acceptance status and known risks
 
 1. **Elevation's advantage is real but not obvious.** Where forest is present,
@@ -190,11 +207,20 @@ uncovered 53, 28t uncovered dead.
 5. From the previous pass: a long uncovered run kills about a quarter of the
    time rather than "usually"; waves run 56-118s.
 
+6. **Road exposure pass is partial (shipped as-is).** 5 of 20 test maps get no
+   strong exposure feature; no in-game debug overlay shows exposure; the old
+   D41 reversal test was not replaced with exposure/knot tests; GOLF and KILO
+   keep one small road loop. Map generation is ~4x slower (max ~1.1s).
+
 ## Next steps
 
-1. Play it by hand, with sound on. The unanswered questions are all about feel.
-2. If elevation should read as an advantage, the honest lever is terrain, not
+1. Play it by hand, with sound on. The unanswered questions are all about feel,
+   and now also whether the hairpin tower sites feel worth taking.
+2. Road exposure follow-ups (D52 known gaps): more feature supply on crowded
+   maps, exposure debug overlay, replace the D41 reversal test with knot and
+   exposure tests.
+3. If elevation should read as an advantage, the honest lever is terrain, not
    stats: keep more high ground clear of ridge shoulders so it is not
    self-blinded.
-3. If the map reads as cluttered in a big wave, cull richness bars during combat
+4. If the map reads as cluttered in a big wave, cull richness bars during combat
    before removing anything else.

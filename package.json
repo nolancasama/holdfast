@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node test/run-tests.js",
     "start": "node serve.js",
-    "artifact": "node generate-artifact.js"
+    "artifact": "node generate-artifact.js",
+    "road-report": "node tools/road-report.js"
   }
 }

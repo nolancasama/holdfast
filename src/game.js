@@ -6,7 +6,7 @@ import {
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
-  kindAt, elevAt, hasLineOfSight, hasClearWalk,
+  kindAt, elevAt, hasLineOfSight, hasClearWalk, isTerrainBuildable,
 } from './terrain.js';
 import { computeField, steer } from './flowfield.js';
 
@@ -118,24 +118,7 @@ export function towerCost(g) {
 
 export function canPlaceAt(g, x, y) {
   const reasons = [];
-  const r = TOWER.radius;
-  let minE = 9;
-  let maxE = -1;
-
-  for (let ty = Math.floor(y - r); ty <= Math.ceil(y + r); ty++) {
-    for (let tx = Math.floor(x - r); tx <= Math.ceil(x + r); tx++) {
-      if (Math.hypot(tx + 0.5 - x, ty + 0.5 - y) > r + 0.3) continue;
-      if (!inBounds(tx, ty)) { reasons.push('off the map'); continue; }
-      const k = kindAt(g.map, tx, ty);
-      if (k === T.CLIFF) reasons.push('cliff');
-      else if (k === T.DEEP) reasons.push('deep water');
-      if (g.map.road[idx(tx, ty)]) reasons.push('on the road');
-      const e = elevAt(g.map, tx, ty);
-      minE = Math.min(minE, e);
-      maxE = Math.max(maxE, e);
-    }
-  }
-  if (maxE - minE > 1) reasons.push('ground too steep');
+  isTerrainBuildable(g.map, x, y, reasons);
 
   for (const t of g.towers) {
     if (Math.hypot(t.x - x, t.y - y) < TOWER.minSpacing) {

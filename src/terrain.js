@@ -1,10 +1,11 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, richnessTierForRate,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, EXPOSURE_GEN, richnessTierForRate,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
 import { findCostPath } from './flowfield.js';
+import { analyseRoadKnots, findExposureFeatures, measureSiteExposure } from './roadexposure.js';
 
 export const idx = (x, y) => y * MAP.w + x;
 export const inBounds = (x, y) => x >= 0 && y >= 0 && x < MAP.w && y < MAP.h;
@@ -322,6 +323,31 @@ function placeDeposits(map, rng, start) {
   return deposits;
 }
 
+/** The terrain-only half of tower placement (D49).
+ * Passing an array is used by canPlaceAt to retain its exact refusal strings.
+ */
+export function isTerrainBuildable(map, x, y, reasons = null) {
+  const failures = reasons || [];
+  const r = TOWER.radius;
+  let minE = 9;
+  let maxE = -1;
+  for (let ty = Math.floor(y - r); ty <= Math.ceil(y + r); ty++) {
+    for (let tx = Math.floor(x - r); tx <= Math.ceil(x + r); tx++) {
+      if (Math.hypot(tx + 0.5 - x, ty + 0.5 - y) > r + 0.3) continue;
+      if (!inBounds(tx, ty)) { failures.push('off the map'); continue; }
+      const k = kindAt(map, tx, ty);
+      if (k === T.CLIFF) failures.push('cliff');
+      else if (k === T.DEEP) failures.push('deep water');
+      if (map.road[idx(tx, ty)]) failures.push('on the road');
+      const e = elevAt(map, tx, ty);
+      minE = Math.min(minE, e);
+      maxE = Math.max(maxE, e);
+    }
+  }
+  if (maxE - minE > 1) failures.push('ground too steep');
+  return failures.length === 0;
+}
+
 function carveRoadPath(map, path) {
   const mark = (i) => {
     if (!PASSABLE[map.kind[i]]) return;
@@ -437,6 +463,7 @@ function parallelWaypoint(map, mouth, side, ordinal) {
 function buildRoadNetwork(map, rng) {
   const centreI = idx(map.roadCenter.x, map.roadCenter.y);
   map.roadRoutes = [];
+  map.roadConnectorPaths = [];
   for (const side of ['west', 'east']) {
     const mouths = map.spawns[side];
     // Three west and two east approaches make 3+ road-run columns a normal
@@ -478,9 +505,164 @@ function buildRoadNetwork(map, rng) {
     const to = roadPointInGap(map, barrier, used[Math.floor(rng() * used.length)]);
     if (to < 0) continue;
     const path = findCostPath(map, from, to);
-    if (path.length) { carveRoadPath(map, path); made++; }
+    if (path.length) { carveRoadPath(map, path); map.roadConnectorPaths.push(path); made++; }
   }
   map.roadConnectors = made;
+  cleanRoadNetwork(map);
+}
+
+/**
+ * D51: a route that visits a waypoint and comes back along its own road keeps
+ * the out-and-back tiles in its path and on the map as a dead-end stub. Erase
+ * those revisits, rebuild the road layer from what enemies can actually follow,
+ * then prune any dead end that is still left.
+ */
+function eraseLoops(path) {
+  const out = [];
+  const at = new Map();
+  for (const i of path) {
+    if (at.has(i)) {
+      const keep = at.get(i);
+      for (let k = keep + 1; k < out.length; k++) at.delete(out[k]);
+      out.length = keep + 1;
+    } else {
+      at.set(i, out.length);
+      out.push(i);
+    }
+  }
+  return out;
+}
+
+function rebuildRoadLayer(map) {
+  map.road.fill(0);
+  for (const route of map.roadRoutes) carveRoadPath(map, route.path);
+  for (const path of map.roadConnectorPaths) carveRoadPath(map, path);
+}
+
+function roadDegree(map, x, y) {
+  let n = 0;
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      if ((ox || oy) && inBounds(x + ox, y + oy) && map.road[idx(x + ox, y + oy)]) n++;
+    }
+  }
+  return n;
+}
+
+function protectedRoadEnd(map, x, y) {
+  if (x <= 2 || y <= 2 || x >= MAP.w - 3 || y >= MAP.h - 3) return true;
+  if (Math.hypot(x - map.roadCenter.x, y - map.roadCenter.y) <= 2) return true;
+  return [...map.spawns.west, ...map.spawns.east].some((m) => Math.hypot(x - m.x, y - m.y) <= 2);
+}
+
+function pruneDeadEnds(map) {
+  for (let changed = true; changed;) {
+    changed = false;
+    for (let y = 0; y < MAP.h; y++) {
+      for (let x = 0; x < MAP.w; x++) {
+        const i = idx(x, y);
+        if (!map.road[i] || roadDegree(map, x, y) > 1 || protectedRoadEnd(map, x, y)) continue;
+        map.road[i] = 0;
+        changed = true;
+      }
+    }
+  }
+  // Paths must stay on road: drop connector paths that pruning emptied.
+  const onRoad = (path) => path.every((i) => map.road[i]);
+  map.roadConnectorPaths = map.roadConnectorPaths.filter(onRoad);
+}
+
+/** Shortest 8-neighbour walk that stays on road tiles and avoids `forbidden`. */
+function roadOnlyPath(map, from, to, forbidden) {
+  const dist = new Float32Array(MAP.w * MAP.h).fill(Infinity);
+  const prev = new Int32Array(MAP.w * MAP.h).fill(-1);
+  const open = [from];
+  dist[from] = 0;
+  while (open.length) {
+    let bi = 0;
+    for (let k = 1; k < open.length; k++) if (dist[open[k]] < dist[open[bi]]) bi = k;
+    const i = open[bi];
+    open[bi] = open[open.length - 1];
+    open.pop();
+    if (i === to) break;
+    const x = i % MAP.w;
+    const y = (i / MAP.w) | 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        if (!ox && !oy) continue;
+        const nx = x + ox;
+        const ny = y + oy;
+        if (!inBounds(nx, ny)) continue;
+        const ni = idx(nx, ny);
+        if (!map.road[ni] || forbidden.has(ni)) continue;
+        const nd = dist[i] + (ox && oy ? Math.SQRT2 : 1);
+        if (nd < dist[ni]) {
+          if (dist[ni] === Infinity) open.push(ni);
+          dist[ni] = nd;
+          prev[ni] = i;
+        }
+      }
+    }
+  }
+  if (!Number.isFinite(dist[to])) return null;
+  const out = [to];
+  for (let i = to; i !== from; i = prev[i]) out.push(prev[i]);
+  return out.reverse();
+}
+
+/**
+ * D51: small loops and braids appear where two separately carved paths run a
+ * tile or two apart. Near each remaining knot, try moving one path onto road
+ * another path already provides, dropping the tiles only it was using. Keep the
+ * change only if the knot count falls.
+ */
+function mergeKnottedPaths(map) {
+  const paths = () => [...map.roadRoutes.map((r) => r.path), ...map.roadConnectorPaths];
+  const setPath = (n, path) => {
+    if (n < map.roadRoutes.length) map.roadRoutes[n].path = path;
+    else map.roadConnectorPaths[n - map.roadRoutes.length] = path;
+  };
+  let knots = analyseRoadKnots(map);
+  for (let pass = 0; pass < 12 && knots.count; pass++) {
+    let improved = false;
+    for (const knot of knots.knots) {
+      const all = paths();
+      const usage = new Map();
+      for (const p of all) for (const i of new Set(p)) usage.set(i, (usage.get(i) || 0) + 1);
+      const near = (i) => Math.hypot(i % MAP.w + 0.5 - knot.x, ((i / MAP.w) | 0) + 0.5 - knot.y) <= 7;
+      for (let n = 0; n < all.length && !improved; n++) {
+        const p = all[n];
+        let k0 = -1;
+        let k1 = -1;
+        for (let k = 0; k < p.length; k++) if (near(p[k])) { if (k0 < 0) k0 = k; k1 = k; }
+        if (k0 < 0 || k1 - k0 < 2) continue;
+        k0 = Math.max(0, k0 - 2);
+        k1 = Math.min(p.length - 1, k1 + 2);
+        const forbidden = new Set();
+        for (let k = k0 + 1; k < k1; k++) if (usage.get(p[k]) === 1) forbidden.add(p[k]);
+        if (!forbidden.size) continue;
+        const detour = roadOnlyPath(map, p[k0], p[k1], forbidden);
+        if (!detour) continue;
+        const saved = { road: map.road.slice(), path: p };
+        setPath(n, eraseLoops([...p.slice(0, k0), ...detour, ...p.slice(k1 + 1)]));
+        rebuildRoadLayer(map);
+        pruneDeadEnds(map);
+        const after = analyseRoadKnots(map);
+        if (after.count < knots.count) { knots = after; improved = true; }
+        else { setPath(n, saved.path); map.road.set(saved.road); }
+      }
+      if (improved) break;
+    }
+    if (!improved) break;
+  }
+}
+
+function cleanRoadNetwork(map) {
+  for (const route of map.roadRoutes) route.path = eraseLoops(route.path);
+  map.roadConnectorPaths = map.roadConnectorPaths.map(eraseLoops);
+  rebuildRoadLayer(map);
+  pruneDeadEnds(map);
+  mergeKnottedPaths(map);
 }
 
 function measureParallelRoadRoutes(map) {
@@ -576,8 +758,276 @@ function buildMap(rng) {
   map.waterDist = waterDistance(map, ROAD.riverCheapRadius);
   buildRoadNetwork(map, rng);
   keepStartTowerOffRoad(map, start);
+  // D52: exposure features are authored only onto a network that already
+  // validates, so a failed feature is undone locally instead of costing a
+  // whole regenerated map.
+  map.exposureFeatures = [];
+  if (validateMap(map).ok) authorExposureFeatures(map, rng);
   map.deposits = placeDeposits(map, rng, start);
   return map;
+}
+
+function snapshotRoads(map) {
+  return {
+    kind: map.kind.slice(), elev: map.elev.slice(), road: map.road.slice(),
+    routes: map.roadRoutes.map((r) => r.path), connectors: [...map.roadConnectorPaths],
+  };
+}
+
+function restoreRoads(map, s) {
+  map.kind.set(s.kind); map.elev.set(s.elev); map.road.set(s.road);
+  map.roadRoutes.forEach((r, n) => { r.path = s.routes[n]; });
+  map.roadConnectorPaths = [...s.connectors];
+}
+
+const tileXY = (i) => ({ x: i % MAP.w, y: (i / MAP.w) | 0 });
+
+/** Candidate spots: straight, single-use stretches of a route, away from the start and mouths. */
+function featureCandidates(map, rng) {
+  const usage = new Map();
+  for (const p of [...map.roadRoutes.map((r) => r.path), ...map.roadConnectorPaths]) {
+    for (const i of new Set(p)) usage.set(i, (usage.get(i) || 0) + 1);
+  }
+  const reach = EXPOSURE_GEN.segmentHalf;
+  const out = [];
+  map.roadRoutes.forEach((route, n) => {
+    const p = route.path;
+    for (let k = reach; k + reach < p.length; k += 2) {
+      const c = tileXY(p[k]);
+      const a = tileXY(p[k - 6]);
+      const b = tileXY(p[k + 6]);
+      if (c.x < 10 || c.x > MAP.w - 11 || c.y < 6 || c.y > MAP.h - 7) continue;
+      if (Math.hypot(c.x - map.start.x, c.y - map.start.y) < EXPOSURE_GEN.minFromStart) continue;
+      const h1 = Math.atan2(c.y - a.y, c.x - a.x);
+      const h2 = Math.atan2(b.y - c.y, b.x - c.x);
+      let turn = Math.abs(h2 - h1);
+      if (turn > Math.PI) turn = Math.PI * 2 - turn;
+      if (turn > 0.8) continue;
+      out.push({ route: n, k });
+    }
+  });
+  return shuffle(rng, out);
+}
+
+/** 8-connected tile line between two tile-space points (Bresenham). */
+function rasterLine(a, b) {
+  const out = [];
+  let x = Math.round(a.x);
+  let y = Math.round(a.y);
+  const x1 = Math.round(b.x);
+  const y1 = Math.round(b.y);
+  const dx = Math.abs(x1 - x);
+  const dy = Math.abs(y1 - y);
+  const sx = x < x1 ? 1 : -1;
+  const sy = y < y1 ? 1 : -1;
+  let err = dx - dy;
+  for (;;) {
+    out.push(inBounds(x, y) ? idx(x, y) : -1);
+    if (x === x1 && y === y1) return out;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x += sx; }
+    if (e2 < dx) { err += dx; y += sy; }
+  }
+}
+
+/**
+ * D52: a short impassable spine (rock spur or water inlet) is stamped across
+ * a straight route stretch, and that stretch is re-laid as a U round the
+ * spine's tip: out along one side, across past the tip, back along the other.
+ * D48 measured why the spine is essential - without it enemies cut the U's
+ * neck. The shape is laid explicitly rather than left to the carve pathfinder,
+ * which either ignored the detour (distant cheap road won) or hugged the spine
+ * too tightly to leave room for a tower. The result is kept only if the D49
+ * measurement finds a strong, readable, buildable site that enemies walk past.
+ * Returns 'cheap' for rejections made before anything was changed.
+ */
+function tryExposureFeature(map, rng, cand, sign, depth) {
+  const G = EXPOSURE_GEN;
+  const route = map.roadRoutes[cand.route];
+  const p = route.path;
+  const c = tileXY(p[cand.k]);
+  const a = tileXY(p[cand.k - 6]);
+  const b = tileXY(p[cand.k + 6]);
+  const dl = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const d = { x: (b.x - a.x) / dl, y: (b.y - a.y) / dl };
+  const n = { x: -d.y * sign, y: d.x * sign };
+
+  const kind = rng() < G.waterChance ? T.DEEP : T.CLIFF;
+  const at = (along, out) => ({ x: c.x + d.x * along + n.x * out, y: c.y + d.y * along + n.y * out });
+  const tileAt = (q) => (inBounds(Math.round(q.x), Math.round(q.y)) ? idx(Math.round(q.x), Math.round(q.y)) : -1);
+  const inside = (i) => {
+    if (i < 0) return false;
+    const { x, y } = tileXY(i);
+    return x >= 2 && y >= 2 && x <= MAP.w - 3 && y <= MAP.h - 3;
+  };
+
+  const spine = new Set();
+  for (let s = -G.rootBehind; s <= depth; s += 0.5) {
+    for (let w = 0; w < G.spineWidth; w++) {
+      const i = tileAt(at(w - (G.spineWidth - 1) / 2, s));
+      if (!inside(i)) { return 'cheap'; }
+      spine.add(i);
+    }
+  }
+
+  const bend = depth + G.bendBeyondTip;
+  // The re-laid stretch runs from the first route tile clear of the legs on
+  // one side to the first clear on the other, however curved the road is.
+  const along = (i) => { const q = tileXY(i); return (q.x - c.x) * d.x + (q.y - c.y) * d.y; };
+  let kFrom = -1;
+  for (let j = cand.k - 1; j >= Math.max(0, cand.k - G.segmentHalf); j--) {
+    if (along(p[j]) <= -G.legHalfGap - 2) { kFrom = j; break; }
+  }
+  let kTo = -1;
+  for (let j = cand.k + 1; j <= Math.min(p.length - 1, cand.k + G.segmentHalf); j++) {
+    if (along(p[j]) >= G.legHalfGap + 2) { kTo = j; break; }
+  }
+  if (kFrom < 0 || kTo < 0) { return 'cheap'; }
+  const from = p[kFrom];
+  const to = p[kTo];
+  const corners = [at(-G.legHalfGap, 0), at(-G.legHalfGap, bend), at(G.legHalfGap, bend), at(G.legHalfGap, 0)];
+  const points = [tileXY(from), ...corners, tileXY(to)];
+  const u = [];
+  for (let k = 1; k < points.length; k++) u.push(...rasterLine(points[k - 1], points[k]).slice(k > 1 ? 1 : 0));
+  if (new Set(u).size !== u.length) { return 'cheap'; }
+
+  // Find every path that uses this stretch. Each must carry it whole (either
+  // direction), or re-laying it would strand a partial overlap.
+  const stretch = p.slice(kFrom, kTo + 1);
+  const stretchSet = new Set(stretch);
+  const handles = [
+    ...map.roadRoutes.map((r) => ({ get: () => r.path, set: (v) => { r.path = v; } })),
+    ...map.roadConnectorPaths.map((_, m) => ({
+      get: () => map.roadConnectorPaths[m], set: (v) => { map.roadConnectorPaths[m] = v; },
+    })),
+  ];
+  const sharers = [];
+  for (const h of handles) {
+    const q = h.get();
+    if (!q.some((i) => stretchSet.has(i))) continue;
+    const fwd = q.indexOf(stretch[0]);
+    const rev = q.indexOf(stretch[stretch.length - 1]);
+    const matches = (start, list) => start >= 0 && list.every((i, m) => q[start + m] === i);
+    if (matches(fwd, stretch)) sharers.push({ ...h, start: fwd, reversed: false });
+    else if (matches(rev, [...stretch].reverse())) sharers.push({ ...h, start: rev, reversed: true });
+    else { return 'cheap'; }
+  }
+
+  const oldStretch = new Set();
+  // The sharing paths' own road just beyond the stretch is not "another" road.
+  const own = G.otherRoadClearance + 2;
+  for (const s of sharers) {
+    const q = s.get();
+    for (const i of q.slice(Math.max(0, s.start - own), s.start + stretch.length + own)) {
+      const { x, y } = tileXY(i);
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) if (inBounds(x + ox, y + oy)) oldStretch.add(idx(x + ox, y + oy));
+      }
+    }
+  }
+  const clearOfOtherRoad = (i, r) => {
+    const { x, y } = tileXY(i);
+    for (let oy = -r; oy <= r; oy++) {
+      for (let ox = -r; ox <= r; ox++) {
+        if (!inBounds(x + ox, y + oy)) continue;
+        const j = idx(x + ox, y + oy);
+        if (map.road[j] && !oldStretch.has(j)) return false;
+      }
+    }
+    return true;
+  };
+  for (const i of u) {
+    if (!inside(i) || spine.has(i) || !PASSABLE[map.kind[i]]) { return 'blocked'; }
+    if (!clearOfOtherRoad(i, G.otherRoadClearance)) { return 'cheap'; }
+  }
+  for (const i of spine) {
+    const { x, y } = tileXY(i);
+    if (Math.hypot(x - map.start.x, y - map.start.y) < GEN.startClearRadius + 4) { return 'cheap'; }
+    if (!clearOfOtherRoad(i, G.otherRoadClearance)) { return 'cheap'; }
+  }
+
+  const before = snapshotRoads(map);
+  const fail = () => { restoreRoads(map, before); return null; };
+  for (const i of spine) {
+    map.kind[i] = kind;
+    if (kind === T.DEEP) map.elev[i] = 0;
+  }
+  // Road builders clear the inside of a bend: open, level-enough ground where a
+  // tower can stand and see both legs.
+  const pocketI = tileAt(at(0, depth + G.pocketOffset));
+  const pocketElev = map.elev[pocketI];
+  for (let along = -G.legHalfGap + 1; along <= G.legHalfGap - 1; along += 0.5) {
+    for (let out = 1; out <= bend - 1; out += 0.5) {
+      const i = tileAt(at(along, out));
+      if (i < 0 || spine.has(i)) continue;
+      if (map.kind[i] === T.FOREST || map.kind[i] === T.MARSH) map.kind[i] = T.PLAIN;
+      if (out > depth && Math.abs(map.elev[i] - pocketElev) > 1) map.elev[i] = pocketElev;
+    }
+  }
+
+  // Every path sharing the stretch (a trunk several routes use) takes the U.
+  for (const s of sharers) {
+    const q = s.get();
+    const piece = s.reversed ? [...u].reverse() : u;
+    const next = [...q.slice(0, s.start), ...piece, ...q.slice(s.start + stretch.length)];
+    if (eraseLoops(next).length !== next.length) return fail();
+    for (let k = 1; k < next.length; k++) {
+      const q0 = tileXY(next[k - 1]);
+      const q1 = tileXY(next[k]);
+      if (q0.x !== q1.x && q0.y !== q1.y
+          && (!PASSABLE[map.kind[idx(q1.x, q0.y)]] || !PASSABLE[map.kind[idx(q0.x, q1.y)]])) return fail();
+    }
+    s.set(next);
+  }
+  rebuildRoadLayer(map);
+  pruneDeadEnds(map);
+
+  if (analyseRoadKnots(map).count) return fail();
+  const pocket = tileXY(pocketI);
+  const found = findExposureFeatures(map, { region: { x: pocket.x + 0.5, y: pocket.y + 0.5, r: bend + 2 } })
+    .filter((f) => f.tier === 'strong' && f.readable);
+  if (!found.length) return fail();
+  const best = found[0];
+  const walked = measureSiteExposure(map, best.x, best.y);
+  const onRoad = walked.walked.filter((q) => map.road[idx(Math.floor(q.x), Math.floor(q.y))]).length;
+  if (onRoad / walked.walked.length < G.minWalkedOnRoad) return fail();
+  if (!validateMap(map).ok) return fail();
+  return {
+    x: best.x, y: best.y, exposure: best.exposure, ratio: best.ratio, kind: best.kind,
+    spine: kind === T.DEEP ? 'water' : 'rock',
+  };
+}
+
+function authorExposureFeatures(map, rng) {
+  const target = randInt(rng, EXPOSURE_GEN.targetMin, EXPOSURE_GEN.targetMax);
+  let tries = 0;
+  // Candidates are re-read after every accepted feature, which moves roads.
+  let candidates = featureCandidates(map, rng);
+  for (let n = 0; n < candidates.length; n++) {
+    if (map.exposureFeatures.length >= target || tries >= EXPOSURE_GEN.maxTries) break;
+    const cand = candidates[n];
+    const c = tileXY(map.roadRoutes[cand.route].path[cand.k]);
+    if (map.exposureFeatures.some((f) => Math.hypot(f.x - c.x, f.y - c.y) < EXPOSURE_GEN.minApart)) continue;
+    const first = rng() < 0.5 ? 1 : -1;
+    const depth = randInt(rng, EXPOSURE_GEN.depthMin, EXPOSURE_GEN.depthMax);
+    let made = null;
+    for (const sign of [first, -first]) {
+      // A U that runs into rock or water may still fit with a shorter spine.
+      for (const tryDepth of depth > EXPOSURE_GEN.depthMin ? [depth, EXPOSURE_GEN.depthMin] : [depth]) {
+        made = tryExposureFeature(map, rng, cand, sign, tryDepth);
+        if (made === 'blocked') continue;
+        break;
+      }
+      if (made === 'cheap' || made === 'blocked') { made = null; continue; }
+      tries++;
+      if (made) break;
+    }
+    if (made) {
+      map.exposureFeatures.push(made);
+      candidates = featureCandidates(map, rng);
+      n = -1;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

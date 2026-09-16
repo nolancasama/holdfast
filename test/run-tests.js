@@ -5,8 +5,15 @@
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
 } from '../src/config.js';
-import { generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt } from '../src/terrain.js';
+import {
+  generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt,
+  isTerrainBuildable,
+} from '../src/terrain.js';
 import { computeField } from '../src/flowfield.js';
+import {
+  straightRoadBaseline, pathExposure, measureSiteExposure, findExposureFeatures,
+  analyseRoadKnots,
+} from '../src/roadexposure.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt,
   setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
@@ -33,6 +40,69 @@ const SEEDS = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 
 
 console.log(`Generating ${SEEDS.length} maps...`);
 const maps = SEEDS.map((s) => generateMap(s));
+
+function syntheticMap() {
+  const size = MAP.w * MAP.h;
+  return {
+    w: MAP.w, h: MAP.h,
+    kind: new Uint8Array(size).fill(T.PLAIN),
+    elev: new Uint8Array(size).fill(1),
+    res: new Float32Array(size),
+    road: new Uint8Array(size),
+    roadRoutes: [],
+    spawns: { west: [], east: [] },
+    roadCenter: { x: Math.floor(MAP.w / 2), y: Math.floor(MAP.h / 2) },
+  };
+}
+
+function stampRoute(map, tiles, side = 'west') {
+  const path = tiles.map(([x, y]) => idx(x, y));
+  for (const i of path) map.road[i] = 1;
+  map.roadRoutes.push({ side, mouth: { x: tiles[0][0], y: tiles[0][1] }, path });
+  return path;
+}
+
+function horizontal(y, x0 = 0, x1 = MAP.w - 1) {
+  const out = [];
+  const step = x0 <= x1 ? 1 : -1;
+  for (let x = x0; x !== x1 + step; x += step) out.push([x, y]);
+  return out;
+}
+
+function makeHairpin({ spine = false, pocketKind = null, forestRing = false } = {}) {
+  const map = syntheticMap();
+  const route = [
+    ...horizontal(18, 0, 78),
+    ...Array.from({ length: 7 }, (_, n) => [78, 19 + n]),
+    ...horizontal(25, 77, 0),
+  ];
+  stampRoute(map, route);
+  map.spawns.west = [{ x: 0, y: 18 }, { x: 0, y: 25 }];
+  if (pocketKind !== null) {
+    for (let y = 19; y <= 24; y++) {
+      for (let x = 0; x <= 77; x++) map.kind[idx(x, y)] = pocketKind;
+    }
+  }
+  if (forestRing) {
+    for (let x = 0; x <= 77; x++) {
+      map.kind[idx(x, 19)] = T.FOREST;
+      map.kind[idx(x, 24)] = T.FOREST;
+    }
+    for (let y = 19; y <= 24; y++) map.kind[idx(77, y)] = T.FOREST;
+  }
+  if (spine) for (let x = 0; x <= 73; x++) map.kind[idx(x, 21)] = T.DEEP;
+  return map;
+}
+
+function bestMeasured(map, sites) {
+  const fieldCache = new Map();
+  let best = null;
+  for (const [x, y] of sites) {
+    const result = measureSiteExposure(map, x + 0.5, y + 0.5, { fieldCache });
+    if (!best || result.exposure > best.exposure) best = result;
+  }
+  return best;
+}
 
 // --- D2: the validation gate actually holds on accepted maps -----------------
 
@@ -292,6 +362,119 @@ check('lane fields discount roads while direct fields ignore the road bitfield',
     }
     if (!discounted) return `${m.seed}: lane field never became cheaper on roads`;
   }
+  return null;
+});
+
+// --- D48/D49: road exposure and knot analysis ------------------------------
+
+check('straight-road exposure matches the geometric baseline', () => {
+  const map = syntheticMap();
+  stampRoute(map, horizontal(26));
+  const result = measureSiteExposure(map, 52.5, 28.5);
+  const baseline = straightRoadBaseline();
+  return Math.abs(result.exposure - baseline) <= baseline * 0.10
+    ? null : `measured ${result.exposure.toFixed(2)}, baseline ${baseline.toFixed(2)}`;
+});
+
+check('an impassable-spined hairpin produces a strong exposure feature', () => {
+  const map = makeHairpin({ spine: true });
+  const features = findExposureFeatures(map);
+  const best = features[0];
+  if (!best) return 'reported no feature';
+  if (best.ratio < 1.75 || best.tier !== 'strong') {
+    return `best was ${best.ratio.toFixed(2)}x/${best.tier}`;
+  }
+  return null;
+});
+
+check('an open U-turn is cut across and is not useful exposure', () => {
+  const map = makeHairpin();
+  const sites = [];
+  for (let y = 20; y <= 23; y++) for (let x = 73; x <= 77; x++) sites.push([x, y]);
+  const best = bestMeasured(map, sites);
+  return best.ratio < 1.35 ? null : `open U scored ${best.ratio.toFixed(2)}x`;
+});
+
+check('an unbuildable hairpin pocket cannot report a strong feature', () => {
+  const map = makeHairpin({ spine: true, pocketKind: T.CLIFF });
+  const strong = findExposureFeatures(map).filter((f) => f.tier === 'strong');
+  return strong.length ? `reported ${strong.length} strong feature(s)` : null;
+});
+
+check('a same-height forest ring drops hairpin exposure below strong', () => {
+  const map = makeHairpin({ spine: true, forestRing: true });
+  const features = findExposureFeatures(map);
+  const best = features[0];
+  return !best || best.ratio < 1.75 ? null : `forest-ringed pocket scored ${best.ratio.toFixed(2)}x`;
+});
+
+check('a cliff wall prevents a site from combining separate roads', () => {
+  const map = syntheticMap();
+  stampRoute(map, horizontal(18));
+  stampRoute(map, horizontal(30), 'east');
+  for (let x = 0; x < MAP.w; x++) map.kind[idx(x, 24)] = T.CLIFF;
+  const result = measureSiteExposure(map, 52.5, 20.5);
+  const baseline = straightRoadBaseline();
+  if (result.routeIndex !== 0) return `selected blocked route ${result.routeIndex}`;
+  return result.exposure <= baseline * 1.10
+    ? null : `combined roads into ${result.exposure.toFixed(2)} exposure`;
+});
+
+check('road-knot analysis finds planted defects and ignores clean roads', () => {
+  const clean = syntheticMap();
+  stampRoute(clean, horizontal(26));
+  if (analyseRoadKnots(clean).count !== 0) return 'clean straight road reported a knot';
+  if (analyseRoadKnots(makeHairpin({ spine: true })).count !== 0) return 'clean spined hairpin reported a knot';
+
+  const map = syntheticMap();
+  stampRoute(map, horizontal(26));
+  for (let y = 21; y <= 25; y++) map.road[idx(18, y)] = 1;
+  for (let y = 5; y <= 9; y++) for (let x = 32; x <= 36; x++) {
+    if (x === 32 || x === 36 || y === 5 || y === 9) map.road[idx(x, y)] = 1;
+  }
+  for (let x = 0; x <= 59; x++) map.road[idx(x, 32)] = 1;
+  for (let y = 32; y <= 40; y++) map.road[idx(59, y)] = 1;
+  for (let x = 60; x <= 67; x++) map.road[idx(x, 40)] = 1;
+  for (let y = 32; y <= 40; y++) map.road[idx(68, y)] = 1;
+  for (let x = 68; x < MAP.w; x++) map.road[idx(x, 32)] = 1;
+  for (let x = 0; x <= 59; x++) map.road[idx(x, 46)] = 1;
+  for (let y = 42; y <= 46; y++) map.road[idx(59, y)] = 1;
+  for (let x = 60; x <= 67; x++) map.road[idx(x, 42)] = 1;
+  for (let y = 42; y <= 46; y++) map.road[idx(68, y)] = 1;
+  for (let x = 68; x < MAP.w; x++) map.road[idx(x, 46)] = 1;
+  const result = analyseRoadKnots(map);
+  if (!result.spurs.length) return 'missed the 5-tile dead-end stub';
+  if (!result.smallLoops.length) return 'missed the 3x3 enclosed loop';
+  if (!result.braids.length) return 'missed the 8-tile braid';
+  return null;
+});
+
+check('terrain buildability and tower placement terrain rules agree', () => {
+  for (const map of maps.slice(0, 3)) {
+    const g = { map, towers: [], materials: Infinity };
+    for (let y = 0; y < MAP.h; y++) {
+      for (let x = 0; x < MAP.w; x++) {
+        const expected = isTerrainBuildable(map, x + 0.5, y + 0.5);
+        const actual = canPlaceAt(g, x + 0.5, y + 0.5).ok;
+        if (actual !== expected) return `${map.seed}: disagreed at (${x},${y})`;
+      }
+    }
+  }
+  return null;
+});
+
+check('road analysis stays within its per-map performance budget', () => {
+  let worst = { seed: '', ms: 0 };
+  for (const map of maps) {
+    const started = performance.now();
+    const fieldCache = new Map();
+    findExposureFeatures(map, { fieldCache });
+    analyseRoadKnots(map);
+    const ms = performance.now() - started;
+    if (ms > worst.ms) worst = { seed: map.seed, ms };
+    if (ms > 400) return `${map.seed} took ${ms.toFixed(1)}ms (budget 400ms)`;
+  }
+  console.log(`Road analysis worst: ${worst.seed} ${worst.ms.toFixed(1)}ms`);
   return null;
 });
 

@@ -74,6 +74,40 @@ export const ROAD = {
   startOffset: 4,
 };
 
+// D49: road exposure and road-knot measurement. Generation (D51/D52) uses it to
+// accept or undo knot fixes and exposure features.
+export const EXPOSURE = {
+  straightOffset: 2.0,
+  usefulRatio: 1.35,
+  strongRatio: 1.75,
+  featureClusterRadius: 8,
+  windowMargin: 6,
+  knotClusterRadius: 6,
+  smallLoopMaxArea: 60,
+  braidMinRun: 5,
+  readableLegSeparation: 5,
+};
+
+// D52: authored exposure features - a short impassable spine the road must wrap.
+export const EXPOSURE_GEN = {
+  targetMin: 2,
+  targetMax: 4,
+  maxTries: 24,            // candidate stretches tried per map before giving up
+  segmentHalf: 14,         // furthest route tiles searched either side for the re-laid stretch ends
+  depthMin: 5,             // spine length out from the old road line
+  depthMax: 8, 
+  rootBehind: 6,           // spine continues behind the road so it cannot be walked round
+  legHalfGap: 4,           // each leg this far from the spine centreline (legs ~8 apart)
+  bendBeyondTip: 5,        // the bend runs this far past the tip, leaving the tower pocket
+  spineWidth: 2,
+  waterChance: 0.45,       // water inlet vs rock spur
+  pocketOffset: 2.5,       // tower pocket centre past the spine tip
+  otherRoadClearance: 2,   // a feature keeps this far from any other road
+  minWalkedOnRoad: 0.9,
+  minFromStart: 12,
+  minApart: 16,
+};
+
 // D2: a map must satisfy these or it is thrown away and regenerated.
 export const VALID = {
   minRoutesPerBarrier: 2,   // >=2 topologically distinct ways through each barrier
