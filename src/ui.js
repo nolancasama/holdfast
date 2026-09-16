@@ -1,7 +1,7 @@
 // DOM HUD. Functional, not pretty (plan §16).
 
 import { ARCHETYPES, TOWER, WAVE, TILE_NAME, DROP } from './config.js';
-import { towerStats, upgradeCost, repairCostPerHp, objectiveHeld, towerCost } from './game.js';
+import { towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState } from './game.js';
 
 export const $ = (id) => document.getElementById(id);
 
@@ -40,13 +40,22 @@ export function updateHud(g) {
 
   const occ = g.towers.find((t) => t.id === g.occupiedTowerId);
   const occChip = $('hud-occ');
-  occChip.textContent = occ ? `OCCUPYING tower #${occ.id}` : 'Unoccupied';
-  occChip.style.color = occ ? 'var(--gold)' : 'var(--dim)';
+  const danger = dangerState(g);
+  const shelterPct = Math.round(danger.shelterProgress * 100);
+  occChip.textContent = occ ? `OCCUPIED tower #${occ.id}`
+    : danger.shelterTowerId ? `SHELTERING ${shelterPct}%` : 'Unoccupied';
+  occChip.style.color = occ ? 'var(--gold)' : danger.shelterTowerId ? 'var(--green)' : 'var(--dim)';
 
-  const held = objectiveHeld(g);
-  const building = g.towers.some((t) => t.isObjective && !t.built);
-  $('hud-obj').textContent = held ? 'HELD' : building ? 'building' : 'not established';
-  $('hud-obj').style.color = held ? 'var(--green)' : 'var(--red)';
+  const dangerChip = $('hud-danger');
+  if (g.phase === 'combat' && !danger.sheltered) {
+    dangerChip.textContent = `EXPOSED · ${danger.hunters} HUNTING`;
+    dangerChip.style.color = 'var(--red)';
+    dangerChip.style.borderColor = 'var(--red)';
+  } else {
+    dangerChip.textContent = danger.sheltered ? 'SHELTERED · MELEE SAFE' : 'OPEN GROUND SAFE · PREP';
+    dangerChip.style.color = danger.sheltered ? 'var(--green)' : 'var(--dim)';
+    dangerChip.style.borderColor = '';
+  }
 
   const fx = Object.entries(g.effects);
   const fxChip = $('hud-effects');
@@ -66,9 +75,11 @@ export function updateHud(g) {
   $('p-income').textContent = `${fmt(income, 2)} /s`;
   $('p-towers').textContent = `${g.towers.filter((t) => t.built).length} built${
     g.towers.some((t) => !t.built) ? ` (+${g.towers.filter((t) => !t.built).length} building)` : ''}`;
-  $('p-obj').innerHTML = held
-    ? '<span class="good">held</span>'
-    : `<span class="warn">${building ? 'under construction' : `build one ${g.map.objective.side}`}</span>`;
+  $('p-danger').innerHTML = danger.sheltered
+    ? '<span class="good">sheltered</span>'
+    : g.phase === 'combat'
+      ? `<span class="warn">EXPOSED · ${danger.hunters} hunting</span>`
+      : danger.shelterTowerId ? `<span class="good">sheltering ${shelterPct}%</span>` : 'safe during prep';
 
   // --- side panel: selected tower ---
   const sel = g.towers.find((t) => t.id === (g.selected ?? g.occupiedTowerId));
@@ -78,7 +89,7 @@ export function updateHud(g) {
     const s = towerStats(g, sel);
     const frac = sel.hp / sel.maxHp;
     const collapsing = sel.built && frac < TOWER.collapsingAt;
-    $('sel-title').textContent = `Tower #${sel.id}${sel.isObjective ? ' — OBJECTIVE' : ''}`;
+    $('sel-title').textContent = `Tower #${sel.id}`;
     $('sel-state').innerHTML = !sel.built
       ? `<span class="muted">building ${(sel.progress * 100).toFixed(0)}%</span>`
       : collapsing ? '<span class="warn">COLLAPSING</span>'
@@ -116,7 +127,6 @@ export function updateHud(g) {
       `<b>${TILE_NAME[c.terrain]}</b>, elevation ${c.elev}`,
       `Income here: <b>${fmt(c.income, 2)} /s</b> ${incomeVerdict(c.income)}`,
       `Visibility: <b>${(c.coverage * 100).toFixed(0)}%</b> of ground in range`,
-      c.inObjective ? '<span class="good">Inside the OBJECTIVE ZONE.</span>' : '',
       c.ok ? '<span class="good">Valid site — click to build.</span>'
            : `<span class="warn">Blocked: ${c.reasons.join(', ')}</span>`,
     ].filter(Boolean).join('<br />');
@@ -165,7 +175,7 @@ export function showEnd(g) {
   $('end-title').textContent = won ? 'Line held' : 'Run over';
   $('end-title').style.color = won ? 'var(--green)' : 'var(--red)';
   $('end-sub').textContent = won
-    ? `You survived ${WAVE.totalToSurvive} waves and held the objective as the ${g.arch.name}.`
+    ? `You survived all ${WAVE.totalToSurvive} waves as the ${g.arch.name}.`
     : `Killed on wave ${g.wave} as the ${g.arch.name}. Towers are expendable. You were not.`;
   $('end-stats').innerHTML = [
     ['Waves cleared', g.stats.wavesCleared],

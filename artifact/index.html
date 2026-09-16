@@ -13,17 +13,26 @@
     --blue: #7fb6ff;
   }
   * { box-sizing: border-box; }
-  html { height: 100%; }
+  html, body { height: 100%; margin: 0; }
   body {
-    height: 100%; margin: 0; padding: 0;
     background: var(--bg);
     color: var(--text);
     font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     overflow: hidden;
   }
+  #boot-error {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: var(--bg); z-index: 100; padding: 30px; text-align: center;
+  }
+  /* An id selector outranks the UA [hidden] rule, so restate it. */
+  #boot-error[hidden], .overlay[hidden] { display: none !important; }
+  #boot-error code {
+    display: inline-block; background: var(--panel2); padding: 6px 10px;
+    border-radius: 5px; color: var(--gold); margin: 4px;
+  }
 
-  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; height: 100dvh; }
-  #stage { position: relative; overflow: hidden; background: #000; min-width: 0; }
+  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  #stage { position: relative; overflow: hidden; background: #000; }
   canvas#game { display: block; width: 100%; height: 100%; }
 
   /* ---- top bar ---- */
@@ -40,19 +49,10 @@
   .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
   .chip.phase-prep { border-color: var(--green); }
   @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
-  @media (prefers-reduced-motion: reduce) { .chip.phase-warning { animation: none; } }
-
-  /* ---- minimap ---- */
-  #minimap-wrap {
-    position: absolute; left: 8px; bottom: 8px;
-    background: rgba(12,15,20,0.9); border: 1px solid var(--line);
-    border-radius: 5px; padding: 4px; line-height: 0;
-  }
-  canvas#minimap { display: block; image-rendering: pixelated; }
 
   /* ---- event log ---- */
   #log {
-    position: absolute; right: 8px; bottom: 8px; width: 330px; max-width: calc(100vw - 16px);
+    position: absolute; right: 8px; bottom: 8px; width: 330px;
     display: flex; flex-direction: column-reverse; gap: 2px; pointer-events: none;
   }
   #log div {
@@ -64,7 +64,7 @@
   /* ---- side panel ---- */
   #side {
     background: var(--panel); border-left: 1px solid var(--line);
-    display: flex; flex-direction: column; overflow-y: auto; min-width: 0;
+    display: flex; flex-direction: column; overflow-y: auto;
   }
   .sec { border-bottom: 1px solid var(--line); padding: 10px 12px; }
   .sec h2 {
@@ -72,7 +72,7 @@
     text-transform: uppercase; color: var(--dim); font-weight: 600;
   }
   .row { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
-  .row span:last-child { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .row span:last-child { color: var(--text); font-weight: 600; }
   .row span:first-child { color: var(--dim); }
   .bar { height: 7px; background: #0b0e13; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin: 5px 0; }
   .bar > i { display: block; height: 100%; background: var(--green); }
@@ -82,7 +82,6 @@
     cursor: pointer; width: 100%; text-align: left; margin-top: 4px;
   }
   button:hover:not(:disabled) { background: #26303e; border-color: #3d4a5d; }
-  button:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   button .cost { float: right; color: var(--gold); }
   .keys { color: var(--dim); font-size: 11px; }
@@ -97,40 +96,51 @@
   /* ---- overlays ---- */
   .overlay {
     position: absolute; inset: 0; display: grid; place-items: center;
-    background: rgba(8,10,14,0.92); z-index: 20; padding: 20px; overflow-y: auto;
+    background: rgba(8,10,14,0.92); z-index: 20; padding: 20px;
   }
-  .overlay[hidden] { display: none !important; }
+  .overlay[hidden] { display: none; }
   .card { max-width: 760px; width: 100%; }
-  .card h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: 0.02em; text-wrap: balance; }
+  .card h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: 0.02em; }
   .card p.lede { color: var(--dim); margin: 0 0 18px; }
-  .picks { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  .picks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .pick {
     background: var(--panel); border: 2px solid var(--line); border-radius: 7px;
     padding: 12px; cursor: pointer;
   }
   .pick:hover, .pick.on { border-color: var(--gold); }
-  .pick:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
   .pick h3 { margin: 0 0 4px; font-size: 15px; }
   .pick ul { margin: 8px 0 0; padding-left: 16px; color: var(--dim); font-size: 12px; }
-  .seedrow { display: flex; gap: 8px; align-items: center; margin: 16px 0 10px; flex-wrap: wrap; }
+  .seedrow { display: flex; gap: 8px; align-items: center; margin: 16px 0 10px; }
   .seedrow input {
     font: inherit; background: var(--panel2); color: var(--text);
     border: 1px solid var(--line); border-radius: 4px; padding: 6px 9px; width: 160px;
   }
-  .seedrow input:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
   .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
   .start:hover { background: #ffe08a; }
-  .start:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 
-  /* ---- phone width: stack the HUD below the battlefield instead of beside it ---- */
+  @media (prefers-reduced-motion: reduce) { .chip.phase-warning { animation: none; } }
+  button:focus-visible, .start:focus-visible, .seedrow input:focus-visible {
+    outline: 2px solid var(--gold); outline-offset: 2px;
+  }
+
+  /* Phone width: stack the HUD under the battlefield so nothing scrolls sideways. */
   @media (max-width: 720px) {
     #app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
     #stage { height: 58vh; height: 58dvh; }
     #side { border-left: none; border-top: 1px solid var(--line); max-height: 42vh; max-height: 42dvh; }
     .picks { grid-template-columns: 1fr; }
-    #log { display: none; } /* the side panel's own state readout covers it at this size */
+    #log { display: none; }
   }
 </style>
+<div id="boot-error" hidden>
+  <div>
+    <h1>Holdfast needs a local web server</h1>
+    <p>This prototype uses ES modules, which browsers refuse to load from <code>file://</code>.</p>
+    <p>From the project folder, run one of:</p>
+    <p><code>python -m http.server 8000</code> <code>npx serve .</code> <code>php -S localhost:8000</code></p>
+    <p>then open <code>http://localhost:8000</code></p>
+  </div>
+</div>
 
 <div id="app">
   <div id="stage">
@@ -141,18 +151,17 @@
       <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
       <div class="chip">HP <b id="hud-hp">100</b></div>
       <div class="chip" id="hud-occ">Unoccupied</div>
-      <div class="chip">Objective <b id="hud-obj">—</b></div>
+      <div class="chip" id="hud-danger">SAFE DURING PREP</div>
       <div class="chip muted" id="hud-seed">seed</div>
       <div class="chip" id="hud-effects" hidden></div>
     </div>
 
-    <div id="minimap-wrap"><canvas id="minimap"></canvas></div>
     <div id="log"></div>
 
     <div class="overlay" id="select-overlay">
       <div class="card">
         <h1>Holdfast</h1>
-        <p class="lede">Towers hold the ground. You make one of them formidable — and make it the thing everything wants to kill.</p>
+        <p class="lede">During combat, towers are safe islands and open ground belongs to the enemy. Survive the final wave.</p>
         <div class="picks" id="picks"></div>
         <div class="seedrow">
           <label for="seed-input">Seed</label>
@@ -186,7 +195,7 @@
       <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
       <div class="row"><span>Income</span><span id="p-income">0.0 /s</span></div>
       <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
-      <div class="row"><span>Objective</span><span id="p-obj">not established</span></div>
+      <div class="row"><span>Combat danger</span><span id="p-danger">safe during prep</span></div>
     </div>
 
     <div class="sec">
@@ -244,4 +253,10 @@
   </div>
 </div>
 
+<script>
+  if (location.protocol === 'file:') {
+    document.getElementById('boot-error').hidden = false;
+    document.getElementById('app').style.display = 'none';
+  }
+</script>
 <script type="module" src="./src/main.js"></script>

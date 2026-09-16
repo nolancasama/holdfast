@@ -2,8 +2,10 @@
 // Every enemy targeting the same tower reads the same field, which is what makes
 // them funnel through the passes instead of each solving the map alone.
 
-import { MAP, MOVE_COST, PASSABLE } from './config.js';
-import { idx, inBounds } from './terrain.js';
+import { MAP, MOVE_COST, PASSABLE, ROAD } from './config.js';
+
+const idx = (x, y) => y * MAP.w + x;
+const inBounds = (x, y) => x >= 0 && y >= 0 && x < MAP.w && y < MAP.h;
 
 const DIAG = Math.SQRT2;
 const NEIGHBOURS = [
@@ -53,7 +55,14 @@ class MinHeap {
  * @param {number[]} seeds tile indices to flood out from (usually one tower tile)
  * @returns {Float32Array} cost-to-reach, Infinity where unreachable
  */
-export function computeField(map, seeds) {
+function costFor(map, i, mode) {
+  const terrain = map.kind[i];
+  if (mode === 'carve') return map.road[i] ? ROAD.existingCost : ROAD.carveCost[terrain];
+  const base = MOVE_COST[terrain];
+  return mode === 'lane' && map.road[i] ? base * ROAD.laneDiscount : base;
+}
+
+export function computeField(map, seeds, mode = 'direct') {
   const dist = new Float32Array(MAP.w * MAP.h).fill(Infinity);
   const heap = new MinHeap();
   for (const s of seeds) {
@@ -71,7 +80,7 @@ export function computeField(map, seeds) {
       const ny = y + oy;
       if (!inBounds(nx, ny)) continue;
       const ni = idx(nx, ny);
-      const cost = MOVE_COST[map.kind[ni]];
+      const cost = costFor(map, ni, mode);
       if (!Number.isFinite(cost)) continue;
       // No corner cutting through a cliff or river bend.
       if (ox !== 0 && oy !== 0) {
@@ -85,6 +94,42 @@ export function computeField(map, seeds) {
     }
   }
   return dist;
+}
+
+/**
+ * Recover one minimum-cost tile path using the same Dijkstra implementation as
+ * the runtime fields. Terrain generation uses the private `carve` cost mode;
+ * gameplay uses only the public lane/direct distinction.
+ */
+export function findCostPath(map, start, target) {
+  const field = computeField(map, [target], 'carve');
+  if (!Number.isFinite(field[start])) return [];
+  const path = [start];
+  let current = start;
+  const seen = new Uint8Array(MAP.w * MAP.h);
+  seen[current] = 1;
+
+  for (let guard = 0; guard < MAP.w * MAP.h && current !== target; guard++) {
+    const x = current % MAP.w;
+    const y = (current / MAP.w) | 0;
+    let best = -1;
+    let bestDist = field[current];
+    for (const [ox, oy] of NEIGHBOURS) {
+      const nx = x + ox;
+      const ny = y + oy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      if (!PASSABLE[map.kind[ni]]) continue;
+      if (ox !== 0 && oy !== 0
+          && (!PASSABLE[map.kind[idx(x + ox, y)]] || !PASSABLE[map.kind[idx(x, y + oy)]])) continue;
+      if (field[ni] < bestDist - 1e-6) { bestDist = field[ni]; best = ni; }
+    }
+    if (best < 0 || seen[best]) return [];
+    current = best;
+    seen[current] = 1;
+    path.push(current);
+  }
+  return current === target ? path : [];
 }
 
 /**

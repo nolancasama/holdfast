@@ -1,30 +1,23 @@
 // Bootstrap, input, and the frame loop.
 
-import { TOWER, ENEMIES } from './config.js';
+import { MAP, TOWER, ENEMIES } from './config.js';
 import { randomSeed } from './terrain.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade,
   forceNextWave, spawnGroupAt,
-  towerStats,
+  towerStats, dangerState,
 } from './game.js';
 import {
-  buildTerrainLayer, buildMinimapLayer, makeCamera, updateCamera,
-  screenToWorld, draw, drawMinimap,
+  buildTerrainLayer, screenToWorld, draw,
 } from './render.js';
 import { $, renderPicks, updateHud, updateMapInfo, showEnd } from './ui.js';
 
-const MINIMAP_SCALE = 2;
-
 const canvas = $('game');
 const ctx = canvas.getContext('2d');
-const miniCanvas = $('minimap');
-const miniCtx = miniCanvas.getContext('2d');
 
 let game = null;
 let layers = null;
-let miniBase = null;
-let cam = makeCamera();
-const view = { w: 0, h: 0 };
+const view = { w: 0, h: 0, tilePx: 1, offsetX: 0, offsetY: 0 };
 const keys = new Set();
 let lastCursorTile = '';
 let endShown = false;
@@ -49,12 +42,6 @@ $('again-btn').onclick = () => {
 function startRun(seed, archetype) {
   game = createGame(seed, archetype);
   layers = { terrain: buildTerrainLayer(game.map) };
-  miniBase = buildMinimapLayer(game.map, MINIMAP_SCALE);
-  miniCanvas.width = miniBase.width;
-  miniCanvas.height = miniBase.height;
-  cam = makeCamera();
-  cam.x = game.player.x * 18 - view.w / 2;
-  cam.y = game.player.y * 18 - view.h / 2;
   endShown = false;
   lastCursorTile = '';
   $('select-overlay').hidden = true;
@@ -74,6 +61,9 @@ function resize() {
   canvas.width = view.w * dpr;
   canvas.height = view.h * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  view.tilePx = Math.max(1, Math.floor(Math.min(view.w / MAP.w, view.h / MAP.h)));
+  view.offsetX = Math.floor((view.w - MAP.w * view.tilePx) / 2);
+  view.offsetY = Math.floor((view.h - MAP.h * view.tilePx) / 2);
 }
 window.addEventListener('resize', resize);
 resize();
@@ -126,7 +116,7 @@ window.addEventListener('blur', () => keys.clear());
 canvas.addEventListener('mousemove', (e) => {
   if (!game) return;
   const rect = canvas.getBoundingClientRect();
-  const w = screenToWorld(cam, e.clientX - rect.left, e.clientY - rect.top);
+  const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
   refreshBuildCheck();
 });
@@ -135,7 +125,7 @@ canvas.addEventListener('mousedown', (e) => {
   if (!game || game.status !== 'playing') return;
   e.preventDefault();
   const rect = canvas.getBoundingClientRect();
-  const w = screenToWorld(cam, e.clientX - rect.left, e.clientY - rect.top);
+  const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
 
   if (game.buildMode) {
@@ -230,7 +220,7 @@ window.holdfast = {
   get game() { return game; },
   start: startRun,
   errors: [],
-  api: { canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave },
+  api: { canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave, dangerState },
   /** Run the simulation forward without waiting in real time. */
   fastForward(seconds, onStep) {
     const step = 1 / 60;
@@ -262,10 +252,8 @@ function frame(now) {
 
   update(game, dt);
 
-  updateCamera(cam, game, view.w, view.h);
   refreshBuildCheck();
-  draw(ctx, game, cam, layers, view);
-  drawMinimap(miniCtx, game, miniBase, cam, view, MINIMAP_SCALE);
+  draw(ctx, game, layers, view);
 
   hudAccum += dt;
   if (hudAccum > 0.08) { hudAccum = 0; updateHud(game); }

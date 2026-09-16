@@ -2,9 +2,8 @@
 // Distances are in TILES unless the name says px. Times are in seconds.
 
 export const MAP = {
-  w: 132,           // long west <-> east
-  h: 58,            // enough north/south room for alternate routes
-  tilePx: 18,
+  w: 104,           // compact enough for the entire battlefield to stay visible
+  h: 52,            // enough north/south room for alternate routes
 };
 
 // --- tile kinds -------------------------------------------------------------
@@ -39,9 +38,19 @@ export const GEN = {
   deposits: { min: 26, max: 38, radiusMin: 4, radiusMax: 9, peakMin: 0.5, peakMax: 1.5 },
   ambientResource: 0.10,   // every site yields a trickle; deposits are where it pays
   startClearRadius: 4,
-  objectiveRadius: 6,
   maxAttempts: 24,     // strict validation attempts (D2)
   maxRelaxedAttempts: 40,
+};
+
+// D20-D22: roads are an overlay. These costs are used only while carving the
+// network; ordinary movement continues to use MOVE_COST above.
+export const ROAD = {
+  existingCost: 0.15,
+  carveCost: [1.0, 2.8, 4.2, 3.0, Infinity, Infinity],
+  laneDiscount: 0.32,
+  connectorsMin: 1,
+  connectorsMax: 2,
+  startOffset: 4,
 };
 
 // D2: a map must satisfy these or it is thrown away and regenerated.
@@ -65,6 +74,7 @@ export const PLAYER = {
   invulnAfterHit: 0.35,
   regen: 2.5,               // hp/sec, prep phase only: surviving a collapse is a
                             // scar you can recover from, not a delayed death
+  shelterTime: 0.7,
 };
 
 // --- towers -----------------------------------------------------------------
@@ -142,15 +152,15 @@ export const ARCHETYPES = {
 export const ENEMIES = {
   swarm: {
     name: 'Swarm', color: '#c98bd8', radius: 0.34,
-    hp: 30, speed: 2.9, towerDps: 6, playerHit: 8, cost: 4, unlockWave: 1,
+    hp: 30, speed: 4.9, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
   },
   runner: {
     name: 'Runner', color: '#78e08f', radius: 0.30,
-    hp: 46, speed: 5.0, towerDps: 8, playerHit: 10, cost: 7, unlockWave: 2,
+    hp: 46, speed: 6.2, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
   },
   heavy: {
     name: 'Heavy', color: '#e8833a', radius: 0.62,
-    hp: 270, speed: 1.7, towerDps: 34, playerHit: 30, cost: 22, unlockWave: 3,
+    hp: 270, speed: 1.7, towerDps: 34, playerHit: 55, cost: 22, unlockWave: 3,
   },
 };
 
@@ -159,14 +169,20 @@ export const ENEMY = {
   playerAttackRange: 0.95,   // enemies en route swipe at a player who gets close
   playerHitCooldown: 1.0,
   separation: 0.55,
+  // D31: hunters aim where the player is GOING, not where they are. This is
+  // what closes circular kiting - a curve is trivial to intercept once the
+  // pursuer cuts the corner - without a leash, an aura or a speed buff.
+  pursuitLeadTime: 1.15,     // seconds of lead, capped by time-to-intercept
+  pursuitLeadRange: 12,      // only lead when close enough to actually cut in
 };
 
 // D5: aggro moves as a rolling commitment, never a synchronized 180.
 export const AGGRO = {
   baseWeight: 1.0,
   occupiedWeight: 4.2,       // the Occupied Tower is by far the juiciest target
-  objectiveWeight: 1.4,
   distanceScale: 22,         // score divided by (1 + dist/scale)
+  playerWeight: 8.0,         // overwhelming nearby, but deliberately short-sighted
+  playerDistanceScale: 1.5,
   switchMargin: 1.35,        // only switch if meaningfully better
   retargetMin: 2.0,
   retargetMax: 4.0,
@@ -192,6 +208,18 @@ export const WAVE = {
 
 export const START_MATERIALS = 220;
 
+// Readability floors for the fixed whole-map view. World-space rings still use
+// the fitted tile scale; only the important entities and their labels/bars floor.
+export const RENDER = {
+  baseTilePx: 18,
+  towerMinRadiusPx: 10,
+  playerMinRadiusPx: 5,
+  enemyMinRadiusPx: 3.5,
+  healthBarMinWidthPx: 16,
+  labelMinPx: 9,
+  roadWidthFrac: 0.58,
+};
+
 // --- drops ------------------------------------------------------------------
 export const DROP = {
   chance: 0.18,
@@ -206,4 +234,3 @@ export const DROP = {
   },
 };
 
-export const CAMERA = { lerp: 0.14 };

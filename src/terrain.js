@@ -1,9 +1,10 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
+import { findCostPath } from './flowfield.js';
 
 export const idx = (x, y) => y * MAP.w + x;
 export const inBounds = (x, y) => x >= 0 && y >= 0 && x < MAP.w && y < MAP.h;
@@ -54,6 +55,28 @@ export function hasLineOfSight(map, x0, y0, x1, y1) {
     const k = kindAt(map, cx, cy);
     if (BLOCKS_SIGHT_ALWAYS[k]) return false;
     if (BLOCKS_SIGHT_UNLESS_ABOVE[k] && shooterElev <= elevAt(map, cx, cy)) return false;
+  }
+  return false;
+}
+
+/** Is the straight line between two points walkable end to end? */
+export function hasClearWalk(map, x0, y0, x1, y1) {
+  let cx = Math.floor(x0);
+  let cy = Math.floor(y0);
+  const tx = Math.floor(x1);
+  const ty = Math.floor(y1);
+  const dx = Math.abs(tx - cx);
+  const dy = Math.abs(ty - cy);
+  const sx = cx < tx ? 1 : -1;
+  const sy = cy < ty ? 1 : -1;
+  let err = dx - dy;
+
+  for (let guard = 0; guard < MAP.w + MAP.h; guard++) {
+    if (cx === tx && cy === ty) return true;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; cx += sx; }
+    if (e2 < dx) { err += dx; cy += sy; }
+    if (!isPassable(map, cx, cy)) return false;
   }
   return false;
 }
@@ -228,7 +251,7 @@ function clearArea(map, cx, cy, r, kind = T.PLAIN, elev = 1) {
 }
 
 /** D9: resource richness is placed as discrete deposits so the player can see it. */
-function placeDeposits(map, rng, objective, start) {
+function placeDeposits(map, rng, start) {
   const deposits = [];
   const add = (cx, cy, radius, peak) => {
     deposits.push({ x: cx, y: cy, r: radius, peak });
@@ -245,10 +268,8 @@ function placeDeposits(map, rng, objective, start) {
   };
 
   const n = randInt(rng, GEN.deposits.min, GEN.deposits.max);
-  // Guarantee the expansion objective is worth expanding to, and that the start
-  // tower is not economically dead.
-  add(objective.x, objective.y, 6, 1.2);
-  add(objective.x + (rng() - 0.5) * 8, objective.y + (rng() - 0.5) * 10, 5, 0.9);
+  // Keep the initial tower economically viable without guaranteeing any remote
+  // location; expansion value comes from the authored random deposits.
   add(start.x + (rng() - 0.5) * 6, start.y + (rng() - 0.5) * 6, 5, 0.7);
 
   let placed = 0;
@@ -272,6 +293,112 @@ function placeDeposits(map, rng, objective, start) {
   return deposits;
 }
 
+function carveRoadPath(map, path) {
+  const mark = (i) => {
+    if (!PASSABLE[map.kind[i]]) return;
+    map.road[i] = 1;
+    if (map.kind[i] === T.FOREST || map.kind[i] === T.MARSH) map.kind[i] = T.PLAIN;
+  };
+  let previous = -1;
+  for (const i of path) {
+    if (previous >= 0) {
+      const px = previous % MAP.w;
+      const py = (previous / MAP.w) | 0;
+      const x = i % MAP.w;
+      const y = (i / MAP.w) | 0;
+      if (x !== px && y !== py) mark(idx(x, py));
+    }
+    mark(i);
+    previous = i;
+  }
+}
+
+function gapRoadPoint(barrier, gap) {
+  const y = Math.max(0, Math.min(MAP.h - 1, Math.floor((gap.y0 + gap.y1) / 2)));
+  const x = Math.max(0, Math.min(MAP.w - 1, Math.round(barrier.xs[y])));
+  return idx(x, y);
+}
+
+function gapHasRoad(map, barrier, gap) {
+  for (let y = gap.y0; y < gap.y1; y++) {
+    const cx = Math.round(barrier.xs[y]);
+    for (let x = cx - 3; x <= cx + 3; x++) {
+      if (inBounds(x, y) && map.road[idx(x, y)]) return true;
+    }
+  }
+  return false;
+}
+
+function roadPointInGap(map, barrier, gap) {
+  const centre = gapRoadPoint(barrier, gap);
+  const cx = centre % MAP.w;
+  const cy = (centre / MAP.w) | 0;
+  let best = -1;
+  let bestD = Infinity;
+  for (let y = Math.max(0, gap.y0 - 2); y < Math.min(MAP.h, gap.y1 + 2); y++) {
+    const bx = Math.round(barrier.xs[y]);
+    for (let x = Math.max(0, bx - 5); x <= Math.min(MAP.w - 1, bx + 5); x++) {
+      const i = idx(x, y);
+      const d = Math.hypot(x - cx, y - cy);
+      if (map.road[i] && d < bestD) { best = i; bestD = d; }
+    }
+  }
+  return best;
+}
+
+/** D20: paths follow actual terrain and progressively merge onto cheap road. */
+function buildRoadNetwork(map, rng) {
+  const centreI = idx(map.roadCenter.x, map.roadCenter.y);
+  for (const side of ['west', 'east']) {
+    for (const mouth of map.spawns[side]) {
+      carveRoadPath(map, findCostPath(map, idx(mouth.x, mouth.y), centreI));
+    }
+  }
+
+  // Add branches from unused authored gaps into the connected main network.
+  // Their endpoint is a different gap already used by a main road, so these are
+  // true lateral alternatives rather than detached decorative tracks.
+  const wanted = randInt(rng, ROAD.connectorsMin, ROAD.connectorsMax);
+  let made = 0;
+  for (const barrier of shuffle(rng, [...map.barriers])) {
+    if (made >= wanted || barrier.gaps.length < 2) break;
+    const used = barrier.gaps.filter((gap) => gapHasRoad(map, barrier, gap));
+    const unused = barrier.gaps.filter((gap) => !gapHasRoad(map, barrier, gap));
+    if (!used.length || !unused.length) continue;
+    const from = gapRoadPoint(barrier, unused[Math.floor(rng() * unused.length)]);
+    const to = roadPointInGap(map, barrier, used[Math.floor(rng() * used.length)]);
+    if (to < 0) continue;
+    const path = findCostPath(map, from, to);
+    if (path.length) { carveRoadPath(map, path); made++; }
+  }
+  map.roadConnectors = made;
+}
+
+function keepStartTowerOffRoad(map, start) {
+  const footprintClear = (cx, cy) => {
+    for (let y = Math.floor(cy - TOWER.radius); y <= Math.ceil(cy + TOWER.radius); y++) {
+      for (let x = Math.floor(cx - TOWER.radius); x <= Math.ceil(cx + TOWER.radius); x++) {
+        if (!inBounds(x, y)) return false;
+        if (Math.hypot(x + 0.5 - cx, y + 0.5 - cy) > TOWER.radius + 0.3) continue;
+        if (!PASSABLE[map.kind[idx(x, y)]] || map.road[idx(x, y)]) return false;
+      }
+    }
+    return true;
+  };
+  if (footprintClear(start.x + 0.5, start.y + 0.5)) return;
+
+  for (let radius = 1; radius <= GEN.startClearRadius + 3; radius++) {
+    for (let oy = -radius; oy <= radius; oy++) {
+      for (let ox = -radius; ox <= radius; ox++) {
+        if (Math.max(Math.abs(ox), Math.abs(oy)) !== radius) continue;
+        const x = start.x + ox;
+        const y = start.y + oy;
+        if (footprintClear(x + 0.5, y + 0.5)) { start.x = x; start.y = y; return; }
+      }
+    }
+  }
+}
+
 function buildMap(rng) {
   const size = MAP.w * MAP.h;
   const map = {
@@ -280,6 +407,7 @@ function buildMap(rng) {
     kind: new Uint8Array(size),
     elev: new Uint8Array(size),
     res: new Float32Array(size),
+    road: new Uint8Array(size),
   };
 
   const elevNoise = makeNoise2D(rng);
@@ -298,24 +426,19 @@ function buildMap(rng) {
   if (columns.river !== null) barriers.push(stampRiver(map, rng, columns.river));
   stampVegetation(map, rng, elevCont);
 
-  const start = { x: Math.round(MAP.w / 2), y: Math.round(MAP.h / 2) };
+  const roadCenter = { x: Math.floor(MAP.w / 2), y: Math.floor(MAP.h / 2) };
+  const start = { x: roadCenter.x, y: roadCenter.y + ROAD.startOffset };
+  clearArea(map, roadCenter.x, roadCenter.y, 2.5, T.PLAIN, 1);
   clearArea(map, start.x, start.y, GEN.startClearRadius, T.PLAIN, 1);
-
-  const side = rng() < 0.5 ? 'west' : 'east';
-  const objective = {
-    side,
-    r: GEN.objectiveRadius,
-    x: Math.round((side === 'west' ? 0.07 : 0.93) * MAP.w),
-    y: Math.round((0.25 + rng() * 0.5) * MAP.h),
-  };
-  // The objective must be physically buildable, but keep it a small clearing so
-  // it still sits inside whatever terrain generated around it.
-  clearArea(map, objective.x, objective.y, 3.2, T.PLAIN, 1);
 
   map.barriers = barriers;
   map.start = start;
-  map.objective = objective;
-  map.deposits = placeDeposits(map, rng, objective, start);
+  map.roadCenter = roadCenter;
+  const centreReach = floodFrom(map, [idx(roadCenter.x, roadCenter.y)]);
+  map.spawns = findSpawns(map, { reachW: centreReach, reachE: centreReach });
+  buildRoadNetwork(map, rng);
+  keepStartTowerOffRoad(map, start);
+  map.deposits = placeDeposits(map, rng, start);
   return map;
 }
 
@@ -405,12 +528,11 @@ export function validateMap(map, relaxed = false) {
   const reachW = floodFrom(map, edgeSeeds(map, 0, 2));
   const reachE = floodFrom(map, edgeSeeds(map, MAP.w - 3, MAP.w - 1));
   const startI = idx(map.start.x, map.start.y);
-  const objI = idx(map.objective.x, map.objective.y);
 
   const problems = [];
   if (!reachW[startI]) problems.push('start unreachable from west edge');
   if (!reachE[startI]) problems.push('start unreachable from east edge');
-  if (!reachW[objI] && !reachE[objI]) problems.push('objective zone unreachable');
+  if (map.roadConnectors < ROAD.connectorsMin) problems.push('road network has no lateral connector');
 
   const minRoutes = relaxed ? 1 : VALID.minRoutesPerBarrier;
   const barrierReport = [];
@@ -434,6 +556,7 @@ export function validateMap(map, relaxed = false) {
   let passable = 0;
   let open = 0;
   let forest = 0;
+  let marsh = 0;
   let water = 0;
   let both = 0;
   for (let i = 0; i < map.kind.length; i++) {
@@ -441,6 +564,7 @@ export function validateMap(map, relaxed = false) {
     if (PASSABLE[k]) passable++;
     if (k === T.PLAIN) open++;
     if (k === T.FOREST) forest++;
+    if (k === T.MARSH) marsh++;
     if (k === T.DEEP || k === T.SHALLOW) water++;
     if (reachW[i] && reachE[i]) both++;
   }
@@ -451,6 +575,7 @@ export function validateMap(map, relaxed = false) {
   if (openFrac < VALID.openFracMin) problems.push(`too cluttered (open ${openFrac.toFixed(2)})`);
   if (openFrac > VALID.openFracMax) problems.push(`featureless field (open ${openFrac.toFixed(2)})`);
   if (!relaxed && forestFrac < VALID.minForestFrac) problems.push(`not enough cover (forest ${forestFrac.toFixed(2)})`);
+  if (marsh === 0) problems.push('no marsh survived road grading');
   if (contestedFrac < 0.30) problems.push(`battlefield too fragmented (${contestedFrac.toFixed(2)})`);
 
   return {
@@ -501,7 +626,6 @@ export function generateMap(seedString) {
       map.attempts = attempt + 1;
       map.relaxed = relaxed;
       map.report = report;
-      map.spawns = findSpawns(map, report);
       return map;
     }
   }
@@ -511,7 +635,6 @@ export function generateMap(seedString) {
   lastMap.attempts = GEN.maxRelaxedAttempts;
   lastMap.relaxed = true;
   lastMap.report = lastReport;
-  lastMap.spawns = findSpawns(lastMap, lastReport);
   return lastMap;
 }
 

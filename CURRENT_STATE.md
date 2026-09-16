@@ -4,80 +4,119 @@ Last updated: 2026-09-16
 
 ## What this is
 
-`holdfast` — a playable 2D top-down tower-defense/survival prototype testing one
-loop: presence makes a tower much stronger and makes it the target, so the
-player must decide whether to hold a failing tower or abandon it. First pass is
-complete and playable end to end. See `README.md` to run it,
-`DESIGN_DECISIONS.md` for what was decided and why.
+`holdfast` is a playable 2D top-down tower-defense/survival prototype. The
+current loop is: read the generated terrain and road network, build towers
+beside the lanes, shelter in a tower during combat, and survive eight waves.
+Victory is surviving the final wave; only player death ends the run in defeat.
 
-## Status
+## Implemented state
 
-Feature-complete against the original brief. All 20 numbered sections of the
-plan are implemented except the deliberate cuts recorded in D10 (Emergency
-Armor and rare-module drops deferred). `npm test` — 23 checks, all passing.
-No console errors across scripted browser runs.
+- The authored-and-validated terrain generator remains intact on a 104x52 map.
+  Its ridges, deliberate gaps, river, explicit fords, open-ground band and
+  seeded regeneration still pass through the validation gate.
+- Every map has a separate `road` bitfield. Cost-carved west/east routes meet at
+  the centre, reuse existing road cheaply, pass through the authored gaps and
+  fords, and gain one or two connected lateral branches where unused gaps are
+  available. Roadbeds grade forest and marsh to plain but preserve shallow
+  fords and never cross impassable terrain.
+- Tower-target flow fields use `lane` cost, which discounts roads. The player
+  pursuit field uses `direct` cost and ignores the road bitfield. Tower fields
+  remain lazily cached, and the existing narrow-pass collision probe and stuck
+  nudge remain active.
+- The camera, minimap and edge markers are gone. Resize computes an integer tile
+  scale that fits the complete map and centres it with letterboxing. Towers,
+  player, enemies, health bars and labels have minimum screen sizes.
+- Towers cannot be placed with any footprint tile on a road. The starting tower
+  is kept beside the central junction and generation verifies its footprint is
+  road-free.
+- Shelter takes 0.7 seconds of continuous presence in a built tower. Occupancy
+  bonuses and melee immunity begin only when that timer completes; leaving
+  immediately resets shelter.
+- An exposed player participates in the existing staggered aggro scoring with a
+  strong, short-distance score. Nearby non-sieging enemies can switch to the
+  player and use the direct field, while enemies already besieging a tower stay
+  committed. Swarms are only slightly slower than the player, Runners are
+  faster, and ordinary hits now kill in roughly two to four hits.
+- Warning highlights the incoming half of the road network. Combat HUD and
+  canvas feedback show EXPOSED state, shelter progress and current hunter count.
+- `window.holdfast` retains `game`, `start()`, `errors`, `fastForward()` and all
+  prior `api` methods. `api.dangerState(game)` additionally exposes
+  `{ sheltered, shelterTowerId, shelterProgress, hunters }` for acceptance.
+- `npm run artifact` regenerates `artifact/index.html` from the real page without
+  its document wrapper.
 
-## Architecture
+## Automated verification
 
-- Plain ES modules, no build step, no dependencies. `npm start` serves it.
-- `src/config.js` holds every balance number; nothing else hard-codes one.
-- Terrain is generated in authored passes and then **validated**, regenerating
-  until it satisfies the predicates in `VALID` (routes per barrier, minimum
-  pass width, chokepoint count, open-ground band). Typically accepted on
-  attempt 1–2; ~19ms per map.
-- Pathing is one shared Dijkstra flow field per target, cached on the tower.
-- `window.holdfast` exposes `game`, `fastForward(seconds, onStep)`, `api.*` and
-  `start()` for scripted playthroughs and console work.
+`npm test` runs 27 headless checks. It covers 20 deterministic seeds, terrain
+validation, road connectivity and legality, seed variation, lane/direct field
+behavior, road placement refusal, delayed shelter occupancy, line of sight,
+collapse, aggro commitment, economy, escalation and a long simulation. Current
+result: 27 passed, 0 failed.
 
-## What the playtests actually showed
+## Controller acceptance — measured, 2026-09-16
 
-Measured with a scripted browser player across seeds BRAVO, CHARLIE, DELTA,
-ECHO, FOXTROT and all three archetypes.
+Scripted browser playthroughs across seeds BRAVO/CHARLIE/DELTA/ECHO/FOXTROT/GOLF.
+No console errors at 1600x900 or 1280x800.
 
-- **Chokepoints appear reliably.** 7–11 tight passes (≤12 tiles) per map, 2–3
-  usable routes through every barrier, narrowest 4–8 tiles. Open-ground fraction
-  0.47–0.63. No map needed relaxed validation.
-- **Placement is a real trade-off.** Income across candidate sites spans
-  0.17 /s (p5) to 3.04 /s (p100) — an 18x spread; payback ranges 588s to 33s.
-  Line-of-sight coverage spans 9% to 100%. A site can be rich and blind, or
-  commanding and barren.
-- **Presence is felt.** An Occupied Gunner tower runs at 71.8 dps against 17.6
-  automated — 4.1x. Sieges peak at 8–11 enemies on one tower by wave 7.
-- **The naive strategy falls just short.** A bot that never abandons a tower and
-  never dodges dies on waves 6–8 against an 8-wave objective, always to collapse
-  damage. That is the intended shape: refusing the decision loses.
-- **The objective works.** Reliably established by wave 3 and held thereafter,
-  and the zone is seeded with deposits so expansion pays.
+**Roads work.** Networks span the full map width (cols 1-102 of 104), contain
+**zero** tiles on impassable terrain, and genuinely use the fords (10-31 ford
+tiles per map). **86-94% of enemy travel happens on road.** Peak stuck time
+0-0.1s: no congestion at crossings, fords or passes. Roads serve 5/10, 6/7 and
+5/6 of the authored barrier gaps — taking most but not all, so off-road
+alternates survive and multiple routes remain.
 
-## Known problems
+**Full-map view is readable.** At 1600x900 the map renders at 12px/tile, at
+1280x800 at 9px/tile; the minimum entity sizes keep towers, player and enemies
+legible at both. The 2:1 map in a ~1.4:1 stage letterboxes top and bottom.
 
-1. **Fleeing is not yet clearly the better play.** A crude flee bot (abandon at
-   30% tower HP, run in a straight line) did *worse* than sitting on two of
-   three seeds — it stops repairing, and it eats hits crossing the siege.
-   Unresolved whether this is bad bot play or a genuine balance gap. **This is
-   the single most important thing to test with a human.**
-2. **Waves run long** — 70–110s each, occasionally 160–190s. A full 8-wave run
-   is 12–15 minutes. Most of it is approach time (23s for Swarm, 39s for Heavy,
-   from edge to centre) and slow stragglers.
-3. **Mid-game Materials still accumulate** past wave 5 even with escalating
-   costs; upgrades are not an expensive enough sink.
-4. The event log bottom-right can overlap a tower near that corner.
+**Outside is lethal, as intended.** Standing still exposed mid-wave: first hit
+after 4.4-5.7s, dead in 5.5-6.0s. Enemy hits are 32/38/55, so 2-4 hits kill.
+
+**Tower-to-tower escape has the right gradient** (24 sampled dashes across a
+contested corridor):
+
+| corridor | avg HP lost | deaths |
+|---|---|---|
+| short, covered (8t) | 34 | 0/6 |
+| mid, covered (13t) | 26 | 0/6 |
+| long, uncovered (24t) | 45 | 3/12 |
+
+**Central turtling does not dominate.** A bot that only ever builds within 14
+tiles of the centre died on wave 7.
+
+**Stay-versus-run still bites.** A bot that never abandons a tower died on waves
+6 and 8 of 8, both times crushed by the collapse it refused to leave.
+
+## Acceptance status and known risks
+
+
+Controller acceptance has now been run; results above.
+
+**Circular kiting was a real exploit and is now closed.** Before the fix a
+player looping at radius 11 survived a full wave on 2 of 6 seeds (90s, 10 laps,
+55 of 100 HP lost) while towers shot the pursuers. Hunters now intercept (D31);
+all six seeds now die, the longest lasting 23.9s.
+
+Turtling was measured rather than pre-empted, and does not dominate (bot died
+wave 7). Material accumulation is also much reduced - repair spend now absorbs
+income, and one seed finished waves at zero Materials.
+
+Remaining concerns, in priority order:
+
+1. **A long uncovered run is dangerous but not "usually fatal"** - 3 deaths in
+   12, arriving at ~55% HP. The brief's wording implies harsher. Note the probe
+   seeds a fixed 9-enemy group in the corridor, which likely understates a real
+   wave, so measure again before tuning.
+2. **Interception has a side effect**: pursuers over-commit to one intercept
+   point, making a long straight sprint slightly cheaper and a short covered
+   dash slightly costlier than before the fix.
+3. **Waves still run 56-118s**, so a full 8-wave run is 10-12 minutes.
+4. The map's 2:1 aspect leaves large letterbox bands at typical window shapes.
 
 ## Next steps
 
-1. **Play it by hand, several maps.** Specifically: does abandoning a tower ever
-   feel like the right call, and does terrain ever make you think "that would be
-   a good place for a tower"? Nothing automated can answer either.
-2. If waves drag: cut `WAVE.totalToSurvive` to 6, or raise enemy speeds again.
-3. If Materials still pile up: raise upgrade costs, or add a third upgrade tier.
-4. If fleeing stays weak: reduce `ENEMY.playerAttackRange` or raise the
-   collapse warning threshold above 20% so abandoning is possible earlier.
-
-## Delegated work
-
-None outstanding. This was implemented directly by Claude — the router
-(`route.js`) reported no delegating worker available: Gemini and the Antigravity
-workers are under global readiness quarantine, and Codex is skipped because this
-project is not a git repository (`workspace-incompatible: git-repo-required`).
-`git init` was deliberately **not** run; say the word and Codex becomes
-available for follow-up work.
+1. Play it by hand. The automated probes cannot answer whether a *human* finds
+   the collapse decision tense rather than arbitrary.
+2. If long runs should be deadlier, raise Swarm `playerHit` or widen
+   `pursuitLeadRange` rather than adding any new mechanic.
+3. If waves drag, cut `WAVE.totalToSurvive` to 6.

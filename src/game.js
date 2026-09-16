@@ -6,12 +6,13 @@ import {
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
-  kindAt, elevAt, hasLineOfSight,
+  kindAt, elevAt, hasLineOfSight, hasClearWalk,
 } from './terrain.js';
 import { computeField, steer } from './flowfield.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+export const PLAYER_TARGET_ID = 'player';
 
 // ---------------------------------------------------------------------------
 
@@ -42,6 +43,7 @@ export function createGame(seedString, archetypeKey) {
     selected: null, buildMode: false,
     cursor: { x: map.start.x, y: map.start.y },
     occupiedTowerId: null,
+    shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
     input: { mx: 0, my: 0, melee: false, repair: false },
     playerField: null, playerFieldAt: -99,
     log: [],
@@ -51,7 +53,7 @@ export function createGame(seedString, archetypeKey) {
 
   const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true);
   start.hp = start.maxHp;
-  say(g, `Seed ${seed} — objective zone lies to the ${map.objective.side}.`);
+  say(g, `Seed ${seed} — survive ${WAVE.totalToSurvive} waves.`);
   return g;
 }
 
@@ -111,6 +113,7 @@ export function canPlaceAt(g, x, y) {
       const k = kindAt(g.map, tx, ty);
       if (k === T.CLIFF) reasons.push('cliff');
       else if (k === T.DEEP) reasons.push('deep water');
+      if (g.map.road[idx(tx, ty)]) reasons.push('on the road');
       const e = elevAt(g.map, tx, ty);
       minE = Math.min(minE, e);
       maxE = Math.max(maxE, e);
@@ -136,7 +139,6 @@ export function canPlaceAt(g, x, y) {
     cost,
     income: resourceScoreAt(g.map, x, y, eRadius) * TOWER.extraction.baseRate,
     coverage: coverageAt(g.map, x, y, TOWER.weapon.range),
-    inObjective: Math.hypot(g.map.objective.x + 0.5 - x, g.map.objective.y + 0.5 - y) <= g.map.objective.r,
     terrain: kindAt(g.map, Math.floor(x), Math.floor(y)),
     elev: elevAt(g.map, Math.floor(x), Math.floor(y)),
   };
@@ -155,7 +157,6 @@ function placeTower(g, x, y, instant = false) {
     flash: 0, smoke: 0,
     field: null,
     resourceScore: resourceScoreAt(g.map, x, y, TOWER.extraction.radius),
-    isObjective: Math.hypot(g.map.objective.x + 0.5 - x, g.map.objective.y + 0.5 - y) <= g.map.objective.r,
   };
   g.towers.push(t);
   return t;
@@ -167,7 +168,7 @@ export function tryBuild(g, x, y) {
   g.materials -= check.cost;
   const t = placeTower(g, x, y, false);
   g.selected = t.id;
-  say(g, t.isObjective ? 'Construction started in the OBJECTIVE ZONE.' : 'Construction started.');
+  say(g, 'Construction started.');
   return check;
 }
 
@@ -216,7 +217,7 @@ export function repairCostPerHp(g) {
 }
 
 function towerField(g, t) {
-  if (!t.field) t.field = computeField(g.map, [idx(clampTx(t.x), clampTy(t.y))]);
+  if (!t.field) t.field = computeField(g.map, [idx(clampTx(t.x), clampTy(t.y))], 'lane');
   return t.field;
 }
 const clampTx = (x) => clamp(Math.floor(x), 0, MAP.w - 1);
@@ -278,15 +279,22 @@ function updatePlayer(g, dt) {
 
   let { mx, my } = g.input;
   const len = Math.hypot(mx, my);
+  const wasX = p.x;
+  const wasY = p.y;
   if (len > 0) {
     mx /= len; my /= len;
     p.facing = { x: mx, y: my };
     moveWithCollision(g, p, mx * speed * dt, my * speed * dt, PLAYER.radius);
   }
+  // Actual achieved velocity, so hunters lead the player's real path rather
+  // than their intent (terrain drag and walls are already accounted for).
+  p.vx = dt > 0 ? (p.x - wasX) / dt : 0;
+  p.vy = dt > 0 ? (p.y - wasY) / dt : 0;
 
   if (g.phase === 'prep' && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + PLAYER.regen * dt);
 
-  // Occupied Tower: the nearest finished tower the player is standing in.
+  // Shelter is earned, not instantaneous. Occupancy (and its bonuses) begins
+  // only after continuously remaining inside one finished tower long enough.
   let best = null;
   let bestD = PLAYER.presenceRadius;
   for (const t of g.towers) {
@@ -294,9 +302,20 @@ function updatePlayer(g, dt) {
     const d = dist(p, t);
     if (d <= bestD) { bestD = d; best = t; }
   }
-  const prev = g.occupiedTowerId;
-  g.occupiedTowerId = best ? best.id : null;
-  if (best && prev !== best.id) g.selected = best.id;
+  if (!best) {
+    g.shelter.towerId = null;
+    g.shelter.progress = 0;
+    g.occupiedTowerId = null;
+  } else {
+    if (g.shelter.towerId !== best.id) {
+      g.shelter.towerId = best.id;
+      g.shelter.progress = 0;
+      g.occupiedTowerId = null;
+      g.selected = best.id;
+    }
+    g.shelter.progress = Math.min(g.shelter.required, g.shelter.progress + dt);
+    g.occupiedTowerId = g.shelter.progress >= g.shelter.required ? best.id : null;
+  }
 
   if (g.input.melee && p.meleeCd <= 0) {
     p.meleeCd = PLAYER.melee.cooldown;
@@ -360,7 +379,7 @@ function updateTowers(g, dt) {
       if (t.progress >= 1) {
         t.built = true;
         t.hp = t.maxHp;
-        say(g, t.isObjective ? 'OBJECTIVE tower online.' : 'Tower online.');
+        say(g, 'Tower online.');
       }
       continue;
     }
@@ -452,9 +471,12 @@ export function spawnGroupAt(g, x, y, typeKey, count) {
 function aggroScore(g, e, t) {
   let w = AGGRO.baseWeight;
   if (t.id === g.occupiedTowerId) w = AGGRO.occupiedWeight;
-  else if (t.isObjective) w = AGGRO.objectiveWeight;
   if (!t.built) w *= 0.8;
   return w / (1 + dist(e, t) / AGGRO.distanceScale);
+}
+
+function playerAggroScore(g, e) {
+  return AGGRO.playerWeight / (1 + dist(e, g.player) / AGGRO.playerDistanceScale);
 }
 
 /**
@@ -463,25 +485,29 @@ function aggroScore(g, e, t) {
  * margin, so aggro rolls over gradually rather than the map turning as one.
  */
 function retarget(g, e) {
-  if (!g.towers.length) { e.targetId = null; return; }
-  const current = g.towers.find((t) => t.id === e.targetId) || null;
-  if (current && e.sieging) return;
-
-  let best = current;
-  let bestScore = current ? aggroScore(g, e, current) * AGGRO.switchMargin : -1;
+  const currentTower = g.towers.find((t) => t.id === e.targetId) || null;
+  if (currentTower && e.sieging) return;
+  const playerExposed = g.occupiedTowerId === null;
+  const currentIsPlayer = e.targetId === PLAYER_TARGET_ID && playerExposed;
+  let best = currentTower ? currentTower.id : currentIsPlayer ? PLAYER_TARGET_ID : null;
+  let bestScore = currentTower ? aggroScore(g, e, currentTower) * AGGRO.switchMargin
+    : currentIsPlayer ? playerAggroScore(g, e) * AGGRO.switchMargin : -1;
   for (const t of g.towers) {
-    if (t === current) continue;
+    if (t === currentTower) continue;
     const s = aggroScore(g, e, t);
-    if (s > bestScore) { bestScore = s; best = t; }
+    if (s > bestScore) { bestScore = s; best = t.id; }
   }
-  if (best && best !== current) { e.targetId = best.id; e.sieging = false; }
-  else if (!current && best) e.targetId = best.id;
+  if (playerExposed && !currentIsPlayer) {
+    const s = playerAggroScore(g, e);
+    if (s > bestScore) { bestScore = s; best = PLAYER_TARGET_ID; }
+  }
+  if (best !== e.targetId) { e.targetId = best; e.sieging = false; }
 }
 
 function playerField(g) {
   if (g.time - g.playerFieldAt > 0.5) {
     g.playerFieldAt = g.time;
-    g.playerField = computeField(g.map, [idx(clampTx(g.player.x), clampTy(g.player.y))]);
+    g.playerField = computeField(g.map, [idx(clampTx(g.player.x), clampTy(g.player.y))], 'direct');
   }
   return g.playerField;
 }
@@ -499,14 +525,17 @@ function updateEnemies(g, dt) {
     }
 
     if (e.targetId !== null && !g.towers.some((t) => t.id === e.targetId)) {
-      e.targetId = null;
-      e.sieging = false;
+      if (e.targetId !== PLAYER_TARGET_ID || g.occupiedTowerId !== null) {
+        e.targetId = null;
+        e.sieging = false;
+      }
     }
-    if (e.targetId === null && g.towers.length) retarget(g, e);
+    if (e.targetId === null) retarget(g, e);
 
     // Opportunistic swipe at a player who wanders into reach, wherever it is headed.
     const dPlayer = dist(e, p);
-    if (dPlayer <= ENEMY.playerAttackRange + e.def.radius && e.hitCd <= 0 && p.hurtCd <= 0) {
+    if (g.occupiedTowerId === null && dPlayer <= ENEMY.playerAttackRange + e.def.radius
+        && e.hitCd <= 0 && p.hurtCd <= 0) {
       e.hitCd = ENEMY.playerHitCooldown;
       p.hp -= e.def.playerHit;
       p.hurtCd = PLAYER.invulnAfterHit;
@@ -515,6 +544,7 @@ function updateEnemies(g, dt) {
     }
 
     const resolved = g.towers.find((t) => t.id === e.targetId) || null;
+    const huntingPlayer = e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null;
     let aim = null;
     let reach = 0;
 
@@ -533,7 +563,7 @@ function updateEnemies(g, dt) {
         resolved.hp -= dealt;
         resolved.flash = 1;
         if (before >= TOWER.collapsingAt && resolved.hp / resolved.maxHp < TOWER.collapsingAt) {
-          say(g, resolved.isObjective ? 'OBJECTIVE TOWER IS COLLAPSING.' : 'A tower is COLLAPSING.');
+          say(g, 'A tower is COLLAPSING.');
         }
         if (resolved.hp <= 0) destroyTower(g, resolved);
 
@@ -548,9 +578,8 @@ function updateEnemies(g, dt) {
         aim = steer(g.map, towerField(g, resolved), e.x, e.y);
         if (!aim) aim = normTo(e, resolved);
       }
-    } else {
-      // No towers left anywhere: come for the player.
-      aim = steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
+    } else if (huntingPlayer) {
+      aim = interceptAim(g, e, p) || steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
     }
 
     // Separation keeps the crowd from collapsing into one dot.
@@ -580,8 +609,8 @@ function updateEnemies(g, dt) {
     // besieging anything would otherwise hold the wave open forever.
     if (!e.sieging && Math.hypot(e.x - px, e.y - py) < speed * dt * 0.2) {
       e.stuck = (e.stuck || 0) + dt;
-      if (e.stuck > 1.5 && resolved) {
-        const nudge = bestNeighbourTile(g, towerField(g, resolved), e.x, e.y);
+      if (e.stuck > 1.5 && (resolved || huntingPlayer)) {
+        const nudge = bestNeighbourTile(g, resolved ? towerField(g, resolved) : playerField(g), e.x, e.y);
         if (nudge) { e.x = nudge.x; e.y = nudge.y; }
         e.stuck = 0;
       }
@@ -607,6 +636,23 @@ function bestNeighbourTile(g, field, x, y) {
     }
   }
   return Number.isFinite(bestD) ? best : null;
+}
+
+/**
+ * D31: close-range interception. A hunter with a clear run at the player aims at
+ * where they will be, not where they are, so a player running a circle gets cut
+ * off instead of towed around behind the pack. Falls back to the flow field
+ * whenever the direct line is blocked, so this never walks anyone into a cliff.
+ */
+function interceptAim(g, e, p) {
+  const d = dist(e, p);
+  if (d > ENEMY.pursuitLeadRange) return null;
+  if (!hasClearWalk(g.map, e.x, e.y, p.x, p.y)) return null;
+  const lead = Math.min(ENEMY.pursuitLeadTime, d / Math.max(0.5, e.def.speed));
+  const ax = p.x + (p.vx || 0) * lead - e.x;
+  const ay = p.y + (p.vy || 0) * lead - e.y;
+  const l = Math.hypot(ax, ay);
+  return l > 0.05 ? { x: ax / l, y: ay / l } : null;
 }
 
 function normTo(from, to) {
@@ -751,9 +797,9 @@ function updateWaves(g, dt) {
       g.phaseLeft = WAVE.aftermath;
       g.stats.wavesCleared++;
       say(g, `Wave ${g.wave} cleared.`);
-      if (g.wave >= WAVE.totalToSurvive && objectiveHeld(g)) {
+      if (g.wave >= WAVE.totalToSurvive) {
         g.status = 'won';
-        say(g, 'Objective held and the line survived. Run complete.');
+        say(g, 'The final wave broke. Run complete.');
       }
     }
     return;
@@ -766,14 +812,20 @@ function updateWaves(g, dt) {
   }
 }
 
-export function objectiveHeld(g) {
-  return g.towers.some((t) => t.isObjective && t.built && t.hp > 0);
-}
-
 export function forceNextWave(g) {
   if (g.phase === 'combat') return;
   g.phase = 'prep';
   g.phaseLeft = 0;
+}
+
+/** Stable semantic state for the acceptance harness and HUD. */
+export function dangerState(g) {
+  return {
+    sheltered: g.occupiedTowerId !== null,
+    shelterTowerId: g.shelter.towerId,
+    shelterProgress: g.shelter.required ? g.shelter.progress / g.shelter.required : 0,
+    hunters: g.enemies.filter((e) => e.targetId === PLAYER_TARGET_ID).length,
+  };
 }
 
 // ---------------------------------------------------------------------------

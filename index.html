@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Holdfast — presence prototype</title>
+<title>Holdfast</title>
 <style>
   :root {
     --bg: #0d1016;
@@ -54,14 +54,6 @@
   .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
   .chip.phase-prep { border-color: var(--green); }
   @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
-
-  /* ---- minimap ---- */
-  #minimap-wrap {
-    position: absolute; left: 8px; bottom: 8px;
-    background: rgba(12,15,20,0.9); border: 1px solid var(--line);
-    border-radius: 5px; padding: 4px; line-height: 0;
-  }
-  canvas#minimap { display: block; image-rendering: pixelated; }
 
   /* ---- event log ---- */
   #log {
@@ -130,6 +122,20 @@
   }
   .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
   .start:hover { background: #ffe08a; }
+
+  @media (prefers-reduced-motion: reduce) { .chip.phase-warning { animation: none; } }
+  button:focus-visible, .start:focus-visible, .seedrow input:focus-visible {
+    outline: 2px solid var(--gold); outline-offset: 2px;
+  }
+
+  /* Phone width: stack the HUD under the battlefield so nothing scrolls sideways. */
+  @media (max-width: 720px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+    #stage { height: 58vh; height: 58dvh; }
+    #side { border-left: none; border-top: 1px solid var(--line); max-height: 42vh; max-height: 42dvh; }
+    .picks { grid-template-columns: 1fr; }
+    #log { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -153,18 +159,17 @@
       <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
       <div class="chip">HP <b id="hud-hp">100</b></div>
       <div class="chip" id="hud-occ">Unoccupied</div>
-      <div class="chip">Objective <b id="hud-obj">—</b></div>
+      <div class="chip" id="hud-danger">SAFE DURING PREP</div>
       <div class="chip muted" id="hud-seed">seed</div>
       <div class="chip" id="hud-effects" hidden></div>
     </div>
 
-    <div id="minimap-wrap"><canvas id="minimap"></canvas></div>
     <div id="log"></div>
 
     <div class="overlay" id="select-overlay">
       <div class="card">
         <h1>Holdfast</h1>
-        <p class="lede">Towers hold the ground. You make one of them formidable — and make it the thing everything wants to kill.</p>
+        <p class="lede">During combat, towers are safe islands and open ground belongs to the enemy. Survive the final wave.</p>
         <div class="picks" id="picks"></div>
         <div class="seedrow">
           <label for="seed-input">Seed</label>
@@ -198,7 +203,7 @@
       <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
       <div class="row"><span>Income</span><span id="p-income">0.0 /s</span></div>
       <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
-      <div class="row"><span>Objective</span><span id="p-obj">not established</span></div>
+      <div class="row"><span>Combat danger</span><span id="p-danger">safe during prep</span></div>
     </div>
 
     <div class="sec">

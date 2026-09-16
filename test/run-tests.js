@@ -2,10 +2,10 @@
 // the D2 terrain guarantees, pathing reachability, line of sight, and a long
 // scripted simulation run. Feel is judged by playing it, not by this file.
 
-import { MAP, T, VALID, PLAYER, TOWER, WAVE } from '../src/config.js';
+import { MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE } from '../src/config.js';
 import { generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt } from '../src/terrain.js';
 import { computeField } from '../src/flowfield.js';
-import { createGame, update, canPlaceAt, tryBuild, objectiveHeld, towerStats } from '../src/game.js';
+import { createGame, update, canPlaceAt, tryBuild, towerStats } from '../src/game.js';
 
 let passed = 0;
 const failures = [];
@@ -93,9 +93,9 @@ check('the same seed regenerates an identical map', () => {
   for (let i = 0; i < a.kind.length; i++) {
     if (a.kind[i] !== b.kind[i]) return `kind differs at ${i}`;
     if (a.elev[i] !== b.elev[i]) return `elevation differs at ${i}`;
+    if (a.road[i] !== b.road[i]) return `road differs at ${i}`;
     if (Math.abs(a.res[i] - b.res[i]) > 1e-9) return `resources differ at ${i}`;
   }
-  if (a.objective.x !== b.objective.x || a.objective.side !== b.objective.side) return 'objective differs';
   return null;
 });
 
@@ -123,16 +123,6 @@ check('enemies from both edges can always reach the start tower', () => {
   return null;
 });
 
-check('the player can walk from the start tower to the objective zone', () => {
-  for (const m of maps) {
-    const field = computeField(m, [idx(m.start.x, m.start.y)]);
-    if (!Number.isFinite(field[idx(m.objective.x, m.objective.y)])) {
-      return `${m.seed}: objective zone is unreachable on foot`;
-    }
-  }
-  return null;
-});
-
 check('slow terrain really costs more to cross than open ground', () => {
   const m = maps[0];
   const field = computeField(m, [idx(m.start.x, m.start.y)]);
@@ -155,6 +145,83 @@ check('slow terrain really costs more to cross than open ground', () => {
   const open = openSum / openN;
   const marsh = marshSum / marshN;
   return marsh > open ? null : `marsh (${marsh.toFixed(2)}) is not costlier than open ground (${open.toFixed(2)})`;
+});
+
+// --- D20-D22: road network and two movement cost modes ---------------------
+
+function floodRoad(map) {
+  const start = idx(map.roadCenter.x, map.roadCenter.y);
+  const seen = new Uint8Array(map.road.length);
+  const queue = map.road[start] ? [start] : [];
+  if (queue.length) seen[start] = 1;
+  for (let head = 0; head < queue.length; head++) {
+    const i = queue[head];
+    const x = i % MAP.w;
+    const y = (i / MAP.w) | 0;
+    for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + ox;
+      const ny = y + oy;
+      if (nx < 0 || ny < 0 || nx >= MAP.w || ny >= MAP.h) continue;
+      const ni = idx(nx, ny);
+      if (!seen[ni] && map.road[ni]) { seen[ni] = 1; queue.push(ni); }
+    }
+  }
+  return seen;
+}
+
+check('roads form one network from both spawn sides to the centre', () => {
+  for (const m of maps) {
+    const roadCount = m.road.reduce((n, v) => n + v, 0);
+    if (!roadCount) return `${m.seed}: no road tiles`;
+    if (m.roadConnectors < 1 || m.roadConnectors > 2) {
+      return `${m.seed}: expected 1-2 lateral connectors, got ${m.roadConnectors}`;
+    }
+    const seen = floodRoad(m);
+    if (!seen[idx(m.roadCenter.x, m.roadCenter.y)]) return `${m.seed}: centre is not road`;
+    for (const side of ['west', 'east']) {
+      for (const p of m.spawns[side]) {
+        if (!seen[idx(p.x, p.y)]) return `${m.seed}: ${side} mouth (${p.x},${p.y}) is disconnected`;
+      }
+    }
+    for (let i = 0; i < m.road.length; i++) {
+      if (m.road[i] && !seen[i]) return `${m.seed}: detached road tile ${i}`;
+    }
+  }
+  return null;
+});
+
+check('roads never make or cross impassable terrain', () => {
+  for (const m of maps) {
+    for (let i = 0; i < m.road.length; i++) {
+      if (m.road[i] && !PASSABLE[m.kind[i]]) return `${m.seed}: road crosses tile ${i} kind ${m.kind[i]}`;
+    }
+  }
+  return null;
+});
+
+check('road layouts vary by seed', () => {
+  const a = generateMap('ROAD-VARIANT-A');
+  const b = generateMap('ROAD-VARIANT-B');
+  let different = 0;
+  for (let i = 0; i < a.road.length; i++) if (a.road[i] !== b.road[i]) different++;
+  return different > MAP.w ? null : `only ${different} road tiles differ`;
+});
+
+check('lane fields discount roads while direct fields ignore the road bitfield', () => {
+  for (const m of maps.slice(0, 5)) {
+    const target = idx(m.roadCenter.x, m.roadCenter.y);
+    const direct = computeField(m, [target], 'direct');
+    const lane = computeField(m, [target], 'lane');
+    const noRoad = { ...m, road: new Uint8Array(m.road.length) };
+    const directWithoutRoad = computeField(noRoad, [target], 'direct');
+    let discounted = false;
+    for (let i = 0; i < m.road.length; i++) {
+      if (Math.abs(direct[i] - directWithoutRoad[i]) > 1e-4) return `${m.seed}: direct mode changed with road bits`;
+      if (m.road[i] && lane[i] + 0.1 < direct[i]) discounted = true;
+    }
+    if (!discounted) return `${m.seed}: lane field never became cheaper on roads`;
+  }
+  return null;
 });
 
 // --- D3: line of sight -------------------------------------------------------
@@ -240,6 +307,26 @@ check('placement refuses cliffs, deep water and crowding', () => {
   return null;
 });
 
+check('tower footprints refuse road tiles', () => {
+  const g = createGame('ROAD-PLACEMENT', 'engineer');
+  g.materials = 99999;
+  const start = g.towers[0];
+  for (let y = Math.floor(start.y - TOWER.radius); y <= Math.ceil(start.y + TOWER.radius); y++) {
+    for (let x = Math.floor(start.x - TOWER.radius); x <= Math.ceil(start.x + TOWER.radius); x++) {
+      if (Math.hypot(x + 0.5 - start.x, y + 0.5 - start.y) <= TOWER.radius + 0.3
+          && g.map.road[idx(x, y)]) return 'starting tower overlaps a road';
+    }
+  }
+  for (let y = 2; y < MAP.h - 2; y++) {
+    for (let x = 2; x < MAP.w - 2; x++) {
+      if (!g.map.road[idx(x, y)]) continue;
+      const result = canPlaceAt(g, x + 0.5, y + 0.5);
+      return result.reasons.includes('on the road') ? null : `road at (${x},${y}) was not named as a refusal`;
+    }
+  }
+  return 'no interior road tile found';
+});
+
 check('a site on rich ground reports more income than a barren one', () => {
   const g = createGame('ECONOMY', 'prospector');
   const m = g.map;
@@ -306,7 +393,7 @@ check('a sieging enemy does not abandon its target when the player leaves', () =
 
   g.player.x = a.x;
   g.player.y = a.y;
-  update(g, 0.01);
+  for (let i = 0; i < 60; i++) update(g, 1 / 60);
   if (g.occupiedTowerId !== a.id) return 'player did not occupy the first tower';
 
   // An enemy that has arrived and started chewing on tower A.
@@ -365,12 +452,43 @@ check('occupying a tower is a large, visible upgrade', () => {
     const away = towerStats(g, t);
     g.player.x = t.x;
     g.player.y = t.y;
-    update(g, 0.01);
+    for (let i = 0; i < 60; i++) update(g, 1 / 60);
     const here = towerStats(g, t);
     const dps = (here.damage * here.fireRate) / (away.damage * away.fireRate);
     const inc = here.income / away.income;
     if (dps < 1.3 && inc < 1.3) return `${key}: occupancy changed almost nothing (dps x${dps.toFixed(2)}, income x${inc.toFixed(2)})`;
   }
+  return null;
+});
+
+check('shelter grants occupancy only after the transition delay', () => {
+  const g = createGame('SHELTER', 'engineer');
+  const t = g.towers[0];
+  g.player.x = t.x;
+  g.player.y = t.y;
+  update(g, PLAYER.shelterTime * 0.5);
+  if (g.occupiedTowerId !== null) return 'tower became occupied halfway through sheltering';
+  if (towerStats(g, t).occupied) return 'occupancy bonuses applied during shelter transition';
+  const e = {
+    id: 997, type: 'swarm', def: { radius: 0.34, hp: 1e6, speed: 0,
+      towerDps: 0, playerHit: 10, color: '#fff' }, side: 'debug',
+    x: g.player.x + 0.2, y: g.player.y, hp: 1e6, maxHp: 1e6,
+    targetId: null, sieging: false, siegeAngle: 0, retargetIn: 99, hitCd: 0, flash: 0,
+  };
+  g.enemies.push(e);
+  update(g, 0.01);
+  if (g.player.hp === g.player.maxHp) return 'player could not be hit during shelter transition';
+  update(g, PLAYER.shelterTime * 0.51);
+  if (g.occupiedTowerId !== t.id) return 'tower did not become occupied after the full delay';
+  if (!towerStats(g, t).occupied) return 'occupancy bonuses did not apply after sheltering';
+  const shelteredHp = g.player.hp;
+  e.hitCd = 0;
+  g.player.hurtCd = 0;
+  update(g, 0.01);
+  if (g.player.hp < shelteredHp) return 'sheltered player was hit by enemy melee';
+  g.player.x += PLAYER.presenceRadius + 1;
+  update(g, 0.01);
+  if (g.occupiedTowerId !== null || g.shelter.progress !== 0) return 'leaving did not reset shelter';
   return null;
 });
 
@@ -428,22 +546,6 @@ check('waves escalate rather than staying flat', () => {
   return sizes[sizes.length - 1] > sizes[0] * 1.5
     ? null
     : `wave 1 averages ${sizes[0].toFixed(1)} units, wave ${WAVE.totalToSurvive} averages ${sizes[sizes.length - 1].toFixed(1)}`;
-});
-
-check('the objective only counts once a tower there is finished and alive', () => {
-  const g = createGame('OBJECTIVE', 'engineer');
-  g.materials = 9999;
-  if (objectiveHeld(g)) return 'objective reported held before anything was built';
-  const o = g.map.objective;
-  const r = tryBuild(g, o.x + 0.5, o.y + 0.5);
-  if (!r.ok) return `could not build in the objective zone: ${r.reasons.join(', ')}`;
-  const t = g.towers[g.towers.length - 1];
-  if (!t.isObjective) return 'tower in the objective zone was not flagged as the objective';
-  if (objectiveHeld(g)) return 'unfinished objective tower counted as held';
-  t.built = true;
-  t.progress = 1;
-  if (!objectiveHeld(g)) return 'finished objective tower did not count';
-  return null;
 });
 
 // ---------------------------------------------------------------------------
