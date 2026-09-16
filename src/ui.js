@@ -28,15 +28,18 @@ export function updateHud(g) {
 
   $('hud-mat').textContent = Math.floor(g.materials);
   $('hud-wave').textContent = `${g.wave}/${WAVE.totalToSurvive}`;
-  $('hud-phase').textContent = g.phase === 'warning'
+  $('hud-phase').textContent = g.paused ? 'PAUSED' : g.phase === 'warning'
     ? `INCOMING — ${g.spawnSides.map((s) => s.toUpperCase()).join(' + ')}`
     : phaseLabel;
   $('hud-timer').textContent = g.phase === 'combat'
     ? `${g.enemies.length + g.pendingSpawns.length} left`
     : `${Math.max(0, g.phaseLeft).toFixed(0)}s`;
-  $('hud-phase-chip').className = `chip phase-${g.phase}`;
+  $('hud-phase-chip').className = `chip ${g.paused ? '' : `phase-${g.phase}`}`;
   $('hud-hp').textContent = Math.max(0, Math.round(g.player.hp));
   $('hud-seed').textContent = `seed ${g.seed}`;
+  const pause = $('pause-toggle');
+  pause.textContent = g.paused ? '[P] Resume' : '[P] Pause';
+  pause.className = g.paused ? 'on' : '';
 
   const occ = g.towers.find((t) => t.id === g.occupiedTowerId);
   const occChip = $('hud-occ');
@@ -62,7 +65,7 @@ export function updateHud(g) {
   fxChip.hidden = fx.length === 0;
   if (fx.length) {
     fxChip.innerHTML = fx.map(([k, t]) =>
-      `<span style="color:${DROP.types[k].color}">${DROP.types[k].name} ${t.toFixed(0)}s</span>`).join(' · ');
+      `<span style="color:${DROP.temporary[k].color}">${DROP.temporary[k].name} ${t.toFixed(0)}s</span>`).join(' · ');
   }
 
   // --- side panel: run ---
@@ -80,6 +83,9 @@ export function updateHud(g) {
     : g.phase === 'combat'
       ? `<span class="warn">EXPOSED · ${danger.hunters} hunting</span>`
       : danger.shelterTowerId ? `<span class="good">sheltering ${shelterPct}%</span>` : 'safe during prep';
+  $('p-equipment').textContent = g.equipment.length
+    ? g.equipment.map((key) => DROP.equipment[key].name).join(' · ')
+    : 'None';
 
   // --- side panel: selected tower ---
   const sel = g.towers.find((t) => t.id === (g.selected ?? g.occupiedTowerId));
@@ -103,29 +109,30 @@ export function updateHud(g) {
     $('sel-range').textContent = `${fmt(s.range, 1)} tiles`;
     $('sel-levels').textContent = `W${sel.wLevel} / E${sel.eLevel} (max ${TOWER.upgrade.maxLevel})`;
 
-    setUpgradeButton($('up-weapon'), '[1] Weapon upgrade', upgradeCost(sel, 'weapon'), g.materials, sel.built);
-    setUpgradeButton($('up-extract'), '[2] Extraction upgrade', upgradeCost(sel, 'extraction'), g.materials, sel.built);
+    setUpgradeButton($('up-weapon'), '[1] Weapon upgrade', upgradeCost(sel, 'weapon'), g.materials, sel.built && !g.paused);
+    setUpgradeButton($('up-extract'), '[2] Extraction upgrade', upgradeCost(sel, 'extraction'), g.materials, sel.built && !g.paused);
 
     const perHp = repairCostPerHp(g);
     const missing = sel.maxHp - sel.hp;
     $('sel-repair').textContent = missing > 0
       ? `${Math.ceil(missing * perHp)} Materials (${fmt(perHp, 2)}/hp)`
       : 'undamaged';
-    $('sel-repair-note').innerHTML = s.occupied
+    $('sel-repair-note').innerHTML = g.paused ? '<span class="muted">Disabled while paused.</span>' : s.occupied
       ? '<span class="good">Occupied: repairing fast.</span> Hold <b>R</b>.'
       : 'Hold <b>R</b>. Standing in the tower repairs far faster.';
   }
 
   // --- build ---
   $('build-cost').textContent = `${towerCost(g)} M`;
+  $('build-toggle').disabled = g.paused;
   $('build-state').textContent = g.buildMode ? '— ACTIVE' : '';
   $('build-state').className = g.buildMode ? 'good' : 'muted';
   const info = $('build-info');
   if (g.buildMode && g.buildCheck) {
     const c = g.buildCheck;
     info.innerHTML = [
-      `<b>${TILE_NAME[c.terrain]}</b>, elevation ${c.elev}`,
-      `Income here: <b>${fmt(c.income, 2)} /s</b> ${incomeVerdict(c.income)}`,
+      `<b>${TILE_NAME[c.terrain]}</b>, elevation <b>${c.elevationName}</b> — ${sightMeaning(c)}`,
+      `Extraction: <span style="color:var(--gold)">${'▰'.repeat(c.richness.bars)}</span> <b>${c.richness.name}</b> - ${fmt(c.income, 2)} Materials/sec`,
       `Visibility: <b>${(c.coverage * 100).toFixed(0)}%</b> of ground in range`,
       c.ok ? '<span class="good">Valid site — click to build.</span>'
            : `<span class="warn">Blocked: ${c.reasons.join(', ')}</span>`,
@@ -141,11 +148,11 @@ export function updateHud(g) {
   }
 }
 
-function incomeVerdict(v) {
-  if (v > 1.1) return '<span class="good">rich</span>';
-  if (v > 0.6) return '<span style="color:var(--gold)">decent</span>';
-  if (v > 0.25) return '<span class="muted">thin</span>';
-  return '<span class="warn">barren</span>';
+function sightMeaning(c) {
+  if (c.elevationName === 'Cliff') return 'impassable and blocks sight';
+  if (c.elev === 0) return 'forest blocks sight';
+  if (c.elev === 1) return 'sees over Low forest';
+  return 'sees over Low and Normal forest';
 }
 
 function setUpgradeButton(btn, label, cost, materials, built) {
@@ -162,9 +169,14 @@ export function updateMapInfo(g) {
   const r = g.map.report;
   const barriers = r.barriers.map((b) =>
     `${b.type}@x${b.cx}: ${b.routes} route(s), narrowest ${b.narrowest}t`).join('<br />');
+  const parallel = ['west', 'east'].map((side) => {
+    const p = r.parallelRoutes[side];
+    return `${side}: median ${p.median}, max ${p.max}, 3+ cols ${p.columnsWithThree}`;
+  }).join(' · ');
   $('d-mapinfo').innerHTML = [
     `seed <b>${g.seed}</b> — accepted on attempt ${g.map.attempts}${g.map.relaxed ? ' <span class="warn">(relaxed)</span>' : ''}`,
     `open ${(r.openFrac * 100).toFixed(0)}% · forest ${(r.forestFrac * 100).toFixed(0)}% · water ${(r.waterFrac * 100).toFixed(0)}%`,
+    `parallel roads — ${parallel}`,
     barriers,
     r.problems.length ? `<span class="warn">${r.problems.join('; ')}</span>` : '',
   ].filter(Boolean).join('<br />');

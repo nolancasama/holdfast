@@ -27,15 +27,26 @@ export const PASSABLE = MOVE_COST.map((c) => Number.isFinite(c));
 export const BLOCKS_SIGHT_ALWAYS = [false, false, false, false, false, true];
 export const BLOCKS_SIGHT_UNLESS_ABOVE = [false, true, false, false, false, false];
 
-export const ELEV_BANDS = 4; // 0 low .. 3 high
+// Three walkable bands. Cliff is a terrain kind, not a fourth height bonus.
+export const ELEV_BANDS = 3;
+export const ELEVATION_NAMES = ['Low', 'Normal', 'High'];
 
 // --- terrain generation -----------------------------------------------------
 export const GEN = {
+  elevationCuts: [0.38, 0.68],
   ridges: { min: 2, max: 4, thicknessMin: 2, thicknessMax: 4, wander: 7 },
   ridgeGap: { min: 4, max: 8, minSeparation: 9 },
   river: { widthMin: 3, widthMax: 6, wander: 11 },
   fords: { min: 2, max: 4, heightMin: 4, heightMax: 7 },
-  deposits: { min: 26, max: 38, radiusMin: 4, radiusMax: 9, peakMin: 0.5, peakMax: 1.5 },
+  deposits: {
+    min: 26, max: 38, radiusMin: 4, radiusMax: 9,
+    peakMin: 0.45, peakMax: 1.55, startPeak: 0.36,
+    startExclusionRadius: 12, startBufferRadius: 18, startBufferRejectChance: 0.70,
+    roadSearchRadius: 7, roadDistanceNormalizer: 8,
+    distanceWeight: 0.70, roadDistanceWeight: 0.30,
+    awkwardnessWeight: 0.65, randomWeight: 0.50,
+    distanceMapFraction: 0.48,
+  },
   ambientResource: 0.10,   // every site yields a trickle; deposits are where it pays
   startClearRadius: 4,
   maxAttempts: 24,     // strict validation attempts (D2)
@@ -47,6 +58,16 @@ export const GEN = {
 export const ROAD = {
   existingCost: 0.15,
   carveCost: [1.0, 2.8, 4.2, 3.0, Infinity, Infinity],
+  elevationCrossingCost: 5.5,
+  riverCheapRadius: 2,
+  riverbankCostMult: 0.48,
+  waypointChance: 0.72,
+  waypointYOffsetMin: 8,
+  waypointYOffsetMax: 18,
+  parallelRouteFraction: 0.62,
+  parallelRouteYOffsetMin: 12,
+  parallelRoadAvoidRadius: 3,
+  parallelRoadAvoidCost: 8.0,
   laneDiscount: 0.32,
   connectorsMin: 1,
   connectorsMax: 2,
@@ -62,6 +83,8 @@ export const VALID = {
   openFracMin: 0.30,        // not a maze
   openFracMax: 0.66,        // not a featureless field
   minForestFrac: 0.05,
+  parallelRouteMedianMin: 2,
+  parallelRouteColumnsWithThreeMin: 3,
 };
 
 // --- player -----------------------------------------------------------------
@@ -218,7 +241,25 @@ export const RENDER = {
   healthBarMinWidthPx: 16,
   labelMinPx: 9,
   roadWidthFrac: 0.58,
+  resourceMarkerMinTilePx: 10,
 };
+
+// The exact extraction-rate thresholds used by both labels and bar glyphs.
+export const RICHNESS = {
+  poorMax: 0.62,
+  moderateMax: 1.18,
+  tiers: [
+    { key: 'poor', name: 'Poor', bars: 1 },
+    { key: 'moderate', name: 'Moderate', bars: 2 },
+    { key: 'rich', name: 'Rich', bars: 3 },
+  ],
+};
+
+export function richnessTierForRate(rate) {
+  return rate < RICHNESS.poorMax ? RICHNESS.tiers[0]
+    : rate < RICHNESS.moderateMax ? RICHNESS.tiers[1]
+    : RICHNESS.tiers[2];
+}
 
 // --- drops ------------------------------------------------------------------
 export const DROP = {
@@ -226,11 +267,52 @@ export const DROP = {
   lifetime: 16,
   pickupRadius: 0.9,
   effectDuration: 20,
-  types: {
+  categoryWeights: { temporary: 0.70, materials: 0.22, equipment: 0.08 },
+  materialsCache: { name: 'Materials Cache', color: '#ffd166', min: 24, max: 42 },
+  equipmentCap: 4,
+  temporary: {
     repair: { name: 'Repair Kit', color: '#5ecbff', instant: true, healFrac: 0.35, playerHeal: 25 },
     damage: { name: 'Damage +60%', color: '#ff6b6b', mult: 1.6 },
     extraction: { name: 'Extraction +80%', color: '#ffd166', mult: 1.8 },
     speed: { name: 'Move Speed +45%', color: '#78e08f', mult: 1.45 },
   },
+  equipment: {
+    reinforcedBarrel: { name: 'Reinforced Barrel', color: '#ffe08a', towerDamage: 1.25 },
+    targetingModule: { name: 'Targeting Module', color: '#d8c4ff', towerRange: 1.20 },
+    extractionChip: { name: 'Extraction Chip', color: '#ffd166', extraction: 1.25 },
+    armourPlate: { name: 'Armour Plate', color: '#a9c6d9', playerDamageTaken: 0.75 },
+    boots: { name: 'Boots', color: '#78e08f', playerSpeed: 1.20 },
+    repairRig: { name: 'Repair Rig', color: '#5ecbff', repairCost: 0.60, repairSpeed: 1.40 },
+  },
 };
 
+// D46: audio is observer-only. These values are deliberately separate from
+// gameplay tuning so synthesis/load can be adjusted without changing a run.
+export const AUDIO = {
+  masterVolume: 0.62,
+  voiceCap: 18,
+  eventQueueCap: 96,
+  nearDistance: 3,
+  farDistance: 42,
+  rateLimits: {
+    towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
+    heavyTowerHit: 0.22, collapsing: 0.75, repair: 0.16, default: 0.08,
+  },
+  limiter: { threshold: -12, ratio: 16 },
+  envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
+  cues: {
+    towerFire: [260, .10, 'square'], enemyHit: [430, .045, 'sine'], enemyDeath: [330, .14, 'triangle'],
+    towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'], towerDestroy: [56, .72, 'triangle'],
+    collapsing: [92, .70, 'sawtooth'], playerDamage: [880, .11, 'square'], exposed: [720, .16, 'sawtooth'],
+    towerEntry: [145, .18, 'triangle'], constructionStart: [180, .13, 'square'], constructionComplete: [620, .24, 'triangle'],
+    repair: [760, .06, 'sine'], upgrade: [720, .18, 'triangle'], waveWarning: [185, .40, 'sawtooth'],
+    waveStart: [230, .32, 'sawtooth'], finalWave: [155, .48, 'sawtooth'], victory: [660, .38, 'triangle'], playerDeath: [110, .44, 'sawtooth'],
+  },
+  dropFrequencies: { temporary: 620, materials: 310, equipment: 880 },
+  // D47: positive confirmations RISE in pitch; everything else falls. A falling
+  // tone reads as failure, so a descending victory sting says the wrong thing.
+  risingCues: ['victory', 'constructionComplete', 'upgrade', 'dropCollect'],
+  risingPitchMult: 1.6,
+  collapsingReminderInterval: 2.6,   // seconds between quiet COLLAPSING reminders
+  collapsingReminderGain: 0.4,       // relative to the first announcement
+};

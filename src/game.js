@@ -2,7 +2,7 @@
 
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY, AGGRO,
-  WAVE, START_MATERIALS, DROP,
+  WAVE, START_MATERIALS, DROP, ELEVATION_NAMES, richnessTierForRate, AUDIO,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -25,6 +25,7 @@ export function createGame(seedString, archetypeKey) {
     seed, map, arch, archetypeKey,
     time: 0,
     status: 'playing',
+    paused: false,
     materials: START_MATERIALS,
     phase: 'prep',
     phaseLeft: WAVE.prepFirst,
@@ -36,7 +37,7 @@ export function createGame(seedString, archetypeKey) {
       hp: PLAYER.maxHp, maxHp: PLAYER.maxHp,
       meleeCd: 0, hurtCd: 0, facing: { x: 0, y: 1 },
     },
-    effects: {},
+    effects: {}, equipment: [],
     towers: [], enemies: [], drops: [],
     tracers: [], particles: [], floaters: [],
     nextTowerId: 1, nextEnemyId: 1,
@@ -46,7 +47,7 @@ export function createGame(seedString, archetypeKey) {
     shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
     input: { mx: 0, my: 0, melee: false, repair: false },
     playerField: null, playerFieldAt: -99,
-    log: [],
+    log: [], audioEvents: [],
     stats: { kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0 },
     debug: { showPaths: false, spawnPaused: false, open: false },
   };
@@ -60,6 +61,21 @@ export function createGame(seedString, archetypeKey) {
 function say(g, text) {
   g.log.unshift({ text, t: g.time });
   if (g.log.length > 7) g.log.pop();
+}
+
+/** Bounded observer queue. Audio never affects simulation state or outcomes. */
+export function emitAudioEvent(g, type, { x = g.player.x, y = g.player.y, ...data } = {}) {
+  if (g.audioEvents.length >= AUDIO.eventQueueCap) g.audioEvents.shift();
+  // `type` is applied LAST: callers pass whole entities as data, and enemies
+  // carry their own `type` ('swarm', 'heavy'), which used to overwrite the cue
+  // name and turned every enemy hit and death into the generic fallback beep.
+  g.audioEvents.push({ x, y, ...data, type });
+}
+
+export function drainAudioEvents(g) {
+  const events = g.audioEvents;
+  g.audioEvents = [];
+  return events;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,14 +149,19 @@ export function canPlaceAt(g, x, y) {
   if (g.materials < cost) unique.push(`need ${cost} Materials`);
 
   const eRadius = TOWER.extraction.radius;
+  const income = resourceScoreAt(g.map, x, y, eRadius) * TOWER.extraction.baseRate;
+  const terrain = kindAt(g.map, Math.floor(x), Math.floor(y));
+  const elev = elevAt(g.map, Math.floor(x), Math.floor(y));
   return {
     ok: unique.length === 0,
     reasons: unique,
     cost,
-    income: resourceScoreAt(g.map, x, y, eRadius) * TOWER.extraction.baseRate,
+    income,
+    richness: richnessTierForRate(income),
     coverage: coverageAt(g.map, x, y, TOWER.weapon.range),
-    terrain: kindAt(g.map, Math.floor(x), Math.floor(y)),
-    elev: elevAt(g.map, Math.floor(x), Math.floor(y)),
+    terrain,
+    elev,
+    elevationName: terrain === T.CLIFF ? 'Cliff' : ELEVATION_NAMES[elev],
   };
 }
 
@@ -164,11 +185,13 @@ function placeTower(g, x, y, instant = false) {
 
 export function tryBuild(g, x, y) {
   const check = canPlaceAt(g, x, y);
+  if (g.paused) return { ...check, ok: false, reasons: [...check.reasons, 'paused'] };
   if (!check.ok) return check;
   g.materials -= check.cost;
   const t = placeTower(g, x, y, false);
   g.selected = t.id;
   say(g, 'Construction started.');
+  emitAudioEvent(g, 'constructionStart', t);
   return check;
 }
 
@@ -180,16 +203,19 @@ export function towerStats(g, t) {
   const occupied = g.occupiedTowerId === t.id;
   const m = occupied ? occupancyMults(g) : { damage: 1, fireRate: 1, extraction: 1, damageTaken: 1 };
   const u = TOWER.upgrade;
-  const dmgBoost = g.effects.damage ? DROP.types.damage.mult : 1;
-  const extBoost = g.effects.extraction ? DROP.types.extraction.mult : 1;
+  const dmgBoost = g.effects.damage ? DROP.temporary.damage.mult : 1;
+  const extBoost = g.effects.extraction ? DROP.temporary.extraction.mult : 1;
+  const barrel = hasEquipment(g, 'reinforcedBarrel') ? DROP.equipment.reinforcedBarrel.towerDamage : 1;
+  const module = hasEquipment(g, 'targetingModule') ? DROP.equipment.targetingModule.towerRange : 1;
+  const chip = hasEquipment(g, 'extractionChip') ? DROP.equipment.extractionChip.extraction : 1;
   return {
     occupied,
-    damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost,
+    damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost * barrel,
     fireRate: TOWER.weapon.fireRate * (1 + u.weaponRatePerLevel * t.wLevel) * m.fireRate,
-    range: TOWER.weapon.range + u.weaponRangePerLevel * t.wLevel,
+    range: (TOWER.weapon.range + u.weaponRangePerLevel * t.wLevel) * module,
     extractRadius: TOWER.extraction.radius + u.extractRadiusPerLevel * t.eLevel,
     income: t.resourceScore * TOWER.extraction.baseRate
-            * (1 + u.extractRatePerLevel * t.eLevel) * m.extraction * extBoost,
+            * (1 + u.extractRatePerLevel * t.eLevel) * m.extraction * extBoost * chip,
     damageTaken: m.damageTaken,
   };
 }
@@ -201,6 +227,7 @@ export function upgradeCost(t, which) {
 }
 
 export function tryUpgrade(g, t, which) {
+  if (g.paused) return false;
   const cost = upgradeCost(t, which);
   if (cost === null || g.materials < cost || !t.built) return false;
   g.materials -= cost;
@@ -209,11 +236,17 @@ export function tryUpgrade(g, t, which) {
     t.eLevel++;
     t.resourceScore = resourceScoreAt(g.map, t.x, t.y, towerStats(g, t).extractRadius);
   }
+  emitAudioEvent(g, 'upgrade', t);
   return true;
 }
 
 export function repairCostPerHp(g) {
-  return TOWER.repair.costPerHp * g.arch.repairCostMult;
+  const rig = hasEquipment(g, 'repairRig') ? DROP.equipment.repairRig.repairCost : 1;
+  return TOWER.repair.costPerHp * g.arch.repairCostMult * rig;
+}
+
+function hasEquipment(g, key) {
+  return g.equipment.includes(key);
 }
 
 function towerField(g, t) {
@@ -224,6 +257,7 @@ const clampTx = (x) => clamp(Math.floor(x), 0, MAP.w - 1);
 const clampTy = (y) => clamp(Math.floor(y), 0, MAP.h - 1);
 
 function destroyTower(g, t) {
+  emitAudioEvent(g, 'towerDestroy', t);
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
@@ -238,8 +272,10 @@ function destroyTower(g, t) {
 
   // D6: standing in the wreckage is near-lethal, and lethal if already hurt.
   if (dist(g.player, t) <= TOWER.collapseRadius) {
-    const dmg = PLAYER.maxHp * TOWER.collapseDamageFrac;
+    const armour = hasEquipment(g, 'armourPlate') ? DROP.equipment.armourPlate.playerDamageTaken : 1;
+    const dmg = PLAYER.maxHp * TOWER.collapseDamageFrac * armour;
     g.player.hp -= dmg;
+    emitAudioEvent(g, 'playerDamage', g.player);
     floater(g, g.player.x, g.player.y - 1, `CRUSHED -${Math.round(dmg)}`, '#ff4d4d');
     say(g, 'The tower came down on top of you.');
   } else {
@@ -273,7 +309,8 @@ function updatePlayer(g, dt) {
   p.meleeCd = Math.max(0, p.meleeCd - dt);
   p.hurtCd = Math.max(0, p.hurtCd - dt);
 
-  const speedBoost = g.effects.speed ? DROP.types.speed.mult : 1;
+  const speedBoost = (g.effects.speed ? DROP.temporary.speed.mult : 1)
+    * (hasEquipment(g, 'boots') ? DROP.equipment.boots.playerSpeed : 1);
   const cost = moveCostAt(g.map, Math.floor(p.x), Math.floor(p.y));
   const speed = PLAYER.speed * speedBoost / (Number.isFinite(cost) ? cost : 1);
 
@@ -302,6 +339,7 @@ function updatePlayer(g, dt) {
     const d = dist(p, t);
     if (d <= bestD) { bestD = d; best = t; }
   }
+  const wasSheltered = g.occupiedTowerId !== null;
   if (!best) {
     g.shelter.towerId = null;
     g.shelter.progress = 0;
@@ -316,6 +354,8 @@ function updatePlayer(g, dt) {
     g.shelter.progress = Math.min(g.shelter.required, g.shelter.progress + dt);
     g.occupiedTowerId = g.shelter.progress >= g.shelter.required ? best.id : null;
   }
+  if (wasSheltered && g.occupiedTowerId === null && g.phase === 'combat') emitAudioEvent(g, 'exposed', p);
+  if (!wasSheltered && g.occupiedTowerId !== null) emitAudioEvent(g, 'towerEntry', p);
 
   if (g.input.melee && p.meleeCd <= 0) {
     p.meleeCd = PLAYER.melee.cooldown;
@@ -335,6 +375,7 @@ function updatePlayer(g, dt) {
 
   if (p.hp <= 0 && g.status === 'playing') {
     g.status = 'lost';
+    emitAudioEvent(g, 'playerDeath', p);
     say(g, 'You died. Run over.');
   }
 }
@@ -380,6 +421,7 @@ function updateTowers(g, dt) {
         t.built = true;
         t.hp = t.maxHp;
         say(g, 'Tower online.');
+        emitAudioEvent(g, 'constructionComplete', t);
       }
       continue;
     }
@@ -401,6 +443,7 @@ function updateTowers(g, dt) {
         t.shotCd = 1 / s.fireRate;
         g.tracers.push({ x0: t.x, y0: t.y, x1: e.x, y1: e.y, t: 0,
           life: 0.09, color: s.occupied ? '#ffe680' : '#cfd6e0' });
+        emitAudioEvent(g, 'towerFire', { ...t, occupied: s.occupied });
         damageEnemy(g, e, s.damage);
       } else {
         t.targetId = null;
@@ -408,6 +451,15 @@ function updateTowers(g, dt) {
     }
 
     if (t.hp / t.maxHp < TOWER.collapsingAt) {
+      // D47: the COLLAPSING announcement fires once on crossing the threshold;
+      // while the tower stays below it, a quieter reminder repeats on a slow
+      // cadence - hard to forget, never a continuous full-volume alarm. Runs on
+      // simulation time, so pause stops it.
+      t.alarmT = (t.alarmT ?? 0) + dt;
+      if (t.alarmT >= AUDIO.collapsingReminderInterval) {
+        t.alarmT = 0;
+        emitAudioEvent(g, 'collapsingReminder', t);
+      }
       t.smoke += dt;
       if (t.smoke > 0.08) {
         t.smoke = 0;
@@ -537,9 +589,12 @@ function updateEnemies(g, dt) {
     if (g.occupiedTowerId === null && dPlayer <= ENEMY.playerAttackRange + e.def.radius
         && e.hitCd <= 0 && p.hurtCd <= 0) {
       e.hitCd = ENEMY.playerHitCooldown;
-      p.hp -= e.def.playerHit;
+      const armour = hasEquipment(g, 'armourPlate') ? DROP.equipment.armourPlate.playerDamageTaken : 1;
+      const playerDamage = e.def.playerHit * armour;
+      p.hp -= playerDamage;
+      emitAudioEvent(g, 'playerDamage', p);
       p.hurtCd = PLAYER.invulnAfterHit;
-      floater(g, p.x, p.y - 0.8, `-${e.def.playerHit}`, '#ff6b6b');
+      floater(g, p.x, p.y - 0.8, `-${Math.round(playerDamage)}`, '#ff6b6b');
       burst(g, p.x, p.y, '#ff6b6b', 5, 2.5);
     }
 
@@ -561,9 +616,11 @@ function updateEnemies(g, dt) {
         const dealt = e.def.towerDps * dt * s.damageTaken;
         const before = resolved.hp / resolved.maxHp;
         resolved.hp -= dealt;
+        emitAudioEvent(g, e.type === 'heavy' ? 'heavyTowerHit' : 'towerHit', { ...resolved, enemyType: e.type });
         resolved.flash = 1;
         if (before >= TOWER.collapsingAt && resolved.hp / resolved.maxHp < TOWER.collapsingAt) {
           say(g, 'A tower is COLLAPSING.');
+          emitAudioEvent(g, 'collapsing', resolved);
         }
         if (resolved.hp <= 0) destroyTower(g, resolved);
 
@@ -666,9 +723,10 @@ function damageEnemy(g, e, amount) {
   e.hp -= amount;
   e.flash = 1;
   burst(g, e.x, e.y, e.def.color, 3, 2);
-  if (e.hp > 0) return;
+  if (e.hp > 0) { emitAudioEvent(g, 'enemyHit', e); return; }
   g.enemies = g.enemies.filter((o) => o !== e);
   g.stats.kills++;
+  emitAudioEvent(g, 'enemyDeath', e);
   burst(g, e.x, e.y, e.def.color, 12, 5);
   if (Math.random() < DROP.chance) spawnDrop(g, e.x, e.y);
 }
@@ -677,10 +735,91 @@ function damageEnemy(g, e, amount) {
 // Drops
 // ---------------------------------------------------------------------------
 
-function spawnDrop(g, x, y) {
-  const keys = Object.keys(DROP.types);
-  const key = keys[Math.floor(Math.random() * keys.length)];
-  g.drops.push({ key, def: DROP.types[key], x, y, t: 0 });
+export function grantEquipment(g, key) {
+  if (!DROP.equipment[key] || hasEquipment(g, key) || g.equipment.length >= DROP.equipmentCap) return false;
+  g.equipment.push(key);
+  return true;
+}
+
+export function equipmentState(g) {
+  return {
+    count: g.equipment.length,
+    cap: DROP.equipmentCap,
+    held: g.equipment.map((key) => ({ key, name: DROP.equipment[key].name })),
+  };
+}
+
+export function depositRichness(map, deposit) {
+  const d = typeof deposit === 'number' ? map.deposits[deposit] : deposit;
+  if (!d) return null;
+  const tier = richnessTierForRate(d.income);
+  return { tier: tier.key, name: tier.name, bars: tier.bars, income: d.income };
+}
+
+export function spawnDrop(g, x, y, forcedCategory = null, forcedKey = null) {
+  const unavailable = g.equipment.length >= DROP.equipmentCap;
+  const weights = DROP.categoryWeights;
+  let category = forcedCategory;
+  if (!category) {
+    const total = weights.temporary + weights.materials + (unavailable ? 0 : weights.equipment);
+    let roll = Math.random() * total;
+    category = (roll -= weights.temporary) < 0 ? 'temporary'
+      : (roll -= weights.materials) < 0 ? 'materials' : 'equipment';
+  }
+
+  if (category === 'equipment') {
+    const dropped = new Set(g.drops.filter((d) => d.category === 'equipment').map((d) => d.key));
+    const keys = Object.keys(DROP.equipment).filter((key) => !hasEquipment(g, key) && !dropped.has(key));
+    if (!keys.length || unavailable) category = 'temporary';
+    else {
+      const key = forcedKey && keys.includes(forcedKey) ? forcedKey : keys[Math.floor(Math.random() * keys.length)];
+      g.drops.push({ category, key, def: DROP.equipment[key], x, y, t: 0 });
+      emitAudioEvent(g, 'dropSpawn', { x, y, category, key });
+      return;
+    }
+  }
+  if (category === 'materials') {
+    const def = DROP.materialsCache;
+    const amount = Math.round(def.min + Math.random() * (def.max - def.min));
+    g.drops.push({ category, key: 'materials', def, amount, x, y, t: 0 });
+    emitAudioEvent(g, 'dropSpawn', { x, y, category, key: 'materials' });
+    return;
+  }
+  const keys = Object.keys(DROP.temporary);
+  const key = forcedKey && DROP.temporary[forcedKey] ? forcedKey : keys[Math.floor(Math.random() * keys.length)];
+  g.drops.push({ category: 'temporary', key, def: DROP.temporary[key], x, y, t: 0 });
+  emitAudioEvent(g, 'dropSpawn', { x, y, category: 'temporary', key });
+}
+
+export function collectDrop(g, d) {
+  if (g.paused) return false;
+  if (d.category === 'equipment') {
+    if (!grantEquipment(g, d.key)) return false;
+    floater(g, g.player.x, g.player.y - 1, d.def.name, d.def.color);
+    say(g, `${d.def.name} equipped for this run.`);
+  } else if (d.category === 'materials') {
+    g.materials += d.amount;
+    g.stats.materialsEarned += d.amount;
+    floater(g, g.player.x, g.player.y - 1, `+${d.amount} Materials`, d.def.color);
+  } else if (d.def.instant) {
+    // Patches up the tower you are holding AND you. After a collapse this is
+    // the thing worth sprinting into the open for.
+    const t = g.towers.find((o) => o.id === (g.occupiedTowerId ?? g.selected));
+    if (t) {
+      t.hp = Math.min(t.maxHp, t.hp + t.maxHp * d.def.healFrac);
+      floater(g, t.x, t.y - 1.5, 'REPAIRED', d.def.color);
+    }
+    const heal = Math.min(g.player.maxHp - g.player.hp, d.def.playerHeal);
+    if (heal > 0) {
+      g.player.hp += heal;
+      floater(g, g.player.x, g.player.y - 1, `+${Math.round(heal)} HP`, d.def.color);
+    }
+  } else {
+    g.effects[d.key] = DROP.effectDuration;
+    floater(g, g.player.x, g.player.y - 1, d.def.name, d.def.color);
+  }
+  emitAudioEvent(g, 'dropCollect', { ...d, x: g.player.x, y: g.player.y });
+  return true;
 }
 
 function updateDrops(g, dt) {
@@ -688,24 +827,7 @@ function updateDrops(g, dt) {
     d.t += dt;
     if (d.t >= DROP.lifetime) { g.drops = g.drops.filter((o) => o !== d); continue; }
     if (dist(d, g.player) <= DROP.pickupRadius) {
-      g.drops = g.drops.filter((o) => o !== d);
-      if (d.def.instant) {
-        // Patches up the tower you are holding AND you. After a collapse this is
-        // the thing worth sprinting into the open for.
-        const t = g.towers.find((o) => o.id === (g.occupiedTowerId ?? g.selected));
-        if (t) {
-          t.hp = Math.min(t.maxHp, t.hp + t.maxHp * d.def.healFrac);
-          floater(g, t.x, t.y - 1.5, 'REPAIRED', d.def.color);
-        }
-        const heal = Math.min(g.player.maxHp - g.player.hp, d.def.playerHeal);
-        if (heal > 0) {
-          g.player.hp += heal;
-          floater(g, g.player.x, g.player.y - 1, `+${Math.round(heal)} HP`, d.def.color);
-        }
-      } else {
-        g.effects[d.key] = DROP.effectDuration;
-        floater(g, g.player.x, g.player.y - 1, d.def.name, d.def.color);
-      }
+      if (collectDrop(g, d)) g.drops = g.drops.filter((o) => o !== d);
     }
   }
   for (const k of Object.keys(g.effects)) {
@@ -774,6 +896,7 @@ function updateWaves(g, dt) {
     g.phaseLeft = WAVE.warning;
     const where = g.spawnSides.map((s) => s.toUpperCase()).join(' and ');
     say(g, `Wave ${g.wave} incoming from the ${where}.`);
+    emitAudioEvent(g, 'waveWarning', g.player);
     return;
   }
 
@@ -781,6 +904,7 @@ function updateWaves(g, dt) {
     g.phase = 'combat';
     g.phaseLeft = 0;
     g.combatT = 0;
+    emitAudioEvent(g, g.wave >= WAVE.totalToSurvive ? 'finalWave' : 'waveStart', g.player);
     return;
   }
 
@@ -799,6 +923,7 @@ function updateWaves(g, dt) {
       say(g, `Wave ${g.wave} cleared.`);
       if (g.wave >= WAVE.totalToSurvive) {
         g.status = 'won';
+        emitAudioEvent(g, 'victory', g.player);
         say(g, 'The final wave broke. Run complete.');
       }
     }
@@ -838,7 +963,8 @@ function updateRepair(g, dt) {
   if (!t || t.hp >= t.maxHp || !t.built) return;
 
   const occ = occupancyMults(g);
-  const rate = TOWER.repair.hpPerSec * (g.occupiedTowerId === t.id ? occ.repair : 1);
+  const rig = hasEquipment(g, 'repairRig') ? DROP.equipment.repairRig.repairSpeed : 1;
+  const rate = TOWER.repair.hpPerSec * (g.occupiedTowerId === t.id ? occ.repair : 1) * rig;
   const perHp = repairCostPerHp(g);
   let hp = rate * dt;
   const cost = hp * perHp;
@@ -848,6 +974,7 @@ function updateRepair(g, dt) {
   t.hp += hp;
   g.materials -= hp * perHp;
   if (Math.random() < 0.25) burst(g, t.x, t.y - 0.5, '#5ecbff', 2, 1.5);
+  emitAudioEvent(g, 'repair', t);
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +997,19 @@ function updateFx(g, dt) {
   for (const f of g.floaters) f.y -= 1.1 * dt;
 }
 
-export function update(g, dt) {
+export function setPaused(g, paused = !g.paused) {
+  if (g.status !== 'playing') return g.paused;
+  g.paused = !!paused;
+  g.input = { mx: 0, my: 0, melee: false, repair: false };
+  return g.paused;
+}
+
+export function pauseState(g) {
+  return { paused: !!g.paused };
+}
+
+export function update(g, dt, { ignorePause = false } = {}) {
+  if (g.paused && !ignorePause) return;
   if (g.status !== 'playing') { updateFx(g, dt); return; }
   g.time += dt;
   updateWaves(g, dt);

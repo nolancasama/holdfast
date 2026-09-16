@@ -1,7 +1,7 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, richnessTierForRate,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
 import { findCostPath } from './flowfield.js';
@@ -268,9 +268,8 @@ function placeDeposits(map, rng, start) {
   };
 
   const n = randInt(rng, GEN.deposits.min, GEN.deposits.max);
-  // Keep the initial tower economically viable without guaranteeing any remote
-  // location; expansion value comes from the authored random deposits.
-  add(start.x + (rng() - 0.5) * 6, start.y + (rng() - 0.5) * 6, 5, 0.7);
+  // The safe central junction deliberately offers only mediocre extraction.
+  add(start.x + (rng() - 0.5) * 6, start.y + (rng() - 0.5) * 6, 5, GEN.deposits.startPeak);
 
   let placed = 0;
   let tries = 0;
@@ -278,10 +277,28 @@ function placeDeposits(map, rng, start) {
     const x = randInt(rng, 4, MAP.w - 5);
     const y = randInt(rng, 3, MAP.h - 4);
     if (!isPassable(map, x, y)) continue;
-    // Bias away from dead centre so expansion is rewarded.
-    if (Math.abs(x - MAP.w / 2) < 14 && rng() < 0.6) continue;
-    add(x, y, randInt(rng, GEN.deposits.radiusMin, GEN.deposits.radiusMax),
-        GEN.deposits.peakMin + rng() * (GEN.deposits.peakMax - GEN.deposits.peakMin));
+    // Keep the safe starting area mediocre; richer authored seams begin where
+    // expansion exposes the player to real travel and defence tradeoffs.
+    const fromStart = Math.hypot(x - start.x, y - start.y);
+    if (fromStart < GEN.deposits.startExclusionRadius
+        || (fromStart < GEN.deposits.startBufferRadius && rng() < GEN.deposits.startBufferRejectChance)) continue;
+    const centreDistance = Math.min(1, fromStart / (MAP.w * GEN.deposits.distanceMapFraction));
+    let nearestRoad = GEN.deposits.roadDistanceNormalizer;
+    for (let oy = -GEN.deposits.roadSearchRadius; oy <= GEN.deposits.roadSearchRadius; oy++) {
+      for (let ox = -GEN.deposits.roadSearchRadius; ox <= GEN.deposits.roadSearchRadius; ox++) {
+        const nx = x + ox;
+        const ny = y + oy;
+        if (inBounds(nx, ny) && map.road[idx(nx, ny)]) nearestRoad = Math.min(nearestRoad, Math.hypot(ox, oy));
+      }
+    }
+    // Rich seams skew away from the safe centre and obvious road chokepoints.
+    // This creates economic temptation without manufacturing a defensible site.
+    const awkward = Math.min(1, centreDistance * GEN.deposits.distanceWeight
+      + (nearestRoad / GEN.deposits.roadDistanceNormalizer) * GEN.deposits.roadDistanceWeight);
+    const peakSpan = GEN.deposits.peakMax - GEN.deposits.peakMin;
+    const peak = GEN.deposits.peakMin + peakSpan * Math.min(1,
+      awkward * GEN.deposits.awkwardnessWeight + rng() * GEN.deposits.randomWeight);
+    add(x, y, randInt(rng, GEN.deposits.radiusMin, GEN.deposits.radiusMax), peak);
     placed++;
   }
 
@@ -289,6 +306,18 @@ function placeDeposits(map, rng, start) {
   // "how good is this site" rather than "is there anything here at all".
   for (let i = 0; i < map.res.length; i++) {
     if (PASSABLE[map.kind[i]]) map.res[i] = Math.min(1.8, map.res[i] + GEN.ambientResource);
+  }
+  for (const d of deposits) {
+    let sum = 0;
+    const radius = TOWER.extraction.radius;
+    for (let y = Math.floor(d.y - radius); y <= Math.ceil(d.y + radius); y++) {
+      for (let x = Math.floor(d.x - radius); x <= Math.ceil(d.x + radius); x++) {
+        if (!inBounds(x, y) || Math.hypot(x + 0.5 - (d.x + 0.5), y + 0.5 - (d.y + 0.5)) > radius) continue;
+        sum += map.res[idx(x, y)];
+      }
+    }
+    d.income = (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
+    d.richness = richnessTierForRate(d.income).key;
   }
   return deposits;
 }
@@ -346,12 +375,92 @@ function roadPointInGap(map, barrier, gap) {
   return best;
 }
 
-/** D20: paths follow actual terrain and progressively merge onto cheap road. */
+function nearestPassable(map, x, y) {
+  const cx = Math.max(1, Math.min(MAP.w - 2, Math.round(x)));
+  const cy = Math.max(1, Math.min(MAP.h - 2, Math.round(y)));
+  for (let r = 0; r <= 8; r++) {
+    for (let oy = -r; oy <= r; oy++) {
+      for (let ox = -r; ox <= r; ox++) {
+        if (Math.max(Math.abs(ox), Math.abs(oy)) !== r) continue;
+        if (isPassable(map, cx + ox, cy + oy)) return idx(cx + ox, cy + oy);
+      }
+    }
+  }
+  return -1;
+}
+
+function routeWaypoints(map, rng, mouth, side) {
+  if (rng() >= ROAD.waypointChance) return [];
+  const direction = side === 'west' ? 1 : -1;
+  const distance = Math.abs(map.roadCenter.x - mouth.x);
+  const x = mouth.x + direction * distance * (0.34 + rng() * 0.28);
+  const sign = rng() < 0.5 ? -1 : 1;
+  const offset = ROAD.waypointYOffsetMin
+    + rng() * (ROAD.waypointYOffsetMax - ROAD.waypointYOffsetMin);
+  const y = Math.max(3, Math.min(MAP.h - 4, mouth.y + sign * offset));
+  const waypoint = nearestPassable(map, x, y);
+  return waypoint >= 0 ? [waypoint] : [];
+}
+
+/** Keep an alternate approach out of the first road's corridor before it merges. */
+function markRoadAvoidance(map, side) {
+  const avoid = new Uint8Array(MAP.w * MAP.h);
+  const radius = ROAD.parallelRoadAvoidRadius;
+  for (let y = 0; y < MAP.h; y++) {
+    for (let x = 0; x < MAP.w; x++) {
+      if (!map.road[idx(x, y)]) continue;
+      for (let oy = -radius; oy <= radius; oy++) {
+        for (let ox = -radius; ox <= radius; ox++) {
+          const nx = x + ox;
+          const ny = y + oy;
+          if (!inBounds(nx, ny) || Math.abs(ox) + Math.abs(oy) > radius) continue;
+          if ((side === 'west' && nx < map.roadCenter.x)
+              || (side === 'east' && nx > map.roadCenter.x)) avoid[idx(nx, ny)] = 1;
+        }
+      }
+    }
+  }
+  return avoid;
+}
+
+function parallelWaypoint(map, mouth, side, ordinal) {
+  const direction = side === 'west' ? 1 : -1;
+  const distance = Math.abs(map.roadCenter.x - mouth.x);
+  const x = mouth.x + direction * distance * ROAD.parallelRouteFraction;
+  const sign = ordinal % 2 ? 1 : -1;
+  const y = Math.max(3, Math.min(MAP.h - 4,
+    mouth.y + sign * (ROAD.parallelRouteYOffsetMin + ordinal * 3)));
+  return nearestPassable(map, x, y);
+}
+
+/** D20/D33: terrain physics, seeded waypoints, and cheap reuse shape the roads. */
 function buildRoadNetwork(map, rng) {
   const centreI = idx(map.roadCenter.x, map.roadCenter.y);
+  map.roadRoutes = [];
   for (const side of ['west', 'east']) {
-    for (const mouth of map.spawns[side]) {
-      carveRoadPath(map, findCostPath(map, idx(mouth.x, mouth.y), centreI));
+    const mouths = map.spawns[side];
+    // Three west and two east approaches make 3+ road-run columns a normal
+    // outcome, while still keeping the whole network to five main routes.
+    const routeCount = Math.max(side === 'west' ? 3 : 2, mouths.length);
+    for (let routeIndex = 0; routeIndex < routeCount; routeIndex++) {
+      const mouth = mouths[routeIndex % mouths.length];
+      const alternate = routeIndex >= mouths.length;
+      const forcedWaypoint = alternate ? parallelWaypoint(map, mouth, side, routeIndex - mouths.length + 1) : -1;
+      const stops = [...routeWaypoints(map, rng, mouth, side), centreI];
+      if (forcedWaypoint >= 0) stops.unshift(forcedWaypoint);
+      let from = idx(mouth.x, mouth.y);
+      const route = [];
+      for (let legIndex = 0; legIndex < stops.length; legIndex++) {
+        const to = stops[legIndex];
+        map.roadAvoid = alternate && legIndex === 0 ? markRoadAvoidance(map, side) : null;
+        const leg = findCostPath(map, from, to);
+        map.roadAvoid = null;
+        if (!leg.length) continue;
+        carveRoadPath(map, leg);
+        route.push(...(route.length ? leg.slice(1) : leg));
+        from = to;
+      }
+      map.roadRoutes.push({ side, mouth: { ...mouth }, path: route });
     }
   }
 
@@ -372,6 +481,34 @@ function buildRoadNetwork(map, rng) {
     if (path.length) { carveRoadPath(map, path); made++; }
   }
   map.roadConnectors = made;
+}
+
+function measureParallelRoadRoutes(map) {
+  const halves = {
+    west: { max: 0, runs: [], columnsWithThree: 0 },
+    east: { max: 0, runs: [], columnsWithThree: 0 },
+  };
+  for (const side of ['west', 'east']) {
+    const from = side === 'west' ? 4 : map.roadCenter.x + 1;
+    const to = side === 'west' ? map.roadCenter.x : MAP.w - 4;
+    const half = halves[side];
+    for (let x = from; x < to; x++) {
+      let runs = 0;
+      let inRun = false;
+      for (let y = 0; y < MAP.h; y++) {
+        if (map.road[idx(x, y)]) {
+          if (!inRun) { runs++; inRun = true; }
+        } else inRun = false;
+      }
+      half.runs.push(runs);
+      half.max = Math.max(half.max, runs);
+      if (runs >= 3) half.columnsWithThree++;
+    }
+    const sorted = [...half.runs].sort((a, b) => a - b);
+    half.median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+    delete half.runs;
+  }
+  return halves;
 }
 
 function keepStartTowerOffRoad(map, start) {
@@ -417,7 +554,7 @@ function buildMap(rng) {
       const e = fbm(elevNoise, x * 0.032, y * 0.05, 5);
       const i = idx(x, y);
       elevCont[i] = e;
-      map.elev[i] = e < 0.33 ? 0 : e < 0.55 ? 1 : e < 0.74 ? 2 : 3;
+      map.elev[i] = e < GEN.elevationCuts[0] ? 0 : e < GEN.elevationCuts[1] ? 1 : 2;
     }
   }
 
@@ -436,6 +573,7 @@ function buildMap(rng) {
   map.roadCenter = roadCenter;
   const centreReach = floodFrom(map, [idx(roadCenter.x, roadCenter.y)]);
   map.spawns = findSpawns(map, { reachW: centreReach, reachE: centreReach });
+  map.waterDist = waterDistance(map, ROAD.riverCheapRadius);
   buildRoadNetwork(map, rng);
   keepStartTowerOffRoad(map, start);
   map.deposits = placeDeposits(map, rng, start);
@@ -533,6 +671,16 @@ export function validateMap(map, relaxed = false) {
   if (!reachW[startI]) problems.push('start unreachable from west edge');
   if (!reachE[startI]) problems.push('start unreachable from east edge');
   if (map.roadConnectors < ROAD.connectorsMin) problems.push('road network has no lateral connector');
+  const parallelRoutes = measureParallelRoadRoutes(map);
+  for (const side of ['west', 'east']) {
+    if (parallelRoutes[side].median < VALID.parallelRouteMedianMin) {
+      problems.push(`${side} roads have median ${parallelRoutes[side].median}, need ${VALID.parallelRouteMedianMin} separate runs`);
+    }
+  }
+  const columnsWithThree = parallelRoutes.west.columnsWithThree + parallelRoutes.east.columnsWithThree;
+  if (columnsWithThree < VALID.parallelRouteColumnsWithThreeMin) {
+    problems.push(`only ${columnsWithThree} road columns have 3+ runs, need ${VALID.parallelRouteColumnsWithThreeMin}`);
+  }
 
   const minRoutes = relaxed ? 1 : VALID.minRoutesPerBarrier;
   const barrierReport = [];
@@ -583,6 +731,7 @@ export function validateMap(map, relaxed = false) {
     problems,
     barriers: barrierReport,
     openFrac, forestFrac, waterFrac: water / map.kind.length, contestedFrac, chokepoints,
+    parallelRoutes, columnsWithThree,
     reachW, reachE,
   };
 }

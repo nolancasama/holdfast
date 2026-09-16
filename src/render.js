@@ -1,10 +1,11 @@
 // Canvas drawing. Simple shapes only — readability over polish (plan §1).
 
-import { MAP, T, TOWER, PLAYER, DROP, RENDER, ELEV_BANDS } from './config.js';
+import { MAP, T, TOWER, PLAYER, DROP, RENDER, richnessTierForRate } from './config.js';
 import { idx, inBounds, isPassable } from './terrain.js';
 import { PLAYER_TARGET_ID, towerStats } from './game.js';
 
 const TP = RENDER.baseTilePx;
+const ELEV_SHADE = [0.72, 0.96, 1.22];
 
 const BASE_COLOR = {
   [T.PLAIN]: [0x74, 0x7f, 0x55],
@@ -35,7 +36,7 @@ export function buildTerrainLayer(map) {
       const px = x * TP;
       const py = y * TP;
       // Higher ground reads brighter, so hills are visible without a legend.
-      ctx.fillStyle = shade(BASE_COLOR[k], 0.70 + (e / (ELEV_BANDS - 1)) * 0.55);
+      ctx.fillStyle = shade(BASE_COLOR[k], ELEV_SHADE[e] ?? ELEV_SHADE[1]);
       ctx.fillRect(px, py, TP, TP);
 
       if (k === T.FOREST) {
@@ -102,6 +103,32 @@ export function buildTerrainLayer(map) {
       }
     }
   }
+
+  // D35: quiet contour strokes make band changes explicit without covering
+  // the terrain symbols. Each shared edge is drawn only once.
+  ctx.lineWidth = 1.5;
+  for (let y = 0; y < MAP.h; y++) {
+    for (let x = 0; x < MAP.w; x++) {
+      const i = idx(x, y);
+      const e = map.elev[i];
+      const cliff = map.kind[i] === T.CLIFF;
+      const px = x * TP;
+      const py = y * TP;
+      const edge = (nx, ny, x0, y0, x1, y1) => {
+        if (!inBounds(nx, ny)) return;
+        const ni = idx(nx, ny);
+        if (map.elev[ni] === e && (map.kind[ni] === T.CLIFF) === cliff) return;
+        ctx.strokeStyle = cliff || map.kind[ni] === T.CLIFF
+          ? 'rgba(25,20,16,0.52)' : 'rgba(244,236,195,0.26)';
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      };
+      edge(x + 1, y, px + TP, py, px + TP, py + TP);
+      edge(x, y + 1, px, py + TP, px + TP, py + TP);
+    }
+  }
   return c;
 }
 
@@ -134,8 +161,9 @@ export function draw(ctx, g, layers, view) {
   if (g.phase === 'warning') drawIncomingRoads(ctx, g);
   if (g.debug.showPaths) drawFlowField(ctx, g);
 
+  drawDepositMarkers(ctx, g, view);
   drawTowerRings(ctx, g);
-  drawDrops(ctx, g);
+  drawDrops(ctx, g, view);
   drawTowers(ctx, g, view);
   drawEnemies(ctx, g, view);
   drawPlayer(ctx, g, view);
@@ -143,6 +171,8 @@ export function draw(ctx, g, layers, view) {
   if (g.buildMode) drawBuildPreview(ctx, g);
 
   ctx.restore();
+
+  if (g.paused) drawPaused(ctx, view);
 }
 
 const localPx = (view, pixels) => pixels * TP / view.tilePx;
@@ -320,28 +350,107 @@ function drawPlayer(ctx, g, view) {
   }
 }
 
-function drawDrops(ctx, g) {
+function drawDepositMarkers(ctx, g, view) {
+  if (view.tilePx < RENDER.resourceMarkerMinTilePx) return;
+  const barW = localPx(view, 3.5);
+  const gap = localPx(view, 1.5);
+  const height = localPx(view, 7);
+  for (const d of g.map.deposits) {
+    const tier = richnessTierForRate(d.income);
+    const totalW = tier.bars * barW + (tier.bars - 1) * gap;
+    const x = (d.x + 0.5) * TP - totalW / 2;
+    const y = (d.y + 0.5) * TP - height / 2;
+    ctx.fillStyle = 'rgba(18,15,9,0.68)';
+    ctx.fillRect(x - gap, y - gap, totalW + gap * 2, height + gap * 2);
+    ctx.fillStyle = 'rgba(255,205,74,0.88)';
+    for (let n = 0; n < tier.bars; n++) ctx.fillRect(x + n * (barW + gap), y, barW, height);
+  }
+}
+
+function drawDrops(ctx, g, view) {
   for (const d of g.drops) {
     const cx = d.x * TP;
     const cy = d.y * TP;
     const left = 1 - d.t / DROP.lifetime;
-    const bob = Math.sin(g.time * 5 + d.x) * 2;
+    const bob = Math.sin(g.time * 5 + d.x) * localPx(view, 2);
+    const radiusPx = d.category === 'equipment' ? 13 : 10;
+    const r = localPx(view, radiusPx);
     ctx.save();
     ctx.fillStyle = d.def.color;
     ctx.strokeStyle = '#0c0f14';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = localPx(view, d.category === 'equipment' ? 3 : 2);
     ctx.beginPath();
-    ctx.rect(cx - 6, cy - 6 + bob, 12, 12);
+    if (d.category === 'equipment') {
+      ctx.moveTo(cx, cy - r + bob);
+      ctx.lineTo(cx + r, cy + bob);
+      ctx.lineTo(cx, cy + r + bob);
+      ctx.lineTo(cx - r, cy + bob);
+      ctx.closePath();
+    } else {
+      ctx.rect(cx - r * 0.72, cy - r * 0.72 + bob, r * 1.44, r * 1.44);
+    }
     ctx.fill();
     ctx.stroke();
+
+    // Category glyphs are geometric, so they remain readable without colour.
+    ctx.strokeStyle = '#10141a';
+    ctx.fillStyle = '#10141a';
+    ctx.lineWidth = localPx(view, 2.2);
+    if (d.category === 'equipment') {
+      ctx.beginPath();
+      ctx.arc(cx - r * 0.18, cy - r * 0.18 + bob, r * 0.23, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx, cy + bob);
+      ctx.lineTo(cx + r * 0.48, cy + r * 0.48 + bob);
+      ctx.stroke();
+    } else if (d.category === 'materials') {
+      for (let n = 0; n < 3; n++) {
+        const h = r * (0.35 + n * 0.2);
+        ctx.fillRect(cx - r * 0.5 + n * r * 0.34, cy + r * 0.42 + bob - h, r * 0.2, h);
+      }
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx + r * 0.10, cy - r * 0.55 + bob);
+      ctx.lineTo(cx - r * 0.30, cy + bob);
+      ctx.lineTo(cx + r * 0.05, cy + bob);
+      ctx.lineTo(cx - r * 0.10, cy + r * 0.55 + bob);
+      ctx.lineTo(cx + r * 0.38, cy - r * 0.10 + bob);
+      ctx.lineTo(cx, cy - r * 0.10 + bob);
+      ctx.closePath();
+      ctx.fill();
+    }
     // Expiry ring: the reason to decide now rather than later.
     ctx.strokeStyle = left < 0.3 ? '#ff6b6b' : 'rgba(255,255,255,0.8)';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = localPx(view, 2.5);
     ctx.beginPath();
-    ctx.arc(cx, cy + bob, 12, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left);
+    ctx.arc(cx, cy + bob, r + localPx(view, 3), -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left);
     ctx.stroke();
+    ctx.font = `bold ${localPx(view, 8)}px ui-monospace, monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`${Math.ceil(DROP.lifetime - d.t)}`, cx, cy + r + localPx(view, 12));
     ctx.restore();
   }
+}
+
+function drawPaused(ctx, view) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,7,10,0.30)';
+  ctx.fillRect(0, 0, view.w, view.h);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 34px ui-monospace, monospace';
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = 'rgba(5,7,10,0.92)';
+  const labelY = Math.max(42, view.h * 0.12);
+  ctx.strokeText('PAUSED', view.w / 2, labelY);
+  ctx.fillStyle = '#ffd666';
+  ctx.fillText('PAUSED', view.w / 2, labelY);
+  ctx.font = 'bold 12px ui-monospace, monospace';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('P TO RESUME', view.w / 2, labelY + 30);
+  ctx.restore();
 }
 
 function drawFx(ctx, g, view) {

@@ -55,15 +55,31 @@ class MinHeap {
  * @param {number[]} seeds tile indices to flood out from (usually one tower tile)
  * @returns {Float32Array} cost-to-reach, Infinity where unreachable
  */
-function costFor(map, i, mode) {
+function costFor(map, i, mode, fromI = i) {
   const terrain = map.kind[i];
-  if (mode === 'carve') return map.road[i] ? ROAD.existingCost : ROAD.carveCost[terrain];
+  if (mode === 'carve') {
+    if (map.road[i]) return ROAD.existingCost + (map.roadAvoid && map.roadAvoid[i] ? ROAD.parallelRoadAvoidCost : 0);
+    let cost = ROAD.carveCost[terrain];
+    if (!Number.isFinite(cost)) return cost;
+    if (map.roadAvoid && map.roadAvoid[i]) cost += ROAD.parallelRoadAvoidCost;
+    if (map.waterDist && map.waterDist[i] > 0 && map.waterDist[i] <= ROAD.riverCheapRadius) {
+      cost *= ROAD.riverbankCostMult;
+    }
+    cost += Math.abs(map.elev[i] - map.elev[fromI]) * ROAD.elevationCrossingCost;
+    return cost;
+  }
   const base = MOVE_COST[terrain];
   return mode === 'lane' && map.road[i] ? base * ROAD.laneDiscount : base;
 }
 
 export function computeField(map, seeds, mode = 'direct') {
   const dist = new Float32Array(MAP.w * MAP.h).fill(Infinity);
+  // D45: each tile is settled exactly once. The heap uses lazy deletion, so a
+  // tile can sit in it several times; without this, every stale copy re-relaxed
+  // its neighbours. Costs are stored as Float32, and once road costs grew large
+  // enough that rounding exceeded the comparison epsilon, those re-relaxations
+  // kept "succeeding" on rounding noise and the heap grew without bound.
+  const settled = new Uint8Array(MAP.w * MAP.h);
   const heap = new MinHeap();
   for (const s of seeds) {
     if (dist[s] !== 0) { dist[s] = 0; heap.push(s, 0); }
@@ -71,6 +87,8 @@ export function computeField(map, seeds, mode = 'direct') {
 
   while (heap.size) {
     const i = heap.pop();
+    if (settled[i]) continue;
+    settled[i] = 1;
     const d = dist[i];
     const x = i % MAP.w;
     const y = (i / MAP.w) | 0;
@@ -80,14 +98,17 @@ export function computeField(map, seeds, mode = 'direct') {
       const ny = y + oy;
       if (!inBounds(nx, ny)) continue;
       const ni = idx(nx, ny);
-      const cost = costFor(map, ni, mode);
+      const cost = costFor(map, ni, mode, i);
       if (!Number.isFinite(cost)) continue;
       // No corner cutting through a cliff or river bend.
       if (ox !== 0 && oy !== 0) {
         if (!PASSABLE[map.kind[idx(x + ox, y)]] || !PASSABLE[map.kind[idx(x, y + oy)]]) continue;
       }
-      const nd = d + cost * mult;
-      if (nd < dist[ni] - 1e-6) {
+      if (settled[ni]) continue;
+      // Compare in the same Float32 space the value is stored in, so an equal
+      // cost can never register as an improvement through rounding alone.
+      const nd = Math.fround(d + cost * mult);
+      if (nd < dist[ni]) {
         dist[ni] = nd;
         heap.push(ni, nd);
       }

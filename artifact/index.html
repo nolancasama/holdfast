@@ -45,6 +45,8 @@
     border-radius: 5px; padding: 5px 10px; white-space: nowrap;
   }
   .chip b { color: var(--gold); font-weight: 700; }
+  #pause-toggle { pointer-events: auto; width: auto; margin: 0; padding: 5px 10px; text-align: center; }
+  #pause-toggle.on { color: #171208; background: var(--gold); border-color: var(--gold); font-weight: 700; }
   .chip.phase-combat { border-color: var(--red); }
   .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
   .chip.phase-prep { border-color: var(--green); }
@@ -150,6 +152,7 @@
       <div class="chip">Materials <b id="hud-mat">0</b></div>
       <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
       <div class="chip">HP <b id="hud-hp">100</b></div>
+      <button id="pause-toggle">[P] Pause</button>
       <div class="chip" id="hud-occ">Unoccupied</div>
       <div class="chip" id="hud-danger">SAFE DURING PREP</div>
       <div class="chip muted" id="hud-seed">seed</div>
@@ -172,7 +175,7 @@
         <button class="start" id="start-btn">Start run</button>
         <p class="keys" style="margin-top:14px">
           <b>WASD</b> move · <b>B</b> build mode · <b>click</b> place / select tower ·
-          <b>R</b> hold to repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee · <b>F1</b> debug
+          <b>R</b> hold to repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
         </p>
       </div>
     </div>
@@ -196,6 +199,7 @@
       <div class="row"><span>Income</span><span id="p-income">0.0 /s</span></div>
       <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
       <div class="row"><span>Combat danger</span><span id="p-danger">safe during prep</span></div>
+      <div class="row"><span>Equipment</span><span id="p-equipment">None</span></div>
     </div>
 
     <div class="sec">
@@ -228,8 +232,14 @@
       <div class="keys">
         <b>WASD</b> move · <b>B</b> build · <b>click</b> place/select<br />
         <b>R</b> hold repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee<br />
-        <b>Esc</b> cancel build · <b>F1</b> debug panel
+        <b>P</b> pause · <b>Esc</b> cancel build · <b>F1</b> debug panel
       </div>
+    </div>
+
+    <div class="sec">
+      <h2>Sound effects</h2>
+      <div class="row"><label for="sfx-volume">SFX volume</label><input id="sfx-volume" type="range" min="0" max="1" step="0.05" value="0.62" /></div>
+      <button id="sfx-mute">Mute SFX</button>
     </div>
 
     <div class="sec">
@@ -245,7 +255,7 @@
         <button id="d-regen" style="width:auto">Regenerate map</button>
         <div class="keys" style="margin-top:8px">
           <b>M</b> materials · <b>N</b> next wave · <b>G</b> spawn · <b>K</b> damage ·
-          <b>J</b> destroy · <b>P</b> paths · <b>L</b> pause spawns · <b>O</b> regen
+          <b>J</b> destroy · <b>H</b> paths · <b>L</b> pause spawns · <b>O</b> regen
         </div>
         <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>
       </div>

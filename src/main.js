@@ -5,8 +5,10 @@ import { randomSeed } from './terrain.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade,
   forceNextWave, spawnGroupAt,
-  towerStats, dangerState,
+  towerStats, dangerState, setPaused, pauseState, equipmentState, depositRichness,
+  drainAudioEvents,
 } from './game.js';
+import { createAudioSystem } from './audio.js';
 import {
   buildTerrainLayer, screenToWorld, draw,
 } from './render.js';
@@ -21,6 +23,7 @@ const view = { w: 0, h: 0, tilePx: 1, offsetX: 0, offsetY: 0 };
 const keys = new Set();
 let lastCursorTile = '';
 let endShown = false;
+const audio = createAudioSystem();
 
 let chosen = 'gunner';
 $('seed-input').value = randomSeed();
@@ -32,7 +35,7 @@ function pick(key) {
 renderPicks(chosen, pick);
 
 $('reroll').onclick = () => { $('seed-input').value = randomSeed(); };
-$('start-btn').onclick = () => startRun($('seed-input').value.trim() || randomSeed(), chosen);
+$('start-btn').onclick = () => { audio.gesture(); startRun($('seed-input').value.trim() || randomSeed(), chosen); };
 $('again-btn').onclick = () => {
   $('end-overlay').hidden = true;
   $('select-overlay').hidden = false;
@@ -47,7 +50,16 @@ function startRun(seed, archetype) {
   $('select-overlay').hidden = true;
   $('end-overlay').hidden = true;
   updateMapInfo(game);
+  syncAudioControls();
 }
+
+function syncAudioControls() {
+  const state = audio.state;
+  $('sfx-volume').value = state.volume;
+  $('sfx-mute').textContent = state.muted ? 'Unmute SFX' : 'Mute SFX';
+}
+$('sfx-volume').oninput = (e) => audio.setVolume(e.target.value);
+$('sfx-mute').onclick = () => { audio.setMuted(!audio.state.muted); syncAudioControls(); };
 
 // ---------------------------------------------------------------------------
 // Sizing
@@ -84,27 +96,34 @@ function typingInInput(e) {
 }
 
 window.addEventListener('keydown', (e) => {
+  audio.gesture();
   if (typingInInput(e)) {
     if (e.code === 'Enter') $('start-btn').click();
     return;
   }
-  if (MOVE_KEYS[e.code] || e.code === 'Space') e.preventDefault();
+  if (MOVE_KEYS[e.code] || e.code === 'Space' || e.code === 'KeyP') e.preventDefault();
   keys.add(e.code);
   if (!game || game.status !== 'playing') return;
 
+  if (e.code === 'KeyP' && !e.repeat) {
+    togglePause();
+    return;
+  }
+  if (e.code === 'F1') { e.preventDefault(); toggleDebug(); return; }
+  if (e.code === 'Escape') { setBuildMode(false); return; }
+  if (game.paused) return;
+
   switch (e.code) {
     case 'KeyB': setBuildMode(!game.buildMode); break;
-    case 'Escape': setBuildMode(false); break;
     case 'Digit1': upgradeSelected('weapon'); break;
     case 'Digit2': upgradeSelected('extraction'); break;
     // debug
-    case 'F1': e.preventDefault(); toggleDebug(); break;
     case 'KeyM': game.materials += 500; break;
     case 'KeyN': forceNextWave(game); break;
     case 'KeyG': debugSpawn(); break;
     case 'KeyK': debugDamage(); break;
     case 'KeyJ': debugKill(); break;
-    case 'KeyP': game.debug.showPaths = !game.debug.showPaths; break;
+    case 'KeyH': game.debug.showPaths = !game.debug.showPaths; break;
     case 'KeyL': game.debug.spawnPaused = !game.debug.spawnPaused; break;
     case 'KeyO': startRun(randomSeed(), game.archetypeKey); break;
     default: break;
@@ -122,13 +141,14 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 canvas.addEventListener('mousedown', (e) => {
+  audio.gesture();
   if (!game || game.status !== 'playing') return;
   e.preventDefault();
   const rect = canvas.getBoundingClientRect();
   const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
 
-  if (game.buildMode) {
+  if (game.buildMode && !game.paused) {
     refreshBuildCheck(true);
     const res = tryBuild(game, w.x, w.y);
     if (res.ok) setBuildMode(false);
@@ -145,6 +165,7 @@ canvas.addEventListener('mousedown', (e) => {
 canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); setBuildMode(false); });
 
 function setBuildMode(on) {
+  if (on && game.paused) return;
   game.buildMode = on;
   lastCursorTile = '';
   if (on) refreshBuildCheck(true);
@@ -161,6 +182,7 @@ function refreshBuildCheck(force = false) {
 }
 
 function upgradeSelected(which) {
+  if (game.paused) return;
   const t = game.towers.find((o) => o.id === (game.selected ?? game.occupiedTowerId));
   if (t) tryUpgrade(game, t, which);
 }
@@ -180,6 +202,14 @@ function toggleDebug() {
 }
 $('debug-toggle').onclick = toggleDebug;
 
+function togglePause() {
+  const paused = setPaused(game);
+  keys.clear();
+  if (paused) setBuildMode(false);
+  if (paused) audio.suspendForPause(); else audio.resumeAfterPause();
+  updateHud(game);
+}
+
 function debugSpawn() {
   const types = Object.keys(ENEMIES);
   const type = types[Math.floor(Math.random() * types.length)];
@@ -196,18 +226,19 @@ function debugKill() {
   if (t) t.hp = -1; // destroyed on the next tower update, collapse damage included
 }
 
-$('d-mat').onclick = () => { game.materials += 500; };
-$('d-wave').onclick = () => forceNextWave(game);
-$('d-spawn').onclick = debugSpawn;
-$('d-dmg').onclick = debugDamage;
-$('d-kill').onclick = debugKill;
+$('pause-toggle').onclick = togglePause;
+$('d-mat').onclick = () => { if (!game.paused) game.materials += 500; };
+$('d-wave').onclick = () => { if (!game.paused) forceNextWave(game); };
+$('d-spawn').onclick = () => { if (!game.paused) debugSpawn(); };
+$('d-dmg').onclick = () => { if (!game.paused) debugDamage(); };
+$('d-kill').onclick = () => { if (!game.paused) debugKill(); };
 $('d-paths').onclick = () => { game.debug.showPaths = !game.debug.showPaths; };
 $('d-pause').onclick = () => {
   game.debug.spawnPaused = !game.debug.spawnPaused;
   $('d-pause').textContent = game.debug.spawnPaused ? 'Resume spawning' : 'Pause spawning';
 };
 $('d-regen').onclick = () => startRun(randomSeed(), game.archetypeKey);
-$('build-toggle').onclick = () => setBuildMode(!game.buildMode);
+$('build-toggle').onclick = () => { if (!game.paused) setBuildMode(!game.buildMode); };
 $('up-weapon').onclick = () => upgradeSelected('weapon');
 $('up-extract').onclick = () => upgradeSelected('extraction');
 
@@ -220,12 +251,21 @@ window.holdfast = {
   get game() { return game; },
   start: startRun,
   errors: [],
-  api: { canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave, dangerState },
+  api: {
+    canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave, dangerState,
+    pauseState, setPaused: (paused) => {
+      const state = setPaused(game, paused);
+      if (state) audio.suspendForPause(); else audio.resumeAfterPause();
+      return state;
+    }, equipmentState, depositRichness,
+    setAudioEnabled: (enabled) => audio.setEnabled(enabled),
+    audioState: () => audio.state,
+  },
   /** Run the simulation forward without waiting in real time. */
   fastForward(seconds, onStep) {
     const step = 1 / 60;
     for (let t = 0; t < seconds && game.status === 'playing'; t += step) {
-      update(game, step);
+      update(game, step, { ignorePause: true });
       if (onStep) onStep(game, t);
     }
   },
@@ -248,9 +288,12 @@ function frame(now) {
     const m = MOVE_KEYS[code];
     if (m) { mx += m[0]; my += m[1]; }
   }
-  game.input = { mx, my, melee: keys.has('Space'), repair: keys.has('KeyR') };
+  game.input = game.paused
+    ? { mx: 0, my: 0, melee: false, repair: false }
+    : { mx, my, melee: keys.has('Space'), repair: keys.has('KeyR') };
 
   update(game, dt);
+  audio.playEvents(drainAudioEvents(game), game.player, game.paused);
 
   refreshBuildCheck();
   draw(ctx, game, layers, view);

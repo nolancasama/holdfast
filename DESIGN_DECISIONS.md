@@ -315,3 +315,190 @@ uncovered crossing kills 3 runs in 12 rather than most of them) while short
 covered dashes cost slightly more. The covered/uncovered distinction the brief
 asked for survives intact; the absolute lethality of a long run is a tuning knob
 left for the next pass.
+
+---
+
+## 2026-09-16 — Pause, road character, legibility, drops, and sound
+
+Third pass. Accepted, with the scope corrected and three things declined.
+
+### D32 — Most of this brief is already built; this pass verifies rather than rebuilds
+**Decision:** sections 1, 2, 4, 9, 10, 13, 14, 15, 16, 17, 18, 22, 23 and 24 of
+the brief describe work that landed in the roads pass (D18-D31). They are
+treated as acceptance criteria to re-verify, not as work to redo. The genuinely
+new scope is: pause, road shape variety, elevation legibility, resource
+richness display, the three drop categories, and the sound layer.
+**Why:** the brief was written without the previous pass in hand. Handing a
+worker "implement sections 1-33" would have rewritten a validated terrain
+generator, a working aggro model and a measured danger curve to arrive back
+where we already are, with all the regression risk that implies.
+
+### D33 — Road character comes from physics in the cost function, not shape templates
+**Decision:** get hairpins, switchbacks and river roads by changing what the
+carving search finds expensive, not by stamping shapes. Crossing an elevation
+band boundary costs a lot, so a road climbing a ridge zigzags across the slope —
+which is how real switchbacks form. Ground near water is easy going, so roads
+sometimes hug a river to its crossing. Seeded intermediate waypoints make routes
+approach the centre obliquely, which is what produces S-bends and doubling back.
+Forks and merges already fall out of the cheap-existing-road rule (D20).
+**Why:** the brief explicitly warns that the generator must "create
+opportunities, not solve the tower-placement puzzle automatically", and that not
+every bend should be a perfect defensive position. A template-stamped hairpin is
+by construction a designed position; one that emerges from terrain cost is not.
+
+### D34 — Declined: the downhill range bonus
+**Decision:** elevation continues to affect line of sight only. No range or
+visibility bonus for shooting downhill.
+**Why:** the brief offers this conditionally — "do not add this unless it is
+visually understandable" — and it is not. A range circle subtly larger on one
+side is unreadable on a full-map view, and it reintroduces precisely the
+invisible numeric advantage that the same section opens by forbidding. The
+problem elevation actually has is that it is invisible, not that it is weak.
+
+### D35 — Elevation is made visible, not more powerful
+**Decision:** three named walkable bands (Low / Normal / High) plus cliff, with
+contour lines drawn at band boundaries, a distinct shading ramp, and the band
+named in the build-site preview alongside what it means for sight.
+**Why:** the LOS-over-forest rule has worked since D3 but nothing on screen said
+what band anything was, so players could not deliberately seek high ground. This
+is a legibility fix for an existing mechanic, which is what section 5 is
+actually asking for.
+
+### D36 — Resource richness is drawn per deposit, not per tile
+**Decision:** one ▰ / ▰▰ / ▰▰▰ marker per deposit region at its centroid, sized
+in screen pixels and culled when the map scale is too small to carry it. The
+build preview shows the bars, the word, and the exact figure together.
+**Why:** the whole map is on screen at 9-12px per tile. A symbol on every rich
+tile would be confetti, and the brief's own playtest question asks whether the
+symbols end up too cluttered. Per-region markers answer "where is the money"
+at a glance, which is the actual goal.
+
+### D37 — Run-long equipment is rare and capped
+**Decision:** three drop categories as briefed. Run-long equipment is rare,
+capped per run, and modest per item; Materials caches are deliberately small.
+**Why:** uncapped permanent stacking turns a lucky early streak into a run that
+plays itself, and oversized caches turn the game into "kill enemies, earn
+money", which section 19 explicitly forbids. Extraction stays the economy.
+
+### D38 — Sound is synthesised, not sampled
+**Decision:** every cue is generated at runtime with Web Audio oscillators,
+filtered noise and envelopes. No audio files, no dependencies. Hard cap on
+concurrent voices, per-cue wall-clock rate limiting, the priority order from
+section 27, stereo pan and attenuation from position relative to the avatar, and
+a master switch.
+**Why:** no assets to load, host or 404; pitch variation is free, which section
+25 asks for repeatedly; and it cannot bloat the page. The master switch is not
+optional — a scripted playthrough fast-forwards thousands of simulation steps,
+and an audio layer that fired an event per step would spawn thousands of nodes
+and hang the acceptance harness.
+
+### D39 — Pause is P only, not Space
+**Decision:** P toggles pause. Space is not bound to it.
+**Why:** the brief offers Space "if it does not conflict with existing
+controls". It does — Space is the melee swing.
+
+### D40 — Pause is enforced at the simulation boundary and bypassed explicitly by the harness
+**Decision:** the ordinary update entry point returns before any simulation or
+FX clock advances while paused. Player action functions separately refuse
+builds, upgrades and collection, and the browser clears movement/action input.
+`fastForward()` uses an explicit `ignorePause` update option and leaves the
+visible pause state unchanged.
+**Why:** one time boundary prevents partial pauses where income, expiry or an FX
+clock keeps running. Separate action guards prevent queued work from resolving
+on resume, while the explicit harness path cannot hang on a paused run.
+
+### D41 — Road character is measurable generated data
+**Decision:** carve cost now includes elevation-band crossings and a riverbank
+discount. A seeded subset of spawn routes uses a passable intermediate waypoint,
+and each recovered route is retained as generation metadata for headless shape
+checks. Existing-road reuse remains the only merge/fork rule.
+**Why:** the stored routes let tests count vertical direction reversals and
+water-adjacent travel rather than treating legality as proof of character. They
+do not place or score defensive positions.
+
+### D42 — Richness tiers are functions of displayed extraction rate
+**Decision:** Poor, Moderate and Rich thresholds live in config and classify the
+same Materials/second number shown by the build preview. Deposit centroids cache
+that figure and tier for rendering and acceptance. The protected starting area
+gets one deliberately modest seam; richer authored seams are excluded nearby
+and skew away from central roads.
+**Why:** a bar glyph cannot contradict its numeric label when both come from one
+function. Moving rich seams away from the safe junction makes economic and
+defensive site selection pull in different directions without manufacturing a
+specific solution.
+
+### D43 — Drop categories share physical collection but not reward lifetime
+**Decision:** temporary effects, modest Materials caches and run-long equipment
+use one expiring world-drop pipeline. Category weights are 70/22/8; equipment
+rolls are removed after the four-item cap, and held equipment keys cannot repeat.
+All six equipment bonuses are direct multipliers on existing systems and reset
+with a new game object.
+**Why:** shared expiry and pickup preserves the risk decision. Separate reward
+application keeps temporary clocks, immediate economy and run-long modifiers
+explicit and testable.
+
+### D44 — Parallel approaches are a regenerated road-network requirement
+**Decision:** An alternate approach pays a temporary cost for entering the first
+road's nearby corridor, so it is carved through a physically different stretch
+of terrain before ordinary cheap-road reuse lets it merge nearer the centre.
+Validation measures maximal vertical road runs per column on each half and
+rejects maps unless both halves have a median of at least two and the network
+has several three-run columns.
+**Why:** Counting authored gaps proved only that the ground was traversable, not
+that enemies had distinct lanes. The road bitfield is the player-facing network,
+so the D2 gate measures that network directly while retaining D20's cost-carved
+rather than template-stamped character.
+
+### D45 — Pathfinding settles each tile once, and compares in Float32 space
+**Decision:** `computeField` marks a tile settled the first time it is popped and
+skips stale heap entries, and computes candidate costs with `Math.fround` so they
+are compared in the same precision they are stored in.
+**Why:** measured. After D44 added corridor-avoidance and elevation-crossing
+costs, map generation went from ~19ms to 120ms-30s, CHARLIE took 14.8s on a
+single attempt, and QUEBEC crashed with the heap exceeding the maximum array
+length. The heap uses lazy deletion but never skipped stale entries, so every
+duplicate re-relaxed its neighbours; and `dist` is a Float32Array compared
+against a 1e-6 epsilon. Once the new costs pushed path totals into the
+hundreds, Float32 rounding (~1e-4) dwarfed the epsilon, so equal-cost paths kept
+registering as improvements on rounding noise and the search never converged.
+The defect predates D44 - larger costs only exposed it.
+**Result:** output-neutral and verified so - road network, terrain, lane field
+and direct field are bit-identical before and after on seven fingerprinted
+seeds. CHARLIE 14825ms -> 45ms, MIKE 30123ms -> 135ms, QUEBEC crash -> 52ms;
+every seed now under 400ms. `npm test` went from never completing to 34 passing
+in 5 seconds. Runtime tower and pursuit fields share this function, so in-game
+pathfinding is faster too.
+
+### D46 — Audio observes a bounded event queue
+**Decision:** gameplay emits small positional cue events into a bounded queue; `audio.js` consumes it with wall-clock rate limits, priority selection, a voice cap and a clamped master bus. The AudioContext is lazy and gesture-resumed; pause suspends it and clears sustained voices. Settings are safe best-effort localStorage values, and scripted runs can switch audio off through `window.holdfast.api.setAudioEnabled(bool)`.
+**Why:** simulation must remain exactly deterministic and runnable without Web Audio, while a fast-forward cannot create an unbounded node graph.
+
+### D47 — Audio acceptance fixes: cue identity, rising confirmations, quiet collapse reminder
+**Decision:** three corrections to the D46 audio layer, made after instrumenting
+Web Audio in a live browser rather than trusting unit tests.
+1. `emitAudioEvent` applies the cue `type` after the caller's data, not before.
+2. Positive confirmations (victory, construction complete, upgrade, drop collect)
+   rise in pitch; everything else still falls.
+3. While a tower stays below the COLLAPSING line, a quieter reminder repeats
+   every 2.6s of simulation time, after the single full-volume announcement.
+**Why:**
+1. Measured. Enemy hit and death sounds never played - 0 of each during a
+   36-enemy siege - while 44 generic 520Hz fallback beeps did. Enemies carry
+   their own `type` ('swarm', 'heavy'), and spreading the enemy object after the
+   cue name overwrote it. The 36 passing tests exercised the audio helpers in
+   isolation and could not see what the game actually emitted. Two new tests
+   drive real play and assert the emitted contract; both were proven by
+   reintroducing the bug (they fail naming exactly 'heavy' and 'swarm').
+2. Every cue shared one downward pitch ramp, so the victory sting descended
+   like the defeat cue. A falling tone reads as failure; the brief asks for an
+   "unmistakable success sting" and a "clear positive cue".
+3. The announcement fired exactly once on crossing the threshold, but a tower
+   can sit collapsing for many seconds, and the brief asks for "announce, then
+   fall back to something quieter and intermittent". Verified live: 2 reminders
+   per 6s while collapsing, 0 while paused, 2 after resume.
+**Rejected:** a continuous alarm, which the brief explicitly forbids.
+**Left alone, deliberately:** `selectVoices` only prioritises the incoming batch,
+not against voices already sounding, so a full voice cap would starve player
+damage. It is unreachable at current rate limits - a 36-enemy siege peaks at 9
+of 18 voices and 5 player hits produced 5 damage cues - so it is recorded as a
+latent risk rather than fixed.

@@ -2,10 +2,17 @@
 // the D2 terrain guarantees, pathing reachability, line of sight, and a long
 // scripted simulation run. Feel is judged by playing it, not by this file.
 
-import { MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE } from '../src/config.js';
+import {
+  MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
+} from '../src/config.js';
 import { generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt } from '../src/terrain.js';
 import { computeField } from '../src/flowfield.js';
-import { createGame, update, canPlaceAt, tryBuild, towerStats } from '../src/game.js';
+import {
+  createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt,
+  setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
+  emitAudioEvent, drainAudioEvents,
+} from '../src/game.js';
+import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
 let passed = 0;
 const failures = [];
@@ -190,12 +197,76 @@ check('roads form one network from both spawn sides to the centre', () => {
   return null;
 });
 
+check('roads provide separate approaches on both sides of the centre', () => {
+  for (const m of maps) {
+    for (const side of ['west', 'east']) {
+      const p = m.report.parallelRoutes[side];
+      if (p.median < VALID.parallelRouteMedianMin) {
+        return `${m.seed}: ${side} median ${p.median}, expected ${VALID.parallelRouteMedianMin}`;
+      }
+    }
+    if (m.report.columnsWithThree < VALID.parallelRouteColumnsWithThreeMin) {
+      return `${m.seed}: ${m.report.columnsWithThree} columns have 3+ runs`;
+    }
+  }
+  return null;
+});
+
 check('roads never make or cross impassable terrain', () => {
   for (const m of maps) {
     for (let i = 0; i < m.road.length; i++) {
       if (m.road[i] && !PASSABLE[m.kind[i]]) return `${m.seed}: road crosses tile ${i} kind ${m.kind[i]}`;
     }
   }
+  return null;
+});
+
+check('road networks use authored shallow-water fords', () => {
+  for (const m of maps) {
+    let fordTiles = 0;
+    for (let i = 0; i < m.road.length; i++) {
+      if (m.road[i] && m.kind[i] === T.SHALLOW) fordTiles++;
+    }
+    if (!fordTiles) return `${m.seed}: no road crosses a shallow-water ford`;
+  }
+  return null;
+});
+
+check('seeded routes add bends and riverbank travel without multiplying lanes', () => {
+  let routes = 0;
+  let reversing = 0;
+  let riverFollowing = 0;
+  for (const m of maps) {
+    const approaches = m.roadRoutes.length;
+    if (approaches < 4 || approaches > 5) return `${m.seed}: ${approaches} approach routes, expected 4-5`;
+    for (const route of m.roadRoutes) {
+      routes++;
+      const verticalRuns = [];
+      let waterStreak = 0;
+      let longestWaterStreak = 0;
+      for (let n = 1; n < route.path.length; n++) {
+        const a = route.path[n - 1];
+        const b = route.path[n];
+        const dy = Math.sign(((b / MAP.w) | 0) - ((a / MAP.w) | 0));
+        if (dy) {
+          const last = verticalRuns[verticalRuns.length - 1];
+          if (last && last.sign === dy) last.distance++;
+          else verticalRuns.push({ sign: dy, distance: 1 });
+        }
+        if (m.waterDist[b] > 0 && m.waterDist[b] <= 2) {
+          waterStreak++;
+          longestWaterStreak = Math.max(longestWaterStreak, waterStreak);
+        } else waterStreak = 0;
+      }
+      const meaningfulReversal = verticalRuns.some((run, i) => i > 0
+        && run.sign !== verticalRuns[i - 1].sign
+        && run.distance >= 4 && verticalRuns[i - 1].distance >= 4);
+      if (meaningfulReversal) reversing++;
+      if (longestWaterStreak >= 4) riverFollowing++;
+    }
+  }
+  if (reversing < routes * 0.35) return `only ${reversing}/${routes} routes have a sustained direction reversal`;
+  if (riverFollowing < routes * 0.20) return `only ${riverFollowing}/${routes} routes follow water for 4+ tiles`;
   return null;
 });
 
@@ -461,6 +532,140 @@ check('occupying a tower is a large, visible upgrade', () => {
   return null;
 });
 
+check('richness bars and labels use the configured numeric thresholds', () => {
+  const eps = 1e-6;
+  if (richnessTierForRate(RICHNESS.poorMax - eps).key !== 'poor') return 'value below poorMax is not Poor';
+  if (richnessTierForRate(RICHNESS.poorMax).key !== 'moderate') return 'poorMax does not begin Moderate';
+  if (richnessTierForRate(RICHNESS.moderateMax - eps).key !== 'moderate') return 'value below moderateMax is not Moderate';
+  if (richnessTierForRate(RICHNESS.moderateMax).key !== 'rich') return 'moderateMax does not begin Rich';
+  for (const m of maps) {
+    for (const d of m.deposits) {
+      const expected = richnessTierForRate(d.income);
+      const access = depositRichness(m, d);
+      if (d.richness !== expected.key || access.tier !== expected.key || access.bars !== expected.bars) {
+        return `${m.seed}: ${d.income.toFixed(3)} says ${d.richness}/${access.tier}, expected ${expected.key}`;
+      }
+    }
+  }
+  const g = createGame('RICHNESS-PREVIEW', 'prospector');
+  const c = canPlaceAt(g, g.map.start.x + 0.5, g.map.start.y + 0.5);
+  return c.richness.key === richnessTierForRate(c.income).key ? null : 'build preview tier contradicts its income';
+});
+
+check('the central starting area is never a rich extraction site', () => {
+  for (const m of maps) {
+    const income = resourceScoreAt(m, m.start.x + 0.5, m.start.y + 0.5, TOWER.extraction.radius)
+      * TOWER.extraction.baseRate;
+    if (richnessTierForRate(income).key === 'rich') return `${m.seed}: start produces ${income.toFixed(2)}/s`;
+  }
+  return null;
+});
+
+// --- D37/D39: equipment and pause ------------------------------------------
+
+check('run-long equipment is one-of-each and capped at four', () => {
+  const g = createGame('EQUIPMENT', 'gunner');
+  const keys = Object.keys(DROP.equipment);
+  if (!grantEquipment(g, keys[0])) return 'first item was refused';
+  if (grantEquipment(g, keys[0])) return 'duplicate item was accepted';
+  for (const key of keys.slice(1, DROP.equipmentCap)) {
+    if (!grantEquipment(g, key)) return `${key} was refused below the cap`;
+  }
+  if (g.equipment.length !== DROP.equipmentCap) return `held ${g.equipment.length}, expected cap ${DROP.equipmentCap}`;
+  if (grantEquipment(g, keys[DROP.equipmentCap])) return 'fifth item exceeded the run cap';
+  if (new Set(g.equipment).size !== g.equipment.length) return 'equipment list contains duplicates';
+  return null;
+});
+
+check('pause freezes simulation and refuses player actions', () => {
+  const g = createGame('PAUSE-FREEZE', 'engineer');
+  g.materials = 9999;
+  const start = g.towers[0];
+  start.hp -= 100;
+  g.effects.damage = 9;
+  g.phase = 'prep';
+  g.phaseLeft = 12;
+  g.input = { mx: 1, my: 0, melee: true, repair: true };
+  spawnGroupAt(g, g.player.x + 1, g.player.y, 'swarm', 1);
+  const enemy = g.enemies[0];
+  enemy.hp = 1000;
+  enemy.maxHp = 1000;
+  g.drops.push({ category: 'materials', key: 'materials', def: DROP.materialsCache,
+    amount: 30, x: g.player.x + 8, y: g.player.y, t: 3 });
+  g.tracers.push({ x0: 0, y0: 0, x1: 1, y1: 1, t: 0.02, life: 1, color: '#fff' });
+  g.particles.push({ x: 2, y: 2, vx: 1, vy: 1, t: 0.02, life: 1, color: '#fff', size: 1 });
+
+  const findSite = () => {
+    for (let y = 3; y < MAP.h - 3; y += 2) {
+      for (let x = 3; x < MAP.w - 3; x += 2) {
+        if (canPlaceAt(g, x + 0.5, y + 0.5).ok) return { x: x + 0.5, y: y + 0.5 };
+      }
+    }
+    return null;
+  };
+  const site = findSite();
+  if (!site || !tryBuild(g, site.x, site.y).ok) return 'could not establish construction precondition';
+  const building = g.towers[g.towers.length - 1];
+  const secondSite = findSite();
+  if (!secondSite) return 'could not establish paused-build precondition';
+
+  setPaused(g, true);
+  const before = {
+    time: g.time, phaseLeft: g.phaseLeft, materials: g.materials,
+    px: g.player.x, py: g.player.y, hp: g.player.hp,
+    towerHp: start.hp, progress: building.progress,
+    ex: enemy.x, ey: enemy.y, enemyHp: enemy.hp,
+    dropT: g.drops[0].t, effect: g.effects.damage,
+    tracerT: g.tracers[0].t, particleT: g.particles[0].t,
+    particleX: g.particles[0].x,
+  };
+  update(g, 2);
+  for (const [key, value] of Object.entries(before)) {
+    const actual = {
+      time: g.time, phaseLeft: g.phaseLeft, materials: g.materials,
+      px: g.player.x, py: g.player.y, hp: g.player.hp,
+      towerHp: start.hp, progress: building.progress,
+      ex: enemy.x, ey: enemy.y, enemyHp: enemy.hp,
+      dropT: g.drops[0].t, effect: g.effects.damage,
+      tracerT: g.tracers[0].t, particleT: g.particles[0].t,
+      particleX: g.particles[0].x,
+    }[key];
+    if (actual !== value) return `${key} changed while paused (${value} -> ${actual})`;
+  }
+
+  const towerCount = g.towers.length;
+  if (tryBuild(g, secondSite.x, secondSite.y).ok || g.towers.length !== towerCount) return 'building succeeded while paused';
+  const weaponLevel = start.wLevel;
+  if (tryUpgrade(g, start, 'weapon') || start.wLevel !== weaponLevel) return 'upgrade succeeded while paused';
+  const cache = { category: 'materials', key: 'materials', def: DROP.materialsCache,
+    amount: 30, x: g.player.x, y: g.player.y, t: 0 };
+  const materials = g.materials;
+  if (collectDrop(g, cache) || g.materials !== materials) return 'drop collection succeeded while paused';
+
+  update(g, 0.25, { ignorePause: true });
+  return g.time > before.time ? null : 'forced harness step did not advance while paused';
+});
+
+// --- D46: audio observer contract (no AudioContext required) ----------------
+
+check('audio event queue is bounded and drains without affecting game state', () => {
+  const g = createGame('AUDIO-QUEUE', 'gunner');
+  const before = { materials: g.materials, time: g.time, towers: g.towers.length };
+  emitAudioEvent(g, 'towerFire', { x: 2, y: 3 });
+  const events = drainAudioEvents(g);
+  if (events.length !== 1 || events[0].type !== 'towerFire' || g.audioEvents.length !== 0) return 'queue did not preserve/drain event';
+  return g.materials === before.materials && g.time === before.time && g.towers.length === before.towers ? null : 'emitting changed simulation state';
+});
+
+check('audio rate limits use wall-clock values and priority drops low cues first', () => {
+  const last = { towerFire: 10 };
+  if (shouldRateLimit(last, 'towerFire', 10.02)) return 'rapid tower fire was not limited';
+  if (!shouldRateLimit(last, 'towerFire', 10.2)) return 'later tower fire remained limited';
+  const chosen = selectVoices([{ type: 'enemyHit' }, { type: 'towerDestroy' }, { type: 'playerDamage' }], 0, 2);
+  if (chosen.map((e) => e.type).join(',') !== 'playerDamage,towerDestroy') return 'priority ordering is wrong';
+  return AUDIO_PRIORITY.playerDamage > AUDIO_PRIORITY.enemyHit ? null : 'priority table is inverted';
+});
+
 check('shelter grants occupancy only after the transition delay', () => {
   const g = createGame('SHELTER', 'engineer');
   const t = g.towers[0];
@@ -546,6 +751,47 @@ check('waves escalate rather than staying flat', () => {
   return sizes[sizes.length - 1] > sizes[0] * 1.5
     ? null
     : `wave 1 averages ${sizes[0].toFixed(1)} units, wave ${WAVE.totalToSurvive} averages ${sizes[sizes.length - 1].toFixed(1)}`;
+});
+
+check('audio events keep their cue name when a whole entity is passed as data', () => {
+  // Regression: enemies carry their own `type` ('swarm'/'heavy'). Spreading the
+  // entity after the cue name overwrote it, so every enemy hit and death played
+  // the generic fallback beep. Unit tests of the audio helpers could not see it.
+  const g = createGame('AUDIOTYPE', 'gunner');
+  drainAudioEvents(g);
+  const fakeEnemy = { type: 'heavy', x: 5, y: 6, hp: 10 };
+  emitAudioEvent(g, 'enemyHit', fakeEnemy);
+  emitAudioEvent(g, 'enemyDeath', { ...fakeEnemy, type: 'swarm' });
+  const ev = drainAudioEvents(g);
+  if (ev[0].type !== 'enemyHit') return `enemyHit arrived as '${ev[0].type}'`;
+  if (ev[1].type !== 'enemyDeath') return `enemyDeath arrived as '${ev[1].type}'`;
+  if (ev[0].x !== 5 || ev[0].y !== 6) return 'entity position was lost';
+  return null;
+});
+
+check('every cue the simulation actually emits has a sound defined', () => {
+  // Drive a real, violent stretch of play and collect every emitted type.
+  const g = createGame('AUDIOCOVER', 'gunner');
+  g.materials = 9000;
+  const seen = new Set();
+  const t = g.towers[0];
+  spawnGroupAt(g, t.x + 3, t.y, 'swarm', 12);
+  spawnGroupAt(g, t.x, t.y + 3, 'heavy', 3);
+  for (let i = 0; i < 60 * 40 && g.status === 'playing'; i++) {
+    g.player.x = t.x + 6; g.player.y = t.y;
+    update(g, 1 / 60);
+    for (const e of drainAudioEvents(g)) seen.add(e.type);
+  }
+  const handledSpecially = new Set(['dropSpawn', 'dropCollect', 'collapsingReminder']);
+  const missing = [...seen].filter((k) => !AUDIO.cues[k] && !handledSpecially.has(k));
+  return missing.length ? `no sound defined for emitted cue(s): ${missing.join(', ')}` : null;
+});
+
+check('positive confirmations are configured to rise in pitch', () => {
+  for (const k of ['victory', 'constructionComplete', 'upgrade']) {
+    if (!AUDIO.risingCues.includes(k)) return `${k} still falls in pitch`;
+  }
+  return AUDIO.risingPitchMult > 1 ? null : 'risingPitchMult does not rise';
 });
 
 // ---------------------------------------------------------------------------
