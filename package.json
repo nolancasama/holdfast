@@ -1,0 +1,11 @@
+{
+  "name": "holdfast",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "2D top-down tower-defense/survival prototype: presence makes a tower strong and makes it a target.",
+  "scripts": {
+    "test": "node test/run-tests.js",
+    "start": "node serve.js"
+  }
+}

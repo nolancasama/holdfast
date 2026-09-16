@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Holdfast — presence prototype</title>
+<style>
+  :root {
+    --bg: #0d1016;
+    --panel: #161b24;
+    --panel2: #1d2430;
+    --line: #2b3342;
+    --text: #dfe6f0;
+    --dim: #8c97a8;
+    --gold: #ffd666;
+    --green: #7be196;
+    --red: #ff6b6b;
+    --blue: #7fb6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow: hidden;
+  }
+  #boot-error {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: var(--bg); z-index: 100; padding: 30px; text-align: center;
+  }
+  /* An id selector outranks the UA [hidden] rule, so restate it. */
+  #boot-error[hidden], .overlay[hidden] { display: none !important; }
+  #boot-error code {
+    display: inline-block; background: var(--panel2); padding: 6px 10px;
+    border-radius: 5px; color: var(--gold); margin: 4px;
+  }
+
+  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  #stage { position: relative; overflow: hidden; background: #000; }
+  canvas#game { display: block; width: 100%; height: 100%; }
+
+  /* ---- top bar ---- */
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; gap: 2px; padding: 8px; pointer-events: none; flex-wrap: wrap;
+  }
+  .chip {
+    background: rgba(18,22,30,0.88); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 10px; white-space: nowrap;
+  }
+  .chip b { color: var(--gold); font-weight: 700; }
+  .chip.phase-combat { border-color: var(--red); }
+  .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
+  .chip.phase-prep { border-color: var(--green); }
+  @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
+
+  /* ---- minimap ---- */
+  #minimap-wrap {
+    position: absolute; left: 8px; bottom: 8px;
+    background: rgba(12,15,20,0.9); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px; line-height: 0;
+  }
+  canvas#minimap { display: block; image-rendering: pixelated; }
+
+  /* ---- event log ---- */
+  #log {
+    position: absolute; right: 8px; bottom: 8px; width: 330px;
+    display: flex; flex-direction: column-reverse; gap: 2px; pointer-events: none;
+  }
+  #log div {
+    background: rgba(12,15,20,0.82); border-left: 2px solid var(--line);
+    padding: 3px 8px; font-size: 12px; color: var(--dim);
+  }
+  #log div:last-child { color: var(--text); border-left-color: var(--gold); }
+
+  /* ---- side panel ---- */
+  #side {
+    background: var(--panel); border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; overflow-y: auto;
+  }
+  .sec { border-bottom: 1px solid var(--line); padding: 10px 12px; }
+  .sec h2 {
+    margin: 0 0 7px; font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+  }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
+  .row span:last-child { color: var(--text); font-weight: 600; }
+  .row span:first-child { color: var(--dim); }
+  .bar { height: 7px; background: #0b0e13; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin: 5px 0; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  button {
+    font: inherit; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px;
+    cursor: pointer; width: 100%; text-align: left; margin-top: 4px;
+  }
+  button:hover:not(:disabled) { background: #26303e; border-color: #3d4a5d; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button .cost { float: right; color: var(--gold); }
+  .keys { color: var(--dim); font-size: 11px; }
+  .keys b { color: var(--text); font-weight: 600; }
+  .warn { color: var(--red); }
+  .good { color: var(--green); }
+  .muted { color: var(--dim); }
+  #debug-body { display: none; }
+  #debug-body.open { display: block; }
+  #debug-body button { width: auto; margin-right: 4px; }
+
+  /* ---- overlays ---- */
+  .overlay {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    background: rgba(8,10,14,0.92); z-index: 20; padding: 20px;
+  }
+  .overlay[hidden] { display: none; }
+  .card { max-width: 760px; width: 100%; }
+  .card h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: 0.02em; }
+  .card p.lede { color: var(--dim); margin: 0 0 18px; }
+  .picks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .pick {
+    background: var(--panel); border: 2px solid var(--line); border-radius: 7px;
+    padding: 12px; cursor: pointer;
+  }
+  .pick:hover, .pick.on { border-color: var(--gold); }
+  .pick h3 { margin: 0 0 4px; font-size: 15px; }
+  .pick ul { margin: 8px 0 0; padding-left: 16px; color: var(--dim); font-size: 12px; }
+  .seedrow { display: flex; gap: 8px; align-items: center; margin: 16px 0 10px; }
+  .seedrow input {
+    font: inherit; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 6px 9px; width: 160px;
+  }
+  .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
+  .start:hover { background: #ffe08a; }
+</style>
+</head>
+<body>
+
+<div id="boot-error" hidden>
+  <div>
+    <h1>Holdfast needs a local web server</h1>
+    <p>This prototype uses ES modules, which browsers refuse to load from <code>file://</code>.</p>
+    <p>From the project folder, run one of:</p>
+    <p><code>python -m http.server 8000</code> <code>npx serve .</code> <code>php -S localhost:8000</code></p>
+    <p>then open <code>http://localhost:8000</code></p>
+  </div>
+</div>
+
+<div id="app">
+  <div id="stage">
+    <canvas id="game"></canvas>
+
+    <div id="topbar">
+      <div class="chip">Materials <b id="hud-mat">0</b></div>
+      <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
+      <div class="chip">HP <b id="hud-hp">100</b></div>
+      <div class="chip" id="hud-occ">Unoccupied</div>
+      <div class="chip">Objective <b id="hud-obj">—</b></div>
+      <div class="chip muted" id="hud-seed">seed</div>
+      <div class="chip" id="hud-effects" hidden></div>
+    </div>
+
+    <div id="minimap-wrap"><canvas id="minimap"></canvas></div>
+    <div id="log"></div>
+
+    <div class="overlay" id="select-overlay">
+      <div class="card">
+        <h1>Holdfast</h1>
+        <p class="lede">Towers hold the ground. You make one of them formidable — and make it the thing everything wants to kill.</p>
+        <div class="picks" id="picks"></div>
+        <div class="seedrow">
+          <label for="seed-input">Seed</label>
+          <input id="seed-input" maxlength="12" />
+          <button id="reroll" style="width:auto">Reroll</button>
+          <span class="muted">Same seed = same map.</span>
+        </div>
+        <button class="start" id="start-btn">Start run</button>
+        <p class="keys" style="margin-top:14px">
+          <b>WASD</b> move · <b>B</b> build mode · <b>click</b> place / select tower ·
+          <b>R</b> hold to repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee · <b>F1</b> debug
+        </p>
+      </div>
+    </div>
+
+    <div class="overlay" id="end-overlay" hidden>
+      <div class="card" style="max-width:520px">
+        <h1 id="end-title">Run over</h1>
+        <p class="lede" id="end-sub"></p>
+        <div id="end-stats"></div>
+        <button class="start" id="again-btn" style="margin-top:16px">New run</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="side">
+    <div class="sec">
+      <h2>Run</h2>
+      <div class="row"><span>Character</span><span id="p-arch">—</span></div>
+      <div class="row"><span>Player HP</span><span id="p-hp">—</span></div>
+      <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
+      <div class="row"><span>Income</span><span id="p-income">0.0 /s</span></div>
+      <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
+      <div class="row"><span>Objective</span><span id="p-obj">not established</span></div>
+    </div>
+
+    <div class="sec">
+      <h2 id="sel-title">Selected tower</h2>
+      <div id="sel-empty" class="muted">Click a tower, or stand in one.</div>
+      <div id="sel-body" hidden>
+        <div class="row"><span>State</span><span id="sel-state">—</span></div>
+        <div class="row"><span>Health</span><span id="sel-hp">—</span></div>
+        <div class="bar"><i id="sel-hpbar"></i></div>
+        <div class="row"><span>Production</span><span id="sel-prod">—</span></div>
+        <div class="row"><span>Damage</span><span id="sel-dmg">—</span></div>
+        <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
+        <div class="row"><span>Range</span><span id="sel-range">—</span></div>
+        <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
+        <button id="up-weapon">[1] Weapon upgrade<span class="cost"></span></button>
+        <button id="up-extract">[2] Extraction upgrade<span class="cost"></span></button>
+        <div class="row" style="margin-top:6px"><span>Repair cost</span><span id="sel-repair">—</span></div>
+        <div class="keys" id="sel-repair-note"></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h2>Build <span id="build-state" class="muted"></span></h2>
+      <button id="build-toggle">[B] Toggle build mode<span class="cost" id="build-cost"></span></button>
+      <div id="build-info" class="keys" style="margin-top:6px">Press B, then click a spot.</div>
+    </div>
+
+    <div class="sec">
+      <h2>Controls</h2>
+      <div class="keys">
+        <b>WASD</b> move · <b>B</b> build · <b>click</b> place/select<br />
+        <b>R</b> hold repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee<br />
+        <b>Esc</b> cancel build · <b>F1</b> debug panel
+      </div>
+    </div>
+
+    <div class="sec">
+      <h2 style="cursor:pointer" id="debug-toggle">Debug tools [F1] ▾</h2>
+      <div id="debug-body">
+        <button id="d-mat" style="width:auto">+500 Materials</button>
+        <button id="d-wave" style="width:auto">Next wave</button>
+        <button id="d-spawn" style="width:auto">Spawn group at cursor</button>
+        <button id="d-dmg" style="width:auto">Damage tower 25%</button>
+        <button id="d-kill" style="width:auto">Destroy tower</button>
+        <button id="d-paths" style="width:auto">Toggle paths</button>
+        <button id="d-pause" style="width:auto">Pause spawning</button>
+        <button id="d-regen" style="width:auto">Regenerate map</button>
+        <div class="keys" style="margin-top:8px">
+          <b>M</b> materials · <b>N</b> next wave · <b>G</b> spawn · <b>K</b> damage ·
+          <b>J</b> destroy · <b>P</b> paths · <b>L</b> pause spawns · <b>O</b> regen
+        </div>
+        <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  if (location.protocol === 'file:') {
+    document.getElementById('boot-error').hidden = false;
+    document.getElementById('app').style.display = 'none';
+  }
+</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
