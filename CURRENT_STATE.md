@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-09-17 (road exposure pass, shipped as-is)
+Last updated: 2026-09-17 (aggro, road readability and edge-entry correction pass)
 
 ## What this is
 
@@ -32,11 +32,14 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 - Shelter takes 0.7 seconds of continuous presence in a built tower. Occupancy
   bonuses and melee immunity begin only when that timer completes; leaving
   immediately resets shelter.
-- An exposed player participates in the existing staggered aggro scoring with a
-  strong, short-distance score. Nearby non-sieging enemies can switch to the
-  player and use the direct field, while enemies already besieging a tower stay
-  committed. Swarms are only slightly slower than the player, Runners are
-  faster, and ordinary hits now kill in roughly two to four hits.
+- D53 aggro: towers have no baseline aggro. The one strategic target is the
+  occupied tower, or the exposed player. An enemy that has physically attacked a
+  tower stays committed to it; enemies only heading for a tower the player leaves
+  drop it within 0.9s and never start a siege there, and new spawns never pick
+  it. Hunters within 12 tiles pursue directly (D31 interception); farther ones
+  travel toward the player on the road-discounted lane field. The HUD "HUNTING"
+  count is the near hunters only. Swarms are only slightly slower than the
+  player, Runners are faster, and ordinary hits kill in roughly two to four hits.
 - Warning highlights the incoming half of the road network. Combat HUD and
   canvas feedback show EXPOSED state, shelter progress and current hunter count.
 - `window.holdfast` retains `game`, `start()`, `errors`, `fastForward()` and all
@@ -47,13 +50,20 @@ Victory is surviving the final wave; only player death ends the run in defeat.
   repairs, drop/effect expiry and FX. Build, upgrade and collection functions
   refuse actions while paused. `fastForward()` explicitly bypasses pause, and
   `api.pauseState(game)` exposes the semantic state.
-- Road carving now charges for elevation-band transitions, discounts ground one
-  or two tiles from water and sends a seeded subset of approaches through an
-  intermediate waypoint. Existing-road reuse still produces the merges. Across
-  six measured seeds, 15 recovered spawn routes included sustained vertical
-  reversals and consecutive four-tile riverbank runs above the checked 35% / 20%
-  floors, and roads used 107 shallow-ford tiles. Maps accepted in 1-3 generation
-  attempts.
+- Road carving charges for elevation-band transitions, discounts ground one or
+  two tiles from water and sends a seeded subset of approaches through an
+  intermediate waypoint. Existing-road reuse still produces the merges. Maps
+  typically take 1-20 generation attempts (the D2/D44 gates reject most builds;
+  the old "1-3 attempts" figure was stale before this pass).
+- D54: every entry route starts on the boundary column at its spawn mouth and
+  the renderer draws it through to the canvas edge; spawn coordinates are
+  unchanged (x=1 / MAP.w-2). Roads avoid the outer two columns/rows elsewhere.
+- D55: `analyseRoadReadability(map)` measures near-self-passes, thick
+  side-by-side bands, junction clutter, density and zigzags. Tangles are
+  prevented in carving (wide alternate corridors, deeper alternate waypoint,
+  direction-independent diagonal corners), repaired by D51 merging, and
+  generateMap prefers a clean valid map within 2 extra attempts. Features report
+  exposure `efficiency`; authored ones need >= 0.3.
 - The D2 road gate now measures maximal vertical road runs per column on each
   battlefield half. Each accepted map has a median of at least two separate
   approaches per half and several three-run columns; alternate approaches avoid
@@ -77,12 +87,15 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 
 ## Automated verification
 
-`npm test` runs 34 headless checks. It covers 20 deterministic seeds, terrain
-validation, road connectivity and legality, seed variation, lane/direct field
-behavior, road placement refusal, ford use and generated route character,
-delayed shelter occupancy, line of sight, richness thresholds, pause freezing
-and action refusal, equipment uniqueness/cap, collapse, aggro commitment,
-economy, escalation and a long simulation. Current result: 33 passed, 0 failed.
+`npm test` runs 64 headless checks in ~40s. It covers 20 deterministic seeds,
+terrain validation, road connectivity and legality, seed variation, lane/direct
+field behavior, road placement refusal, ford use and generated route character,
+road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
+20 seeds), D54 entry roads, delayed shelter occupancy, line of sight, richness
+thresholds, pause freezing and action refusal, equipment uniqueness/cap,
+collapse, D53 aggro (A-E), economy, escalation and a long simulation. Current
+result: 64 passed, 0 failed. `npm run road-report` prints per-seed features,
+efficiency, knots, readability defects, entry roads and attempts.
 
 ## Controller acceptance — measured, 2026-09-16
 
@@ -185,6 +198,28 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 - Browser smoke: game loads and plays waves on NOVEMBER with no console errors;
   hairpins read clearly at full-map scale.
 
+## Aggro + road readability pass - measured, 2026-09-17
+
+- **Stale aggro fixed (D53).** Live combat, 4 seeds x 2, player walks A -> B:
+  non-sieging enemies that went on to besiege abandoned A 0-11 per run -> 0;
+  new spawns choosing A up to 5/5 -> 0; committed siegers stayed. Browser run
+  on CHARLIE: 3 siegers + 17 approaching A; 1.2s into the walk 10 target the
+  player and 7 are still peeling off; 5s after occupying B, 17 target B, 0
+  uncommitted enemies remain on A, 1 surviving sieger stays on A. Standing
+  exposed beside a besieged tower kills a little faster (mean 4.3s -> 3.4s).
+- **Roads (D54/D55), 20 test seeds:** knots 2 -> 0; readability defects 3 (one
+  short band each on BRAVO, DELTA, PAPA); strong exposure features 29 -> 51;
+  maps with none 5 -> 0; best-site ratio 1.79-2.25x; every entry road reaches
+  the boundary. Generation mean ~680ms, max ~1.3-1.4s (was ~470ms / ~1.1s).
+  Runtime road adherence during a sheltered wave 77-91% (mean 86%) vs 75-93%
+  (mean 87%) on the old generator.
+- **Browser, full-map screenshots judged by the controller:** GOLF, HOTEL, KILO,
+  BRAVO, PAPA, ALPHA-era seeds plus random R7KD2P, M4XQ9A. Approaches read as
+  separate lanes with clean loops and hairpins; entries meet the canvas edge.
+  Still busy: KILO centre-left where two approaches converge on a diagonal, and
+  R7KD2P centre where two roads run almost side by side (its one flagged band).
+  No console errors.
+
 ## Acceptance status and known risks
 
 1. **Elevation's advantage is real but not obvious.** Where forest is present,
@@ -207,18 +242,24 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 5. From the previous pass: a long uncovered run kills about a quarter of the
    time rather than "usually"; waves run 56-118s.
 
-6. **Road exposure pass is partial (shipped as-is).** 5 of 20 test maps get no
-   strong exposure feature; no in-game debug overlay shows exposure; the old
-   D41 reversal test was not replaced with exposure/knot tests; GOLF and KILO
-   keep one small road loop. Map generation is ~4x slower (max ~1.1s).
+6. **Road readability is much better, not perfect (D55 known gaps).** About 1 in
+   7 maps keeps one short side-by-side band; converging diagonal approaches can
+   still look busy because a diagonal road renders as a two-tile staircase. No
+   in-game debug overlay shows exposure or readability defects. Where a river
+   meets the map edge beside a spawn mouth, a road can be forced along the
+   boundary (seen on random seed M4XQ9A only).
+7. **Exposed-player pressure rose slightly (D53).** With unoccupied towers no
+   longer targets, every enemy not committed to a siege goes after an exposed
+   player (far ones by road). Worth judging by hand whether tower-to-tower
+   dashes still feel fair.
 
 ## Next steps
 
 1. Play it by hand, with sound on. The unanswered questions are all about feel,
    and now also whether the hairpin tower sites feel worth taking.
-2. Road exposure follow-ups (D52 known gaps): more feature supply on crowded
-   maps, exposure debug overlay, replace the D41 reversal test with knot and
-   exposure tests.
+2. Road follow-ups: a debug overlay for exposure sites and readability defects;
+   if converging diagonals still read as busy in play, consider drawing diagonal
+   road segments as diagonal strokes instead of staircases (render-only).
 3. If elevation should read as an advantage, the honest lever is terrain, not
    stats: keep more high ground clear of ridge shoulders so it is not
    self-blinded.

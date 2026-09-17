@@ -620,3 +620,111 @@ lanes stay 95-98% on road (was 94-97%). Generation mean ~470ms, max ~1.1s
 **Known gaps:** 5 of 20 maps get no strong feature (crowded roads leave no room
 for a U); no debug overlay for exposure was built; the D41 reversal test was not
 replaced by exposure tests; feature counts are not a validation requirement.
+
+### D53 — An abandoned tower keeps only the enemies already sieging it
+**Date:** 2026-09-17
+**Decision:** towers have no baseline aggro. The one strategic target is the
+occupied tower, or the exposed player when no tower is occupied. An enemy that
+has physically attacked a tower (`siegedId`, set every frame it is in reach)
+stays committed to it until it dies, even if separation later shoves it off the
+wall. When the player leaves a tower, enemies merely heading for it get their
+retarget timer cut to a random 0-0.9s, so they peel away rather than turn as one;
+one that reaches the tower before re-reading never starts a siege there.
+Hunters within 12 tiles pursue the player directly (D31 interception); farther
+ones travel toward the player on a road-discounted lane field, and only the near
+ones count as "HUNTING" in the HUD.
+**Why:** measured in live combat (4 seeds x 2, wave 5, player walks A -> B).
+Every tower scored `1.0 / (1 + d/22)` just for existing, and the current target
+kept a 1.35x switch margin, so an enemy near A could hold A over a distant
+occupied B or a distant exposed player indefinitely. Before: up to 11
+non-sieging enemies per transfer went on to besiege the abandoned A, and 5 of 5
+enemies spawned after one transfer chose A. After: 0 and 0; enemies already
+sieging stayed (5/5).
+**Consequence:** with a single candidate, D24's distance-weighted score and D5's
+switch margin no longer do anything and were removed. D24's short sight now lives
+in pursuit mode instead of score. Standing exposed beside a besieged tower
+kills slightly faster (mean death 4.3s -> 3.4s over 8 noisy runs), because
+nearby enemies stop idling on the old target.
+**Rejected:** keeping baseline aggro but zeroing it only for the last occupied
+tower (other unoccupied towers would still be picked at random); sending every
+enemy after a far exposed player by the direct field (drops road adherence
+map-wide); an instant retarget of every enemy on leaving (a synchronized turn).
+
+### D54 — Entry roads run out through the map boundary
+**Date:** 2026-09-17
+**Decision:** every primary route starts on the boundary column (x=0 west,
+x=MAP.w-1 east) on its spawn mouth's row, or the adjacent row if that tile is
+impassable, and steps straight to the mouth. Spawn coordinates are unchanged
+(x=1 / MAP.w-2): enemies still appear one tile in, so no spawn, flow-field or
+stuck behaviour at the boundary changed. An alternate approach from the same
+mouth shares the primary's first 3 tiles and forks from there. Every carved leg
+and connector prices the outer two columns and rows like an avoided corridor,
+except the tiles beside each mouth, so roads meet the boundary only where they
+enter. The renderer extends a boundary-column road tile through its outer half
+so the road visibly reaches the canvas edge.
+**Why:** mouths sat at x=1, leaving a strip of terrain between road and edge,
+and up to three routes left one mouth separately and splayed into loops at the
+edge. The first two attempts (a delegated worker) turned the entire map border
+into cliff to keep roads off it and capped spawn mouths at 3/2. Both were
+rejected: the first redesigned terrain (a visible cliff frame, rivers ending in
+a wall), and the second removed enemy entry points.
+**Known gap:** where a river meets the map edge next to a mouth, the only land
+south of the mouth can be the boundary column itself (random seed M4XQ9A), so
+the soft boundary price lets that road run along the edge. Seen on 1 of 27
+seeds checked; none of the 20 test seeds.
+
+### D55 — Road readability: prevent the tangles at their cause, measure the rest
+**Date:** 2026-09-17
+**Decision:**
+1. *Causes fixed in carving.* Alternate approaches avoid the first road within
+   6 tiles, not 3; their forced waypoint sits 0.9 of the way to the centre, not
+   0.62; the avoided corridor is lifted within 7 tiles of the fork. Diagonal
+   steps fill their corner tile the same way whichever direction the road is
+   walked.
+2. *Measured.* `analyseRoadReadability(map)` (src/roadexposure.js, READABILITY
+   config) reports near-self-passes (road within 4 tiles that is 12+ steps away
+   along the road, 4+ tiles), thick bands (5+ solid 2x2 road blocks within a
+   knight-move of each other: strands laid side by side), junction clutter (more
+   than 3 junctions within 7 tiles), density (> 0.42 road tiles per disc tile at
+   radius 5) and zigzags (more than 3 sharp turns of 70+ degrees within 16 route
+   steps). Features also report `extraLength` and exposure `efficiency` =
+   (exposure - straight baseline) / extra road length.
+3. *Repaired locally.* D51's path merging now works on readability defects too
+   (a wider 13-tile window for strands), keeps a merge only if knots do not rise,
+   the combined count falls and the D44 gate is not broken, and its detour walks
+   other paths' own tiles rather than their corner fills. An authored feature is
+   rejected if it adds a readability defect or its efficiency is below 0.3.
+4. *Preferred, not gated.* generateMap keeps a valid map whose roads still carry
+   a defect and tries up to 2 more valid maps for a clean one, returning the
+   least-defective. Features and deposits are laid only on the map kept, with that
+   attempt's own rng.
+**Why D49 missed the tangles:** its loop detector ignored every region touching
+the border and its spur detector protected every tile within 2 of an edge, which
+hid the mouth splays; its braid scan only looked for 1-2 tile gaps along rows and
+columns, so diagonal strands 2-4 apart passed.
+**Why prevention, not a gate (measured):** a strict "0 defects" gate was tried
+twice by a delegated worker; generation went to ~1.2s mean / ~3s max with 3 seeds
+relaxed, then to all 20 relaxed. The original generator accepted only 8 of 61
+builds on 9 seeds, and 6 of those 8 had knot or readability defects, so a gate
+alone multiplies attempts. The narrow 3-tile avoidance ring was itself the cause
+of the strands: alternates ran just outside it, 3-4 tiles from the first road -
+which is also what satisfied D44's "separate runs" check. Widening it alone took
+near-parallel strand tiles over 20 seeds from 511 to 50 with no loss of attempts;
+the deeper waypoint then took attempts from 129 to 73 (alternates hold their own
+line long enough for D44). Thick bands had two further causes: the direction-
+dependent corner fill (two routes sharing a diagonal in opposite directions
+painted both corners) and merge detours cutting corner to corner.
+**Result (20 test seeds):** knots 2 -> 0; readability defects 3 (one short band
+each on BRAVO, DELTA, PAPA); strong exposure features 29 -> 51; maps with no
+strong feature 5 -> 0; best-site ratio 1.79-2.25x; generation mean ~470 -> ~680ms,
+max ~1.1 -> ~1.3-1.4s; npm test ~29 -> ~40s. Runtime road adherence during a
+sheltered wave 77-91% (mean 86%) against 75-93% (mean 87%) before.
+**Rejected:** a strict readability gate (above); leaving road tiles un-penalised
+inside the avoided corridor so squeezed alternates share the road (attempts
+73 -> 753, 18 seeds relaxed: alternates simply rode the primary road); a 4-block
+thick-band minimum (6 maps still flagged, slower, fewer features); border cliffs
+and spawn caps (D54).
+**Known gaps:** short side-by-side merges below the thresholds still read as a
+double line where two approaches converge on a diagonal (KILO centre-left); a
+diagonal road renders as a two-tile staircase, which makes converging diagonals
+look busier than their tile count says.

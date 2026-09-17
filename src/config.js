@@ -51,6 +51,7 @@ export const GEN = {
   startClearRadius: 4,
   maxAttempts: 24,     // strict validation attempts (D2)
   maxRelaxedAttempts: 40,
+  readableExtraAttempts: 2, // D55: further valid maps tried when roads are not yet clean
 };
 
 // D20-D22: roads are an overlay. These costs are used only while carving the
@@ -64,9 +65,11 @@ export const ROAD = {
   waypointChance: 0.72,
   waypointYOffsetMin: 8,
   waypointYOffsetMax: 18,
-  parallelRouteFraction: 0.62,
+  parallelRouteFraction: 0.9,   // D55: was 0.62; a wide alternate must hold its own line most of the half
   parallelRouteYOffsetMin: 12,
-  parallelRoadAvoidRadius: 3,
+  parallelRoadAvoidRadius: 6,  // D55: was 3, which bred strands 3-4 tiles apart
+  branchClearRadius: 7,        // D55: avoidance lifted round an alternate's fork point
+  entryTrunkLength: 3,         // D54: tiles an alternate shares with its mouth's primary route
   parallelRoadAvoidCost: 8.0,
   laneDiscount: 0.32,
   connectorsMin: 1,
@@ -86,6 +89,26 @@ export const EXPOSURE = {
   smallLoopMaxArea: 60,
   braidMinRun: 5,
   readableLegSeparation: 5,
+};
+
+// D55: road readability at full-map scale. Exposure scores tower sites; these
+// reject road areas a player would have to trace with a finger.
+export const READABILITY = {
+  nearPassDistance: 4,       // an unrelated strand this close (tiles, Euclidean)...
+  nearPassGraphMin: 12,      // ...that is at least this far away along the road
+  nearPassClusterRadius: 3,
+  nearPassMinTiles: 4,       // a brushing touch of one or two tiles is not a strand
+  thickBandMinBlocks: 5,     // solid 2x2 road blocks in one run: strands laid side by side
+  junctionRadius: 7,
+  maxJunctionsInRadius: 3,
+  densityRadius: 5,
+  maxDensity: 0.42,          // road tiles per disc tile
+  turnChord: 3,
+  sharpTurnDegrees: 70,
+  turnWindow: 16,            // route steps
+  maxSharpTurnsInWindow: 3,
+  defectClusterRadius: 6,
+  minExposureEfficiency: 0.3, // (exposure - straight baseline) per tile of extra road
 };
 
 // D52: authored exposure features - a short impassable spine the road must wrap.
@@ -235,12 +258,10 @@ export const ENEMY = {
 
 // D5: aggro moves as a rolling commitment, never a synchronized 180.
 export const AGGRO = {
-  baseWeight: 1.0,
-  occupiedWeight: 4.2,       // the Occupied Tower is by far the juiciest target
-  distanceScale: 22,         // score divided by (1 + dist/scale)
-  playerWeight: 8.0,         // overwhelming nearby, but deliberately short-sighted
-  playerDistanceScale: 1.5,
-  switchMargin: 1.35,        // only switch if meaningfully better
+  // D53: towers have no baseline aggro; the occupied tower or the exposed
+  // player is the one strategic target, so score weights are gone.
+  directPursuitRange: 12,    // beyond this, hunters travel toward the player by road
+  releaseDelayMax: 0.9,      // non-sieging enemies drop a just-abandoned tower within this
   retargetMin: 2.0,
   retargetMax: 4.0,
 };

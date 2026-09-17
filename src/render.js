@@ -2,7 +2,7 @@
 
 import { MAP, T, TOWER, PLAYER, DROP, RENDER, richnessTierForRate } from './config.js';
 import { idx, inBounds, isPassable } from './terrain.js';
-import { PLAYER_TARGET_ID, towerStats } from './game.js';
+import { isHunting, towerStats } from './game.js';
 
 const TP = RENDER.baseTilePx;
 const ELEV_SHADE = [0.72, 0.96, 1.22];
@@ -86,6 +86,9 @@ export function buildTerrainLayer(map) {
         if (x + 1 < MAP.w && map.road[idx(x + 1, y)]) ctx.fillRect(cx, cy - half, TP * 0.5, half * 2);
         if (y > 0 && map.road[idx(x, y - 1)]) ctx.fillRect(cx - half, py, half * 2, TP * 0.5);
         if (y + 1 < MAP.h && map.road[idx(x, y + 1)]) ctx.fillRect(cx - half, cy, half * 2, TP * 0.5);
+        // D54: an entry road on the boundary column runs out through the map edge.
+        if (x === 0) ctx.fillRect(px, cy - half, TP * 0.5, half * 2);
+        if (x === MAP.w - 1) ctx.fillRect(cx, cy - half, TP * 0.5, half * 2);
         ctx.fillStyle = 'rgba(244,214,144,0.34)';
         ctx.fillRect(cx - half, cy - 1, half * 2, 2);
       }
@@ -342,7 +345,7 @@ function drawPlayer(ctx, g, view) {
     p.hp / p.maxHp < 0.34 ? '#ff4d4d' : '#7be196');
 
   if (g.phase === 'combat' && g.occupiedTowerId === null) {
-    const hunters = g.enemies.filter((e) => e.targetId === PLAYER_TARGET_ID).length;
+    const hunters = g.enemies.filter((e) => isHunting(g, e)).length;
     ctx.font = `bold ${localPx(view, RENDER.labelMinPx + 2)}px ui-monospace, monospace`;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ff5a5a';

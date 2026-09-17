@@ -4,6 +4,7 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
+  EXPOSURE, READABILITY,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt,
@@ -12,12 +13,12 @@ import {
 import { computeField } from '../src/flowfield.js';
 import {
   straightRoadBaseline, pathExposure, measureSiteExposure, findExposureFeatures,
-  analyseRoadKnots,
+  analyseRoadKnots, analyseRoadReadability, exposureEfficiency, walkedExtraLength,
 } from '../src/roadexposure.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt,
   setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
-  emitAudioEvent, drainAudioEvents,
+  emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -449,6 +450,181 @@ check('road-knot analysis finds planted defects and ignores clean roads', () => 
   return null;
 });
 
+// --- D55: road readability ---------------------------------------------------
+
+/** Axis-aligned polyline through corner points, as route tiles. */
+function polyline(corners) {
+  const out = [corners[0]];
+  for (let k = 1; k < corners.length; k++) {
+    let [x, y] = out[out.length - 1];
+    const [tx, ty] = corners[k];
+    while (x !== tx || y !== ty) {
+      x += Math.sign(tx - x);
+      if (x === tx) y += Math.sign(ty - y);
+      out.push([x, y]);
+    }
+  }
+  return out;
+}
+
+/** A synthetic map carrying one route through the given corners. */
+function routeMap(corners) {
+  const map = syntheticMap();
+  stampRoute(map, polyline(corners));
+  return map;
+}
+
+const readabilityOf = (map) => analyseRoadReadability(map);
+const defectKinds = (r) => [...new Set(r.defects.flatMap((d) => d.kinds))].join(',') || 'none';
+
+check('D55: a clean hairpin, switchback and straight road read as clean', () => {
+  const hairpin = readabilityOf(makeHairpin({ spine: true }));
+  if (hairpin.count) return `clean hairpin flagged: ${defectKinds(hairpin)}`;
+  const switchback = readabilityOf(routeMap([[0, 10], [80, 10], [80, 18], [20, 18], [20, 26], [103, 26]]));
+  if (switchback.count) return `clean switchback flagged: ${defectKinds(switchback)}`;
+  const straight = syntheticMap();
+  stampRoute(straight, horizontal(26));
+  const s = readabilityOf(straight);
+  return s.count ? `straight road flagged: ${defectKinds(s)}` : null;
+});
+
+check('D55: a dense zigzag knot is rejected', () => {
+  const corners = [[0, 26]];
+  for (let x = 30, up = true; x <= 60; x += 3, up = !up) corners.push([x, 26], [x, up ? 23 : 26]);
+  corners.push([103, corners[corners.length - 1][1]]);
+  const r = readabilityOf(routeMap(corners));
+  return r.zigzags.length || r.denseAreas.length ? null : `zigzag passed (${defectKinds(r)})`;
+});
+
+check('D55: repeated near-self-passes are rejected', () => {
+  const r = readabilityOf(routeMap([[0, 20], [60, 20], [60, 23], [10, 23], [10, 26], [103, 26]]));
+  return r.nearPasses.length ? null : `strands 3 tiles apart passed (${defectKinds(r)})`;
+});
+
+check('D55: diagonal strands laid side by side are rejected', () => {
+  const map = syntheticMap();
+  const diagonal = (x0) => Array.from({ length: 16 }, (_, n) => [x0 + n, 10 + n]);
+  for (const x0 of [30, 31]) {
+    const tiles = diagonal(x0);
+    stampRoute(map, tiles);
+    for (let n = 1; n < tiles.length; n++) map.road[idx(tiles[n][0], tiles[n - 1][1])] = 1;
+  }
+  const r = readabilityOf(map);
+  return r.thickBands.length ? null : `side-by-side diagonals passed (${defectKinds(r)})`;
+});
+
+check('D55: a small confusing multi-junction area is rejected', () => {
+  const map = syntheticMap();
+  stampRoute(map, horizontal(26));
+  stampRoute(map, horizontal(22, 40, 60), 'east');
+  for (const x of [43, 48, 53]) stampRoute(map, Array.from({ length: 11 }, (_, n) => [x, 19 + n]), 'east');
+  const r = readabilityOf(map);
+  return r.junctionClutter.length ? null : `junction grid passed (${defectKinds(r)})`;
+});
+
+check('D55: long road spaghetti is rejected despite high raw exposure', () => {
+  const corners = [[0, 12], [70, 12], [70, 16], [30, 16], [30, 20], [70, 20], [70, 24], [30, 24], [30, 28], [103, 28]];
+  const map = routeMap(corners);
+  const points = polyline(corners).map(([x, y]) => ({ x: x + 0.5, y: y + 0.5 }));
+  const site = { x: 50.5, y: 18.5 };
+  if (!isTerrainBuildable(map, site.x, site.y)) return 'test site is not buildable';
+  const window = points.filter((p) => p.x >= 28 && p.x <= 72);
+  const raw = pathExposure(map, site.x, site.y, window).length;
+  const baseline = straightRoadBaseline();
+  if (raw < EXPOSURE.strongRatio * baseline) return `raw exposure only ${(raw / baseline).toFixed(2)}x - not a high-exposure case`;
+  const efficiency = exposureEfficiency(raw, walkedExtraLength(window), baseline);
+  if (efficiency >= READABILITY.minExposureEfficiency) return `spaghetti efficiency ${efficiency.toFixed(2)} passed`;
+  return readabilityOf(map).count ? null : 'spaghetti read as clean';
+});
+
+check('D55: a spined hairpin with a buildable pocket is strong, readable and efficient', () => {
+  const map = makeHairpin({ spine: true });
+  const best = findExposureFeatures(map).find((f) => f.tier === 'strong');
+  if (!best) return 'no strong feature';
+  if (!isTerrainBuildable(map, best.x, best.y)) return 'feature site is not buildable';
+  if (!best.readable || readabilityOf(map).count) return 'hairpin not readable';
+  return best.efficiency >= READABILITY.minExposureEfficiency
+    ? null : `efficiency ${best.efficiency.toFixed(2)} below ${READABILITY.minExposureEfficiency}`;
+});
+
+check('D55: generated maps have no knots and at most isolated readability defects', () => {
+  const flagged = maps.filter((m) => analyseRoadReadability(m).count);
+  for (const m of maps) {
+    if (analyseRoadKnots(m).count) return `${m.seed} keeps a road knot`;
+    const r = analyseRoadReadability(m);
+    if (r.count > 1) return `${m.seed} keeps ${r.count} readability defects (${defectKinds(r)})`;
+  }
+  // Measured 2026-09-17: 3 of 20 keep one short side-by-side band (D55 known gap).
+  return flagged.length <= 3 ? null : `${flagged.length} maps keep a readability defect: ${flagged.map((m) => m.seed).join(', ')}`;
+});
+
+check('D55: authored exposure features are efficient', () => {
+  for (const m of maps) {
+    for (const f of m.exposureFeatures) {
+      if (!(f.efficiency >= READABILITY.minExposureEfficiency)) return `${m.seed} feature at ${f.x},${f.y} efficiency ${f.efficiency}`;
+    }
+  }
+  return null;
+});
+
+// --- D54: entry roads run out through the map edge ---------------------------
+
+check('D54: every spawn mouth has a road from the boundary column into the network', () => {
+  for (const m of maps) {
+    const reach = new Uint8Array(m.road.length);
+    const queue = [idx(m.roadCenter.x, m.roadCenter.y)];
+    reach[queue[0]] = 1;
+    for (let head = 0; head < queue.length; head++) {
+      const x = queue[head] % MAP.w;
+      const y = (queue[head] / MAP.w) | 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = x + ox;
+          const ny = y + oy;
+          if (nx < 0 || ny < 0 || nx >= MAP.w || ny >= MAP.h) continue;
+          const n = idx(nx, ny);
+          if (m.road[n] && !reach[n]) { reach[n] = 1; queue.push(n); }
+        }
+      }
+    }
+    const lane = computeField(m, [idx(m.start.x, m.start.y)], 'lane');
+    for (const side of ['west', 'east']) {
+      const edgeX = side === 'west' ? 0 : MAP.w - 1;
+      for (const mouth of m.spawns[side]) {
+        if (mouth.x !== (side === 'west' ? 1 : MAP.w - 2)) return `${m.seed} ${side} spawn moved to x=${mouth.x}`;
+        if (![0, -1, 1].some((oy) => m.road[idx(edgeX, mouth.y + oy)] && reach[idx(edgeX, mouth.y + oy)])) {
+          return `${m.seed} ${side} mouth (${mouth.x},${mouth.y}) has no connected road on the boundary`;
+        }
+        if (!reach[idx(mouth.x, mouth.y)]) return `${m.seed} ${side} mouth is off the road network`;
+        if (!Number.isFinite(lane[idx(mouth.x, mouth.y)])) return `${m.seed} ${side} mouth has no lane path`;
+      }
+    }
+    for (const route of m.roadRoutes) {
+      if (route.path[0] % MAP.w !== (route.side === 'west' ? 0 : MAP.w - 1)) {
+        return `${m.seed} ${route.side} route starts at x=${route.path[0] % MAP.w}, not the boundary`;
+      }
+    }
+  }
+  return null;
+});
+
+check('D54: roads touch the map boundary only at entry roads', () => {
+  for (const m of maps) {
+    for (let y = 0; y < MAP.h; y++) {
+      for (const side of ['west', 'east']) {
+        const edgeX = side === 'west' ? 0 : MAP.w - 1;
+        if (m.road[idx(edgeX, y)] && !m.spawns[side].some((mouth) => Math.abs(mouth.y - y) <= 1)) {
+          return `${m.seed} ${side} boundary road at y=${y} is not an entry`;
+        }
+      }
+    }
+    for (let x = 0; x < MAP.w; x++) {
+      if (m.road[idx(x, 0)] || m.road[idx(x, MAP.h - 1)]) return `${m.seed} road on the north/south boundary at x=${x}`;
+    }
+  }
+  return null;
+});
+
 check('terrain buildability and tower placement terrain rules agree', () => {
   for (const map of maps.slice(0, 3)) {
     const g = { map, towers: [], materials: Infinity };
@@ -693,6 +869,165 @@ check('an enemy that is not yet sieging does eventually re-prioritise', () => {
   g.player.y = b.y;
   for (let i = 0; i < 600; i++) update(g, 1 / 60); // 10s
   return e.targetId === b.id ? null : `stayed on tower ${e.targetId} despite the player occupying ${b.id}`;
+});
+
+// --- D53: an abandoned tower keeps only the enemies already sieging it --------
+
+/** Start tower A, plus built towers B (far from A) and C (away from both). */
+function aggroFixture(seed) {
+  const g = createGame(seed, 'gunner');
+  g.materials = 99999;
+  const a = g.towers[0];
+  const sites = [];
+  for (let y = 3; y < MAP.h - 3; y++) {
+    for (let x = 3; x < MAP.w - 3; x++) {
+      if (canPlaceAt(g, x + 0.5, y + 0.5).ok) sites.push({ x: x + 0.5, y: y + 0.5 });
+    }
+  }
+  const far = (s, list, d) => list.every((t) => Math.hypot(s.x - t.x, s.y - t.y) >= d);
+  const bSite = sites.filter((s) => far(s, [a], 30)).sort((p, q) => Math.abs(p.y - a.y) - Math.abs(q.y - a.y))[0];
+  if (!bSite || !tryBuild(g, bSite.x, bSite.y).ok) return null;
+  const b = g.towers[g.towers.length - 1];
+  const cSite = sites.find((s) => far(s, [a, b], 20));
+  if (!cSite || !tryBuild(g, cSite.x, cSite.y).ok) return null;
+  const c = g.towers[g.towers.length - 1];
+  for (const t of [b, c]) { t.built = true; t.progress = 1; t.hp = t.maxHp; }
+  return { g, a, b, c };
+}
+
+/** A walkable spot `r` tiles from (x, y), clear of every tower's presence radius. */
+function walkableNear(g, x, y, r, clearOfTowers = true) {
+  for (let k = 0; k < 32; k++) {
+    const ang = (k / 32) * Math.PI * 2;
+    const px = x + Math.cos(ang) * r;
+    const py = y + Math.sin(ang) * r;
+    if (!isPassable(g.map, Math.floor(px), Math.floor(py))) continue;
+    if (clearOfTowers && g.towers.some((t) => Math.hypot(t.x - px, t.y - py) <= PLAYER.presenceRadius + 1.5)) continue;
+    return { x: px, y: py };
+  }
+  return null;
+}
+
+function testEnemy(g, at, targetId, speed = 0) {
+  const e = {
+    id: g.nextEnemyId++, type: 'swarm', side: 'debug',
+    def: { radius: 0.34, hp: 1e6, speed, towerDps: 0, playerHit: 0, color: '#fff' },
+    x: at.x, y: at.y, hp: 1e6, maxHp: 1e6,
+    targetId, sieging: false, siegeAngle: 0, retargetIn: 99, hitCd: 99, flash: 0,
+  };
+  g.enemies.push(e);
+  return e;
+}
+
+function occupy(g, t) {
+  g.player.x = t.x;
+  g.player.y = t.y;
+  for (let i = 0; i < 60 && g.occupiedTowerId !== t.id; i++) update(g, 1 / 60);
+  return g.occupiedTowerId === t.id;
+}
+
+const runFor = (g, seconds) => { for (let i = 0; i < seconds * 60; i++) update(g, 1 / 60); };
+
+check('D53-A: an enemy already sieging the old tower stays on it after the player moves', () => {
+  const f = aggroFixture('AGGRO-A');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b } = f;
+  a.hp = a.maxHp = 1e9;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = walkableNear(g, a.x, a.y, TOWER.radius + 1.2, false);
+  if (!spot) return 'no siege position beside A';
+  const e = testEnemy(g, spot, a.id);
+  update(g, 1 / 60);
+  if (!e.sieging) return 'enemy did not begin sieging A';
+  if (!occupy(g, b)) return 'player did not occupy B';
+  runFor(g, 1);
+  // Separation can shove a besieger off the wall; that must not end the commitment.
+  const out = walkableNear(g, a.x, a.y, TOWER.radius + 3.5, false);
+  if (out) { e.x = out.x; e.y = out.y; e.def.speed = 2; }
+  e.retargetIn = 0;
+  runFor(g, 6);
+  return e.targetId === a.id ? null : `sieging enemy left A for ${e.targetId}`;
+});
+
+check('D53-B: an enemy only heading for the old tower drops it and never sieges it', () => {
+  const f = aggroFixture('AGGRO-B');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b } = f;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = walkableNear(g, a.x, a.y, 6);
+  if (!spot) return 'no approach position near A';
+  // A long personal timer: only releasing the abandoned tower can make it re-read.
+  const waiting = testEnemy(g, spot, a.id);
+  const walker = testEnemy(g, { x: spot.x, y: spot.y }, a.id, 2.2);
+  if (!occupy(g, b)) return 'player did not occupy B';
+  let siegedA = false;
+  for (let i = 0; i < 6 * 60; i++) {
+    update(g, 1 / 60);
+    if (walker.targetId === a.id && walker.sieging) siegedA = true;
+  }
+  if (siegedA) return 'an enemy that had not begun sieging went on to besiege the abandoned tower';
+  if (waiting.targetId !== b.id) return `waiting enemy kept ${waiting.targetId} (hysteresis/loyalty), expected B ${b.id}`;
+  if (walker.targetId !== b.id) return `walking enemy targets ${walker.targetId}, expected B ${b.id}`;
+  return null;
+});
+
+check('D53-C: a nearby enemy bound for the old tower turns on the exposed player', () => {
+  const f = aggroFixture('AGGRO-C');
+  if (!f) return 'could not build the fixture';
+  const { g, a } = f;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = walkableNear(g, a.x, a.y, 7);
+  if (!spot) return 'no approach position near A';
+  const e = testEnemy(g, spot, a.id);
+  const stand = walkableNear(g, spot.x, spot.y, 3);
+  if (!stand) return 'no exposed standing spot';
+  g.player.x = stand.x;
+  g.player.y = stand.y;
+  runFor(g, 1.5);
+  if (g.occupiedTowerId !== null) return 'player is not exposed';
+  if (e.targetId !== PLAYER_TARGET_ID) return `enemy kept ${e.targetId} instead of the exposed player`;
+  return isHunting(g, e) ? null : 'nearby enemy targets the player but is not hunting directly';
+});
+
+check('D53-D: enemies spawned after a transfer never choose the previously occupied tower', () => {
+  const f = aggroFixture('AGGRO-D');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b } = f;
+  if (!occupy(g, a) || !occupy(g, b)) return 'player did not transfer A -> B';
+  const spot = walkableNear(g, a.x, a.y, TOWER.radius + 3);
+  if (!spot) return 'no spawn position near A';
+  spawnGroupAt(g, spot.x, spot.y, 'swarm', 6);
+  for (const e of g.enemies) { e.hp = e.maxHp = 1e6; }
+  for (let i = 0; i < 8 * 60; i++) {
+    update(g, 1 / 60);
+    const bad = g.enemies.find((e) => e.targetId === a.id);
+    if (bad) return `new enemy ${bad.id} chose abandoned tower A`;
+  }
+  return null;
+});
+
+check('D53-E: a never-occupied tower is not a strategic target, sheltered or exposed', () => {
+  const f = aggroFixture('AGGRO-E');
+  if (!f) return 'could not build the fixture';
+  const { g, a, c } = f;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = walkableNear(g, c.x, c.y, TOWER.radius + 3);
+  if (!spot) return 'no position beside C';
+  const sheltered = testEnemy(g, spot, null);
+  sheltered.retargetIn = 0;
+  runFor(g, 3);
+  if (sheltered.targetId !== a.id) return `enemy beside C chose ${sheltered.targetId}, expected occupied A ${a.id}`;
+  // Player steps out far from C: the old baseline score let C beat a distant player.
+  const out = walkableNear(g, a.x, a.y, PLAYER.presenceRadius + 3);
+  if (!out) return 'no exposed spot near A';
+  g.player.x = out.x;
+  g.player.y = out.y;
+  const exposed = testEnemy(g, spot, null);
+  exposed.retargetIn = 0;
+  runFor(g, 3);
+  if (g.occupiedTowerId !== null) return 'player is not exposed';
+  if (exposed.targetId !== PLAYER_TARGET_ID) return `enemy beside C chose ${exposed.targetId} over the exposed player`;
+  return [sheltered, exposed].some((e) => e.targetId === c.id) ? 'an enemy targeted unoccupied C' : null;
 });
 
 // --- occupancy is actually a large bonus -------------------------------------

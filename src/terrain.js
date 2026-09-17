@@ -1,11 +1,13 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, EXPOSURE_GEN, richnessTierForRate,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, EXPOSURE_GEN, READABILITY, richnessTierForRate,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
 import { findCostPath } from './flowfield.js';
-import { analyseRoadKnots, findExposureFeatures, measureSiteExposure } from './roadexposure.js';
+import {
+  analyseRoadKnots, analyseRoadReadability, findExposureFeatures, measureSiteExposure,
+} from './roadexposure.js';
 
 export const idx = (x, y) => y * MAP.w + x;
 export const inBounds = (x, y) => x >= 0 && y >= 0 && x < MAP.w && y < MAP.h;
@@ -361,7 +363,16 @@ function carveRoadPath(map, path) {
       const py = (previous / MAP.w) | 0;
       const x = i % MAP.w;
       const y = (i / MAP.w) | 0;
-      if (x !== px && y !== py) mark(idx(x, py));
+      // A diagonal step needs one corner tile to read as continuous road. D55:
+      // pick it the same way whichever direction the road is walked; a
+      // direction-dependent corner painted BOTH corners wherever two routes
+      // shared a diagonal in opposite directions - a solid band four tiles wide.
+      if (x !== px && y !== py) {
+        const upper = y < py ? { x, y } : { x: px, y: py };
+        const lower = y < py ? { x: px, y: py } : { x, y };
+        const corner = idx(lower.x, upper.y);
+        mark(PASSABLE[map.kind[corner]] ? corner : idx(upper.x, lower.y));
+      }
     }
     mark(i);
     previous = i;
@@ -428,10 +439,18 @@ function routeWaypoints(map, rng, mouth, side) {
   return waypoint >= 0 ? [waypoint] : [];
 }
 
-/** Keep an alternate approach out of the first road's corridor before it merges. */
-function markRoadAvoidance(map, side) {
+/**
+ * Keep an alternate approach out of the first road's corridor before it merges.
+ * D55: the corridor must be wide. A narrow ring priced the alternate just
+ * outside it, so it ran alongside the first road 3-4 tiles away - the
+ * near-parallel strands that read as one tangled band at full-map scale.
+ * The ground around the branch point stays free so the fork can leave cleanly.
+ */
+function markRoadAvoidance(map, side, branch = -1) {
   const avoid = new Uint8Array(MAP.w * MAP.h);
   const radius = ROAD.parallelRoadAvoidRadius;
+  const bx = branch % MAP.w;
+  const by = (branch / MAP.w) | 0;
   for (let y = 0; y < MAP.h; y++) {
     for (let x = 0; x < MAP.w; x++) {
       if (!map.road[idx(x, y)]) continue;
@@ -440,6 +459,7 @@ function markRoadAvoidance(map, side) {
           const nx = x + ox;
           const ny = y + oy;
           if (!inBounds(nx, ny) || Math.abs(ox) + Math.abs(oy) > radius) continue;
+          if (branch >= 0 && Math.hypot(nx - bx, ny - by) <= ROAD.branchClearRadius) continue;
           if ((side === 'west' && nx < map.roadCenter.x)
               || (side === 'east' && nx > map.roadCenter.x)) avoid[idx(nx, ny)] = 1;
         }
@@ -447,6 +467,41 @@ function markRoadAvoidance(map, side) {
     }
   }
   return avoid;
+}
+
+/** D54: every boundary tile except the entry tiles beside each spawn mouth. */
+function boundaryAvoidance(map) {
+  // Two tiles deep: a road one column in reads as running along the edge too.
+  const avoid = new Uint8Array(MAP.w * MAP.h);
+  for (let x = 0; x < MAP.w; x++) {
+    for (const y of [0, 1, MAP.h - 2, MAP.h - 1]) avoid[idx(x, y)] = 1;
+  }
+  for (let y = 0; y < MAP.h; y++) {
+    for (const x of [0, 1, MAP.w - 2, MAP.w - 1]) avoid[idx(x, y)] = 1;
+  }
+  for (const side of ['west', 'east']) {
+    const columns = side === 'west' ? [0, 1] : [MAP.w - 1, MAP.w - 2];
+    for (const mouth of map.spawns[side]) {
+      for (const x of columns) {
+        for (const oy of [-1, 0, 1]) if (inBounds(x, mouth.y + oy)) avoid[idx(x, mouth.y + oy)] = 0;
+      }
+    }
+  }
+  return avoid;
+}
+
+/**
+ * D54: the visible start of an entry road - the boundary tile on the mouth's
+ * row, then the mouth itself. Enemies still spawn at the mouth, one tile in.
+ */
+function entryPath(map, mouth, side) {
+  const edgeX = side === 'west' ? 0 : MAP.w - 1;
+  const mouthI = idx(mouth.x, mouth.y);
+  for (const oy of [0, -1, 1]) {
+    const y = mouth.y + oy;
+    if (inBounds(edgeX, y) && isPassable(map, edgeX, y)) return [idx(edgeX, y), mouthI];
+  }
+  return [mouthI];
 }
 
 function parallelWaypoint(map, mouth, side, ordinal) {
@@ -464,29 +519,42 @@ function buildRoadNetwork(map, rng) {
   const centreI = idx(map.roadCenter.x, map.roadCenter.y);
   map.roadRoutes = [];
   map.roadConnectorPaths = [];
+  // D54: roads meet the map boundary only where they enter it. Everywhere
+  // else the boundary is priced like an alternate's avoided corridor.
+  const edgeAvoid = boundaryAvoidance(map);
   for (const side of ['west', 'east']) {
     const mouths = map.spawns[side];
     // Three west and two east approaches make 3+ road-run columns a normal
     // outcome, while still keeping the whole network to five main routes.
     const routeCount = Math.max(side === 'west' ? 3 : 2, mouths.length);
+    const primaryPaths = [];
     for (let routeIndex = 0; routeIndex < routeCount; routeIndex++) {
-      const mouth = mouths[routeIndex % mouths.length];
+      const mouthIndex = routeIndex % mouths.length;
+      const mouth = mouths[mouthIndex];
       const alternate = routeIndex >= mouths.length;
       const forcedWaypoint = alternate ? parallelWaypoint(map, mouth, side, routeIndex - mouths.length + 1) : -1;
       const stops = [...routeWaypoints(map, rng, mouth, side), centreI];
       if (forcedWaypoint >= 0) stops.unshift(forcedWaypoint);
-      let from = idx(mouth.x, mouth.y);
-      const route = [];
+      // D54/D55: a primary route enters from the boundary; an alternate from
+      // the same mouth shares that entry trunk and forks off a few tiles in,
+      // so the edge shows one road that splits rather than a splay of strands.
+      const route = alternate
+        ? primaryPaths[mouthIndex].slice(0, ROAD.entryTrunkLength + 1)
+        : entryPath(map, mouth, side);
+      carveRoadPath(map, route);
+      let from = route[route.length - 1];
       for (let legIndex = 0; legIndex < stops.length; legIndex++) {
         const to = stops[legIndex];
-        map.roadAvoid = alternate && legIndex === 0 ? markRoadAvoidance(map, side) : null;
+        map.roadAvoid = alternate && legIndex === 0
+          ? markRoadAvoidance(map, side, from).map((v, i) => v | edgeAvoid[i]) : edgeAvoid;
         const leg = findCostPath(map, from, to);
         map.roadAvoid = null;
         if (!leg.length) continue;
         carveRoadPath(map, leg);
-        route.push(...(route.length ? leg.slice(1) : leg));
+        route.push(...leg.slice(1));
         from = to;
       }
+      if (!alternate) primaryPaths[mouthIndex] = route;
       map.roadRoutes.push({ side, mouth: { ...mouth }, path: route });
     }
   }
@@ -504,7 +572,9 @@ function buildRoadNetwork(map, rng) {
     const from = gapRoadPoint(barrier, unused[Math.floor(rng() * unused.length)]);
     const to = roadPointInGap(map, barrier, used[Math.floor(rng() * used.length)]);
     if (to < 0) continue;
+    map.roadAvoid = edgeAvoid;
     const path = findCostPath(map, from, to);
+    map.roadAvoid = null;
     if (path.length) { carveRoadPath(map, path); map.roadConnectorPaths.push(path); made++; }
   }
   map.roadConnectors = made;
@@ -573,7 +643,7 @@ function pruneDeadEnds(map) {
 }
 
 /** Shortest 8-neighbour walk that stays on road tiles and avoids `forbidden`. */
-function roadOnlyPath(map, from, to, forbidden) {
+function roadOnlyPath(map, from, to, forbidden, onPath = null) {
   const dist = new Float32Array(MAP.w * MAP.h).fill(Infinity);
   const prev = new Int32Array(MAP.w * MAP.h).fill(-1);
   const open = [from];
@@ -595,7 +665,9 @@ function roadOnlyPath(map, from, to, forbidden) {
         if (!inBounds(nx, ny)) continue;
         const ni = idx(nx, ny);
         if (!map.road[ni] || forbidden.has(ni)) continue;
-        const nd = dist[i] + (ox && oy ? Math.SQRT2 : 1);
+        // D55: walk another path's own tiles, not the corner fills beside them;
+        // cutting corner to corner would lay a fresh strand next to the road.
+        const nd = dist[i] + (ox && oy ? Math.SQRT2 : 1) + (onPath && !onPath.has(ni) ? 0.6 : 0);
         if (nd < dist[ni]) {
           if (dist[ni] === Infinity) open.push(ni);
           dist[ni] = nd;
@@ -622,14 +694,24 @@ function mergeKnottedPaths(map) {
     if (n < map.roadRoutes.length) map.roadRoutes[n].path = path;
     else map.roadConnectorPaths[n - map.roadRoutes.length] = path;
   };
-  let knots = analyseRoadKnots(map);
-  for (let pass = 0; pass < 12 && knots.count; pass++) {
+  // D55: readability defects (strands laid side by side, near-passes) are
+  // repaired the same way; a merge is kept only if knots do not rise, the
+  // combined count falls, and the D44 parallel-approach gate is not broken.
+  const score = () => {
+    const k = analyseRoadKnots(map);
+    const r = analyseRoadReadability(map);
+    // A side-by-side strand runs further than a knot; repair the whole run.
+    const sites = [...k.knots.map((p) => ({ ...p, reach: 7 })), ...r.defects.map((p) => ({ ...p, reach: 13 }))];
+    return { k, r, total: k.count + r.count, parallel: parallelOk(map), sites };
+  };
+  let knots = score();
+  for (let pass = 0; pass < 16 && knots.total; pass++) {
     let improved = false;
-    for (const knot of knots.knots) {
+    for (const knot of knots.sites) {
       const all = paths();
       const usage = new Map();
       for (const p of all) for (const i of new Set(p)) usage.set(i, (usage.get(i) || 0) + 1);
-      const near = (i) => Math.hypot(i % MAP.w + 0.5 - knot.x, ((i / MAP.w) | 0) + 0.5 - knot.y) <= 7;
+      const near = (i) => Math.hypot(i % MAP.w + 0.5 - knot.x, ((i / MAP.w) | 0) + 0.5 - knot.y) <= knot.reach;
       for (let n = 0; n < all.length && !improved; n++) {
         const p = all[n];
         let k0 = -1;
@@ -641,20 +723,29 @@ function mergeKnottedPaths(map) {
         const forbidden = new Set();
         for (let k = k0 + 1; k < k1; k++) if (usage.get(p[k]) === 1) forbidden.add(p[k]);
         if (!forbidden.size) continue;
-        const detour = roadOnlyPath(map, p[k0], p[k1], forbidden);
+        const detour = roadOnlyPath(map, p[k0], p[k1], forbidden, usage);
         if (!detour) continue;
-        const saved = { road: map.road.slice(), path: p };
+        const saved = snapshotRoads(map);
         setPath(n, eraseLoops([...p.slice(0, k0), ...detour, ...p.slice(k1 + 1)]));
         rebuildRoadLayer(map);
         pruneDeadEnds(map);
-        const after = analyseRoadKnots(map);
-        if (after.count < knots.count) { knots = after; improved = true; }
-        else { setPath(n, saved.path); map.road.set(saved.road); }
+        const after = score();
+        if (after.total < knots.total && after.k.count <= knots.k.count && (after.parallel || !knots.parallel)) {
+          knots = after;
+          improved = true;
+        } else restoreRoads(map, saved);
       }
       if (improved) break;
     }
     if (!improved) break;
   }
+}
+
+/** The D44 parallel-approach part of the validation gate, on its own. */
+function parallelOk(map) {
+  const p = measureParallelRoadRoutes(map);
+  return p.west.median >= VALID.parallelRouteMedianMin && p.east.median >= VALID.parallelRouteMedianMin
+    && p.west.columnsWithThree + p.east.columnsWithThree >= VALID.parallelRouteColumnsWithThreeMin;
 }
 
 function cleanRoadNetwork(map) {
@@ -758,12 +849,19 @@ function buildMap(rng) {
   map.waterDist = waterDistance(map, ROAD.riverCheapRadius);
   buildRoadNetwork(map, rng);
   keepStartTowerOffRoad(map, start);
-  // D52: exposure features are authored only onto a network that already
-  // validates, so a failed feature is undone locally instead of costing a
-  // whole regenerated map.
+  return map;
+}
+
+/**
+ * D52: exposure features are authored only onto a network that already
+ * validates, so a failed feature is undone locally instead of costing a whole
+ * regenerated map. D55: this runs only for the map generateMap keeps, with that
+ * attempt's own rng, so judging several candidate networks stays cheap.
+ */
+function finishMap(map, rng) {
   map.exposureFeatures = [];
   if (validateMap(map).ok) authorExposureFeatures(map, rng);
-  map.deposits = placeDeposits(map, rng, start);
+  map.deposits = placeDeposits(map, rng, map.start);
   return map;
 }
 
@@ -947,6 +1045,7 @@ function tryExposureFeature(map, rng, cand, sign, depth) {
   }
 
   const before = snapshotRoads(map);
+  const readabilityBefore = analyseRoadReadability(map).count;
   const fail = () => { restoreRoads(map, before); return null; };
   for (const i of spine) {
     map.kind[i] = kind;
@@ -983,17 +1082,21 @@ function tryExposureFeature(map, rng, cand, sign, depth) {
   pruneDeadEnds(map);
 
   if (analyseRoadKnots(map).count) return fail();
+  // D55: a feature may not make the road network harder to read.
+  if (analyseRoadReadability(map).count > readabilityBefore) return fail();
   const pocket = tileXY(pocketI);
   const found = findExposureFeatures(map, { region: { x: pocket.x + 0.5, y: pocket.y + 0.5, r: bend + 2 } })
     .filter((f) => f.tier === 'strong' && f.readable);
   if (!found.length) return fail();
   const best = found[0];
+  if (best.efficiency < READABILITY.minExposureEfficiency) return fail();
   const walked = measureSiteExposure(map, best.x, best.y);
   const onRoad = walked.walked.filter((q) => map.road[idx(Math.floor(q.x), Math.floor(q.y))]).length;
   if (onRoad / walked.walked.length < G.minWalkedOnRoad) return fail();
   if (!validateMap(map).ok) return fail();
   return {
     x: best.x, y: best.y, exposure: best.exposure, ratio: best.ratio, kind: best.kind,
+    extraLength: best.extraLength, efficiency: best.efficiency,
     spine: kind === T.DEEP ? 'water' : 'rock',
   };
 }
@@ -1213,23 +1316,44 @@ export function generateMap(seedString) {
   const base = hashString(String(seedString));
   let lastMap = null;
   let lastReport = null;
+  // D55: a valid map whose roads still carry knots or readability defects is
+  // kept, and a few more attempts look for a clean one. The least-defective
+  // valid map wins if none turns up; a strict map is never traded for relaxing.
+  let fallback = null;
+  let extra = 0;
+  const finish = (candidate, attempts) => {
+    const { map, rng, relaxed } = candidate;
+    finishMap(map, rng);
+    map.seed = String(seedString);
+    map.attempts = attempts;
+    map.relaxed = relaxed;
+    map.report = validateMap(map, relaxed);
+    const knots = analyseRoadKnots(map);
+    const readability = analyseRoadReadability(map);
+    map.roadDefects = { knots: knots.count, readability: readability.count };
+    return map;
+  };
 
   for (let attempt = 0; attempt < GEN.maxRelaxedAttempts; attempt++) {
     const relaxed = attempt >= GEN.maxAttempts;
-    const map = buildMap(makeRng((base + attempt * 7919) >>> 0));
+    if (relaxed && fallback) return finish(fallback, attempt);
+    const rng = makeRng((base + attempt * 7919) >>> 0);
+    const map = buildMap(rng);
     const report = validateMap(map, relaxed);
-    lastMap = map;
+    lastMap = { map, rng, relaxed };
     lastReport = report;
     if (report.ok) {
-      map.seed = String(seedString);
-      map.attempts = attempt + 1;
-      map.relaxed = relaxed;
-      map.report = report;
-      return map;
+      const defects = analyseRoadKnots(map).count + analyseRoadReadability(map).count;
+      const candidate = { map, rng, relaxed, defects };
+      if (!defects || relaxed) return finish(candidate, attempt + 1);
+      if (!fallback || defects < fallback.defects) fallback = candidate;
+      if (++extra > GEN.readableExtraAttempts) return finish(fallback, attempt + 1);
     }
   }
 
   // Never hand back nothing; the debug panel will show why this one is off-spec.
+  finishMap(lastMap.map, lastMap.rng);
+  lastMap = lastMap.map;
   lastMap.seed = String(seedString);
   lastMap.attempts = GEN.maxRelaxedAttempts;
   lastMap.relaxed = true;

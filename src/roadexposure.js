@@ -1,7 +1,7 @@
 // D49 road-exposure and road-knot measurement. Read-only: terrain generation
 // calls it to judge knot fixes and exposure features (D51/D52) but it edits nothing.
 
-import { MAP, T, TOWER, EXPOSURE, PASSABLE } from './config.js';
+import { MAP, T, TOWER, EXPOSURE, READABILITY, PASSABLE } from './config.js';
 import { computeField } from './flowfield.js';
 import { idx, inBounds, hasLineOfSight, isTerrainBuildable } from './terrain.js';
 
@@ -224,6 +224,27 @@ function classifyFeature(map, site, walked, counted) {
   return { kind, legSeparation };
 }
 
+/** D55: road the walked window spends beyond a straight line between its ends. */
+export function walkedExtraLength(walked) {
+  if (walked.length < 2) return 0;
+  let length = 0;
+  for (let k = 1; k < walked.length; k++) {
+    length += Math.hypot(walked[k].x - walked[k - 1].x, walked[k].y - walked[k - 1].y);
+  }
+  const a = walked[0];
+  const b = walked[walked.length - 1];
+  return Math.max(0, length - Math.hypot(b.x - a.x, b.y - a.y));
+}
+
+/**
+ * D55: exposure bought per tile of extra road. A hairpin that adds a little
+ * road for a lot of firing time scores high; a long knot scores low however
+ * much raw exposure it piles up.
+ */
+export function exposureEfficiency(exposure, extraLength, baseline = straightRoadBaseline()) {
+  return (exposure - baseline) / Math.max(1, extraLength);
+}
+
 export function findExposureFeatures(map, options = {}) {
   const range = options.range ?? TOWER.weapon.range;
   const baseline = straightRoadBaseline(range);
@@ -249,11 +270,14 @@ export function findExposureFeatures(map, options = {}) {
     const result = measureSiteExposure(map, candidate.x, candidate.y, { ...options, fieldCache, range });
     if (result.exposure < threshold) continue;
     const classification = classifyFeature(map, candidate, result.walked, result.counted);
+    const extraLength = walkedExtraLength(result.walked);
     measured.push({
       x: candidate.x,
       y: candidate.y,
       exposure: result.exposure,
       ratio: result.ratio,
+      extraLength,
+      efficiency: exposureEfficiency(result.exposure, extraLength, baseline),
       tier: result.ratio >= EXPOSURE.strongRatio ? 'strong' : 'useful',
       kind: classification.kind,
       legSeparation: classification.legSeparation,
@@ -381,6 +405,198 @@ function findBraids(map) {
   scan(MAP.h - 2, MAP.w, (row, col) => idx(col, row));
   scan(MAP.w - 2, MAP.h, (col, row) => idx(col, row));
   return braids;
+}
+
+// ---------------------------------------------------------------------------
+// D55: road readability. A knot (D49) is a topological defect; these measure
+// what makes a connected, knot-free road still hard to follow at full-map scale.
+// ---------------------------------------------------------------------------
+
+function roadTiles(map) {
+  const out = [];
+  for (let i = 0; i < map.road.length; i++) if (map.road[i]) out.push(i);
+  return out;
+}
+
+/** Road tiles with an unrelated strand close by: near in space, far along the road. */
+function findNearPasses(map, tiles) {
+  const R = READABILITY;
+  const reach = Math.ceil(R.nearPassDistance);
+  const r2 = R.nearPassDistance * R.nearPassDistance;
+  const W = MAP.w;
+  // Generation-stamped visits: no per-tile clearing or neighbour arrays.
+  const seenAt = new Int32Array(map.road.length);
+  const depth = new Int16Array(map.road.length);
+  const queue = new Int32Array(map.road.length);
+  const hits = [];
+  let stamp = 0;
+  for (const start of tiles) {
+    const sx = start % W;
+    const sy = (start / W) | 0;
+    const near = [];
+    for (let oy = -reach; oy <= reach; oy++) {
+      for (let ox = -reach; ox <= reach; ox++) {
+        if ((!ox && !oy) || ox * ox + oy * oy > r2 || !inBounds(sx + ox, sy + oy)) continue;
+        const j = idx(sx + ox, sy + oy);
+        if (map.road[j]) near.push(j);
+      }
+    }
+    if (!near.length) continue;
+    stamp++;
+    seenAt[start] = stamp;
+    depth[start] = 0;
+    queue[0] = start;
+    let tail = 1;
+    let found = 0;
+    for (let head = 0; head < tail && found < near.length; head++) {
+      const i = queue[head];
+      if (depth[i] >= R.nearPassGraphMin) continue;
+      const x = i % W;
+      const y = (i / W) | 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = x + ox;
+          const ny = y + oy;
+          if ((!ox && !oy) || nx < 0 || ny < 0 || nx >= W || ny >= MAP.h) continue;
+          const n = ny * W + nx;
+          if (!map.road[n] || seenAt[n] === stamp) continue;
+          seenAt[n] = stamp;
+          depth[n] = depth[i] + 1;
+          queue[tail++] = n;
+          if (Math.abs(nx - sx) <= reach && Math.abs(ny - sy) <= reach) found = near.filter((j) => seenAt[j] === stamp).length;
+        }
+      }
+    }
+    if (near.some((j) => seenAt[j] !== stamp)) hits.push({ x: sx + 0.5, y: sy + 0.5 });
+  }
+  return clusterPoints(hits, R.nearPassClusterRadius)
+    .filter((group) => group.length >= R.nearPassMinTiles).map(centroid);
+}
+
+/** Solid 2x2 road blocks in a run: diagonal strands laid side by side. */
+function findThickBands(map) {
+  const blocks = [];
+  for (let y = 0; y + 1 < MAP.h; y++) {
+    for (let x = 0; x + 1 < MAP.w; x++) {
+      if (map.road[idx(x, y)] && map.road[idx(x + 1, y)] && map.road[idx(x, y + 1)] && map.road[idx(x + 1, y + 1)]) {
+        blocks.push({ x: x + 1, y: y + 1 });
+      }
+    }
+  }
+  // Knight-move reach: a band that shifts sideways by a tile is still one band.
+  return clusterPoints(blocks, 2.3).filter((group) => group.length >= READABILITY.thickBandMinBlocks).map(centroid);
+}
+
+/** Separate road branches leaving a tile, read round its eight neighbours. */
+function branchCount(map, i) {
+  const x = i % MAP.w;
+  const y = (i / MAP.w) | 0;
+  const ring = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
+    .map(([ox, oy]) => inBounds(x + ox, y + oy) && map.road[idx(x + ox, y + oy)] ? 1 : 0);
+  let runs = 0;
+  for (let k = 0; k < 8; k++) if (ring[k] && !ring[(k + 7) % 8]) runs++;
+  return runs || (ring.some(Boolean) ? 1 : 0);
+}
+
+/** Several road junctions crowded into one small area. */
+function findJunctionClutter(map, tiles) {
+  const R = READABILITY;
+  const junctionTiles = tiles.filter((i) => branchCount(map, i) >= 3)
+    .map((i) => ({ x: i % MAP.w + 0.5, y: ((i / MAP.w) | 0) + 0.5 }));
+  const junctions = clusterPoints(junctionTiles, 2.5).map(centroid);
+  const out = [];
+  for (const j of junctions) {
+    const near = junctions.filter((o) => Math.hypot(o.x - j.x, o.y - j.y) <= R.junctionRadius);
+    if (near.length > R.maxJunctionsInRadius) out.push(centroid(near));
+  }
+  return clusterPoints(out, R.junctionRadius).map(centroid);
+}
+
+/** Too much road packed into a small disc. */
+function findDenseAreas(map, tiles) {
+  const R = READABILITY;
+  const r = R.densityRadius;
+  const area = Math.PI * r * r;
+  const dense = [];
+  for (const i of tiles) {
+    const x = i % MAP.w;
+    const y = (i / MAP.w) | 0;
+    let n = 0;
+    for (let oy = -r; oy <= r; oy++) {
+      for (let ox = -r; ox <= r; ox++) {
+        if (ox * ox + oy * oy <= r * r && inBounds(x + ox, y + oy) && map.road[idx(x + ox, y + oy)]) n++;
+      }
+    }
+    if (n / area > R.maxDensity) dense.push({ x: x + 0.5, y: y + 0.5 });
+  }
+  return clusterPoints(dense, r).map(centroid);
+}
+
+/** Many sharp turns within a short stretch of one route: a zigzag. */
+function findZigzags(map) {
+  const R = READABILITY;
+  const out = [];
+  const c = R.turnChord;
+  for (const route of map.roadRoutes || []) {
+    const p = route.path.map((i) => ({ x: i % MAP.w + 0.5, y: ((i / MAP.w) | 0) + 0.5 }));
+    const sharp = [];
+    for (let k = c; k + c < p.length; k++) {
+      const h1 = Math.atan2(p[k].y - p[k - c].y, p[k].x - p[k - c].x);
+      const h2 = Math.atan2(p[k + c].y - p[k].y, p[k + c].x - p[k].x);
+      if (Math.abs(angleDelta(h1, h2)) * 180 / Math.PI >= R.sharpTurnDegrees
+          && (!sharp.length || k - sharp[sharp.length - 1] >= c)) sharp.push(k);
+    }
+    for (let a = 0; a < sharp.length; a++) {
+      let b = a;
+      while (b + 1 < sharp.length && sharp[b + 1] - sharp[a] <= R.turnWindow) b++;
+      if (b - a + 1 > R.maxSharpTurnsInWindow) out.push(p[sharp[a + ((b - a) >> 1)]]);
+    }
+  }
+  return clusterPoints(out, R.defectClusterRadius).map(centroid);
+}
+
+function clusterPoints(points, radius) {
+  const groups = [];
+  for (const p of points) {
+    const touching = groups.filter((g) => g.some((o) => Math.hypot(o.x - p.x, o.y - p.y) <= radius));
+    if (!touching.length) groups.push([p]);
+    else {
+      touching[0].push(p);
+      for (const extra of touching.slice(1)) {
+        touching[0].push(...extra);
+        groups.splice(groups.indexOf(extra), 1);
+      }
+    }
+  }
+  return groups;
+}
+
+function centroid(group) {
+  return {
+    x: group.reduce((s, p) => s + p.x, 0) / group.length,
+    y: group.reduce((s, p) => s + p.y, 0) / group.length,
+  };
+}
+
+export function analyseRoadReadability(map) {
+  const tiles = roadTiles(map);
+  const nearPasses = findNearPasses(map, tiles);
+  const thickBands = findThickBands(map);
+  const junctionClutter = findJunctionClutter(map, tiles);
+  const denseAreas = findDenseAreas(map, tiles);
+  const zigzags = findZigzags(map);
+  const tagged = [
+    ...nearPasses.map((p) => ({ ...p, kind: 'nearPass' })),
+    ...thickBands.map((p) => ({ ...p, kind: 'thickBand' })),
+    ...junctionClutter.map((p) => ({ ...p, kind: 'junctionClutter' })),
+    ...denseAreas.map((p) => ({ ...p, kind: 'dense' })),
+    ...zigzags.map((p) => ({ ...p, kind: 'zigzag' })),
+  ];
+  const defects = clusterPoints(tagged, READABILITY.defectClusterRadius).map((group) => ({
+    ...centroid(group),
+    kinds: [...new Set(group.map((p) => p.kind))],
+  }));
+  return { nearPasses, thickBands, junctionClutter, denseAreas, zigzags, defects, count: defects.length };
 }
 
 export function analyseRoadKnots(map) {

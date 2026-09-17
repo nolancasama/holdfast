@@ -46,7 +46,7 @@ export function createGame(seedString, archetypeKey) {
     occupiedTowerId: null,
     shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
     input: { mx: 0, my: 0, melee: false, repair: false },
-    playerField: null, playerFieldAt: -99,
+    playerField: null, playerFieldAt: -99, playerLaneField: null, playerLaneFieldAt: -99,
     log: [], audioEvents: [],
     stats: { kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0 },
     debug: { showPaths: false, spawnPaused: false, open: false },
@@ -244,7 +244,7 @@ function destroyTower(g, t) {
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
-  for (const e of g.enemies) if (e.targetId === t.id) { e.targetId = null; e.sieging = false; }
+  for (const e of g.enemies) if (e.targetId === t.id) { e.targetId = null; e.sieging = false; e.siegedId = null; }
 
   for (let i = 0; i < 46; i++) {
     const a = Math.random() * Math.PI * 2;
@@ -323,6 +323,7 @@ function updatePlayer(g, dt) {
     if (d <= bestD) { bestD = d; best = t; }
   }
   const wasSheltered = g.occupiedTowerId !== null;
+  const previousTowerId = g.occupiedTowerId;
   if (!best) {
     g.shelter.towerId = null;
     g.shelter.progress = 0;
@@ -337,6 +338,7 @@ function updatePlayer(g, dt) {
     g.shelter.progress = Math.min(g.shelter.required, g.shelter.progress + dt);
     g.occupiedTowerId = g.shelter.progress >= g.shelter.required ? best.id : null;
   }
+  if (previousTowerId !== null && g.occupiedTowerId !== previousTowerId) releaseTowerAggro(g, previousTowerId);
   if (wasSheltered && g.occupiedTowerId === null && g.phase === 'combat') emitAudioEvent(g, 'exposed', p);
   if (!wasSheltered && g.occupiedTowerId !== null) emitAudioEvent(g, 'towerEntry', p);
 
@@ -503,40 +505,58 @@ export function spawnGroupAt(g, x, y, typeKey, count) {
   }
 }
 
-function aggroScore(g, e, t) {
-  let w = AGGRO.baseWeight;
-  if (t.id === g.occupiedTowerId) w = AGGRO.occupiedWeight;
-  if (!t.built) w *= 0.8;
-  return w / (1 + dist(e, t) / AGGRO.distanceScale);
-}
-
-function playerAggroScore(g, e) {
-  return AGGRO.playerWeight / (1 + dist(e, g.player) / AGGRO.playerDistanceScale);
+/** D5: an enemy that has physically attacked a tower stays committed to it. */
+function committedTo(e, t) {
+  return !!t && (e.sieging || e.siegedId === t.id);
 }
 
 /**
- * D5: an enemy already sieging keeps its target until that tower dies. Everyone
- * else re-evaluates on a personal staggered timer and only switches past a
- * margin, so aggro rolls over gradually rather than the map turning as one.
+ * D53: a tower target is held only while the player occupies it or this enemy
+ * has already begun sieging it. An unoccupied tower is never a strategic target.
+ */
+function staleTowerTarget(g, e, t) {
+  return !!t && t.id !== g.occupiedTowerId && !committedTo(e, t);
+}
+
+/**
+ * D5/D53: an enemy already sieging keeps its target until that tower dies.
+ * Everyone else takes the one strategic target the current state offers - the
+ * occupied tower, or the exposed player - on a personal staggered timer, so
+ * aggro rolls over gradually rather than the map turning as one. Unoccupied
+ * towers, including one the player has just left, are not candidates.
  */
 function retarget(g, e) {
   const currentTower = g.towers.find((t) => t.id === e.targetId) || null;
-  if (currentTower && e.sieging) return;
-  const playerExposed = g.occupiedTowerId === null;
-  const currentIsPlayer = e.targetId === PLAYER_TARGET_ID && playerExposed;
-  let best = currentTower ? currentTower.id : currentIsPlayer ? PLAYER_TARGET_ID : null;
-  let bestScore = currentTower ? aggroScore(g, e, currentTower) * AGGRO.switchMargin
-    : currentIsPlayer ? playerAggroScore(g, e) * AGGRO.switchMargin : -1;
-  for (const t of g.towers) {
-    if (t === currentTower) continue;
-    const s = aggroScore(g, e, t);
-    if (s > bestScore) { bestScore = s; best = t.id; }
+  if (committedTo(e, currentTower)) return;
+  const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
+  const best = occupied ? occupied.id : PLAYER_TARGET_ID;
+  if (best !== e.targetId) { e.targetId = best; e.sieging = false; e.siegedId = null; }
+}
+
+/**
+ * D53: the player has just left a tower. Enemies still merely heading for it
+ * lose it as a target soon - each on a short random delay, so they peel away
+ * rather than turn in unison - while enemies already sieging it stay.
+ */
+function releaseTowerAggro(g, towerId) {
+  for (const e of g.enemies) {
+    if (e.targetId !== towerId || committedTo(e, g.towers.find((t) => t.id === towerId))) continue;
+    e.retargetIn = Math.min(e.retargetIn, Math.random() * AGGRO.releaseDelayMax);
   }
-  if (playerExposed && !currentIsPlayer) {
-    const s = playerAggroScore(g, e);
-    if (s > bestScore) { bestScore = s; best = PLAYER_TARGET_ID; }
+}
+
+/** D53: near hunters close in directly; distant ones travel toward the player by road. */
+export function isHunting(g, e) {
+  return e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null
+    && dist(e, g.player) <= AGGRO.directPursuitRange;
+}
+
+function playerLaneField(g) {
+  if (g.time - g.playerLaneFieldAt > 0.5 || !g.playerLaneField) {
+    g.playerLaneFieldAt = g.time;
+    g.playerLaneField = computeField(g.map, [idx(clampTx(g.player.x), clampTy(g.player.y))], 'lane');
   }
-  if (best !== e.targetId) { e.targetId = best; e.sieging = false; }
+  return g.playerLaneField;
 }
 
 function playerField(g) {
@@ -581,8 +601,16 @@ function updateEnemies(g, dt) {
       burst(g, p.x, p.y, '#ff6b6b', 5, 2.5);
     }
 
-    const resolved = g.towers.find((t) => t.id === e.targetId) || null;
+    let resolved = g.towers.find((t) => t.id === e.targetId) || null;
+    // D53: an enemy reaching a tower it no longer has reason to attack re-reads
+    // the situation instead of starting a siege there.
+    if (staleTowerTarget(g, e, resolved)
+        && dist(e, resolved) <= TOWER.radius + ENEMY.attackRange + e.def.radius) {
+      retarget(g, e);
+      resolved = g.towers.find((t) => t.id === e.targetId) || null;
+    }
     const huntingPlayer = e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null;
+    const directPursuit = huntingPlayer && dPlayer <= AGGRO.directPursuitRange;
     let aim = null;
     let reach = 0;
 
@@ -590,6 +618,7 @@ function updateEnemies(g, dt) {
       reach = TOWER.radius + ENEMY.attackRange + e.def.radius;
       const d = dist(e, resolved);
       if (d <= reach) {
+        e.siegedId = resolved.id;
         if (!e.sieging) {
           e.sieging = true;
           // §10: spread around the perimeter rather than piling on one point.
@@ -618,8 +647,10 @@ function updateEnemies(g, dt) {
         aim = steer(g.map, towerField(g, resolved), e.x, e.y);
         if (!aim) aim = normTo(e, resolved);
       }
-    } else if (huntingPlayer) {
+    } else if (directPursuit) {
       aim = interceptAim(g, e, p) || steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
+    } else if (huntingPlayer) {
+      aim = steer(g.map, playerLaneField(g), e.x, e.y) || steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
     }
 
     // Separation keeps the crowd from collapsing into one dot.
@@ -650,7 +681,8 @@ function updateEnemies(g, dt) {
     if (!e.sieging && Math.hypot(e.x - px, e.y - py) < speed * dt * 0.2) {
       e.stuck = (e.stuck || 0) + dt;
       if (e.stuck > 1.5 && (resolved || huntingPlayer)) {
-        const nudge = bestNeighbourTile(g, resolved ? towerField(g, resolved) : playerField(g), e.x, e.y);
+        const field = resolved ? towerField(g, resolved) : directPursuit ? playerField(g) : playerLaneField(g);
+        const nudge = bestNeighbourTile(g, field, e.x, e.y);
         if (nudge) { e.x = nudge.x; e.y = nudge.y; }
         e.stuck = 0;
       }
@@ -932,7 +964,7 @@ export function dangerState(g) {
     sheltered: g.occupiedTowerId !== null,
     shelterTowerId: g.shelter.towerId,
     shelterProgress: g.shelter.required ? g.shelter.progress / g.shelter.required : 0,
-    hunters: g.enemies.filter((e) => e.targetId === PLAYER_TARGET_ID).length,
+    hunters: g.enemies.filter((e) => isHunting(g, e)).length,
   };
 }
 
