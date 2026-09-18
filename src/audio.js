@@ -2,8 +2,9 @@
 import { AUDIO } from './config.js';
 
 export const AUDIO_PRIORITY = Object.freeze({
-  playerDamage: 10, collapsing: 9, collapsingReminder: 9, towerDestroy: 8, exposed: 7, towerEntry: 6,
-  waveWarning: 5, heavyTowerHit: 4, towerFire: 3, enemyDeath: 2, enemyHit: 1,
+  playerDamage: 10, collapsing: 9, collapsingReminder: 9, towerUnderAttack: 8, towerDestroy: 8,
+  exposed: 7, towerEntry: 6, waveWarning: 5, heavyTowerHit: 4, upgradeStart: 3,
+  towerFire: 3, enemyDeath: 2, enemyHit: 1,
 });
 
 export function cuePriority(type) { return AUDIO_PRIORITY[type] || 2; }

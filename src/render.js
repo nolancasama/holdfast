@@ -1,7 +1,7 @@
 // Canvas drawing. Simple shapes only — readability over polish (plan §1).
 
-import { MAP, T, TOWER, PLAYER, DROP, RENDER, richnessTierForRate } from './config.js';
-import { idx, inBounds, isPassable } from './terrain.js';
+import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, richnessTierForRate } from './config.js';
+import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
 import { isHunting, towerStats } from './game.js';
 
 const TP = RENDER.baseTilePx;
@@ -135,6 +135,72 @@ export function buildTerrainLayer(map) {
   return c;
 }
 
+/** A map-sized remembered-terrain layer, built once alongside the bright one. */
+export function buildTerrainDimLayer(terrain) {
+  const c = document.createElement('canvas');
+  c.width = terrain.width;
+  c.height = terrain.height;
+  const ctx = c.getContext('2d');
+  // Remembered ground must stay navigable: dimmer and greyer than live vision,
+  // but far from the near-black of unexplored tiles.
+  const filtered = 'filter' in ctx;
+  if (filtered) ctx.filter = 'grayscale(0.7) brightness(0.64)';
+  ctx.drawImage(terrain, 0, 0);
+  if (filtered) ctx.filter = 'none';
+  else {
+    ctx.fillStyle = 'rgba(7,9,12,0.4)';
+    ctx.fillRect(0, 0, c.width, c.height);
+  }
+  return c;
+}
+
+function tileVisible(g, tx, ty) {
+  return !g.fog || !!(inBounds(tx, ty) && g.fog.visible[idx(tx, ty)]);
+}
+
+function tileExplored(g, tx, ty) {
+  return !g.fog || !!(inBounds(tx, ty) && g.fog.explored[idx(tx, ty)]);
+}
+
+function pointVisible(g, x, y) {
+  return tileVisible(g, Math.floor(x), Math.floor(y));
+}
+
+/** Rebuild only when simulation visibility changes (or fog debug is toggled). */
+function terrainForFog(layers, g) {
+  if (!g.fog) return layers.terrain;
+  if (g.debug.showFog) return layers.terrain;
+  if (!layers.terrainDim) layers.terrainDim = buildTerrainDimLayer(layers.terrain);
+  if (!layers.terrainView) {
+    layers.terrainView = document.createElement('canvas');
+    layers.terrainView.width = layers.terrain.width;
+    layers.terrainView.height = layers.terrain.height;
+  }
+  if (layers.fogVersion === g.fog.version) return layers.terrainView;
+
+  const ctx = layers.terrainView.getContext('2d');
+  ctx.clearRect(0, 0, layers.terrainView.width, layers.terrainView.height);
+  ctx.drawImage(layers.terrainDim, 0, 0);
+  // Copy bright terrain one exact tile at a time. This deliberately avoids
+  // filtering across an unexplored boundary.
+  for (let y = 0; y < MAP.h; y++) {
+    for (let x = 0; x < MAP.w; x++) {
+      if (!g.fog.visible[idx(x, y)]) continue;
+      ctx.drawImage(layers.terrain, x * TP, y * TP, TP, TP, x * TP, y * TP, TP, TP);
+    }
+  }
+  ctx.fillStyle = '#07090c';
+  ctx.beginPath();
+  for (let y = 0; y < MAP.h; y++) {
+    for (let x = 0; x < MAP.w; x++) {
+      if (!g.fog.explored[idx(x, y)]) ctx.rect(x * TP, y * TP, TP, TP);
+    }
+  }
+  ctx.fill();
+  layers.fogVersion = g.fog.version;
+  return layers.terrainView;
+}
+
 export function screenToWorld(view, sx, sy) {
   return { x: (sx - view.offsetX) / view.tilePx, y: (sy - view.offsetY) / view.tilePx };
 }
@@ -152,14 +218,15 @@ function healthBar(ctx, x, y, w, h, frac, color, bg = 'rgba(0,0,0,0.6)') {
 }
 
 export function draw(ctx, g, layers, view) {
-  const { terrain } = layers;
   ctx.clearRect(0, 0, view.w, view.h);
   ctx.imageSmoothingEnabled = false;
 
   ctx.save();
   ctx.translate(view.offsetX, view.offsetY);
   ctx.scale(view.tilePx / TP, view.tilePx / TP);
-  ctx.drawImage(terrain, 0, 0);
+  ctx.drawImage(terrainForFog(layers, g), 0, 0);
+
+  if (g.debug.showFog) drawFogStateTint(ctx, g);
 
   if (g.phase === 'warning') drawIncomingRoads(ctx, g);
   if (g.debug.showPaths) drawFlowField(ctx, g);
@@ -172,6 +239,7 @@ export function draw(ctx, g, layers, view) {
   drawPlayer(ctx, g, view);
   drawFx(ctx, g, view);
   if (g.buildMode) drawBuildPreview(ctx, g);
+  if (g.debug.showFog) drawFogDebug(ctx, g, view);
 
   ctx.restore();
 
@@ -186,7 +254,7 @@ function drawIncomingRoads(ctx, g) {
   ctx.fillStyle = `rgba(255,92,72,${0.20 + pulse * 0.24})`;
   for (let y = 0; y < MAP.h; y++) {
     for (let x = 0; x < MAP.w; x++) {
-      if (!g.map.road[idx(x, y)]) continue;
+      if (!g.map.road[idx(x, y)] || (!g.debug.showFog && !tileExplored(g, x, y))) continue;
       const fromWest = g.spawnSides.includes('west') && x <= g.map.roadCenter.x;
       const fromEast = g.spawnSides.includes('east') && x >= g.map.roadCenter.x;
       if (fromWest || fromEast) ctx.fillRect(x * TP + TP * 0.2, y * TP + TP * 0.2, TP * 0.6, TP * 0.6);
@@ -221,6 +289,7 @@ function drawTowers(ctx, g, view) {
     const frac = t.hp / t.maxHp;
     const collapsing = t.built && frac < TOWER.collapsingAt;
     const occupied = t.id === g.occupiedTowerId;
+    const alarm = Number.isFinite(t.unseenHitAt) && g.time - t.unseenHitAt < 1.5;
 
     if (occupied) {
       const pulse = 0.5 + 0.5 * Math.sin(g.time * 6);
@@ -228,6 +297,14 @@ function drawTowers(ctx, g, view) {
       ctx.lineWidth = localPx(view, 3);
       ctx.beginPath();
       ctx.arc(cx, cy, r + localPx(view, 7 + pulse * 3), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    if (alarm) {
+      const pulse = 0.5 + 0.5 * Math.sin(g.time * 12);
+      ctx.strokeStyle = `rgba(255,64,64,${0.55 + pulse * 0.45})`;
+      ctx.lineWidth = localPx(view, 3);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + localPx(view, 8 + pulse * 5), 0, Math.PI * 2);
       ctx.stroke();
     }
 
@@ -242,7 +319,7 @@ function drawTowers(ctx, g, view) {
 
     // Barrel pointing at whatever it is shooting.
     const target = g.enemies.find((e) => e.id === t.targetId);
-    if (t.built && target) {
+    if (t.built && target && (g.debug.showFog || pointVisible(g, target.x, target.y))) {
       const a = Math.atan2(target.y - t.y, target.x - t.x);
       ctx.strokeStyle = occupied ? '#ffe680' : '#aab4c2';
       ctx.lineWidth = localPx(view, 4);
@@ -260,11 +337,55 @@ function drawTowers(ctx, g, view) {
     }
 
     if (!t.built) {
+      // Crossed structural members and deterministic flickering weld sparks
+      // keep a tiny construction site distinct from a damaged finished tower.
+      ctx.strokeStyle = 'rgba(192,214,205,0.78)';
+      ctx.lineWidth = localPx(view, 1.5);
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.62, cy - r * 0.62);
+      ctx.lineTo(cx + r * 0.62, cy + r * 0.62);
+      ctx.moveTo(cx + r * 0.62, cy - r * 0.62);
+      ctx.lineTo(cx - r * 0.62, cy + r * 0.62);
+      ctx.stroke();
+      ctx.fillStyle = '#ffe28a';
+      for (let n = 0; n < 3; n++) {
+        const flicker = 0.35 + 0.65 * Math.abs(Math.sin(g.time * (13 + n * 3) + t.id * 1.7 + n));
+        const a = g.time * (2.7 + n * 0.4) + t.id + n * 2.1;
+        ctx.globalAlpha = flicker;
+        ctx.fillRect(cx + Math.cos(a) * r * 0.72 - localPx(view, 1),
+          cy + Math.sin(a) * r * 0.72 - localPx(view, 1), localPx(view, 2), localPx(view, 2));
+      }
+      ctx.globalAlpha = 1;
       ctx.strokeStyle = '#7be196';
       ctx.lineWidth = localPx(view, 3);
       ctx.beginPath();
       ctx.arc(cx, cy, r + localPx(view, 4), -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * t.progress);
       ctx.stroke();
+    }
+
+    if (t.upgrade) {
+      const progress = Math.max(0, Math.min(1, t.upgrade.progress));
+      ctx.strokeStyle = '#65e8f4';
+      ctx.lineWidth = localPx(view, 3);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + localPx(view, 5), -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+      ctx.stroke();
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(g.time * 1.8);
+      ctx.strokeStyle = 'rgba(101,232,244,0.9)';
+      ctx.lineWidth = localPx(view, 2);
+      const br = r + localPx(view, 9);
+      const tick = localPx(view, 5);
+      for (let n = 0; n < 4; n++) {
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(br - tick, -br);
+        ctx.lineTo(br, -br);
+        ctx.lineTo(br, -br + tick);
+        ctx.stroke();
+      }
+      ctx.restore();
     }
 
     const barW = Math.max(r * 2, localPx(view, RENDER.healthBarMinWidthPx));
@@ -276,9 +397,20 @@ function drawTowers(ctx, g, view) {
     if (collapsing) {
       ctx.fillStyle = '#ff6b6b';
       ctx.fillText('COLLAPSING', cx, cy - r - localPx(view, 14));
+    } else if (alarm) {
+      ctx.fillStyle = '#ff5a5a';
+      ctx.fillText('UNDER ATTACK', cx, cy - r - localPx(view, 14));
     } else if (occupied) {
       ctx.fillStyle = '#ffd666';
       ctx.fillText('OCCUPIED', cx, cy - r - localPx(view, 14));
+    } else if (t.upgrade) {
+      const which = t.upgrade.which === 'weapon' ? 'W' : 'E';
+      ctx.fillStyle = '#77eef6';
+      ctx.fillText(`UPG ${which}${t.upgrade.toLevel} ${(t.upgrade.progress * 100).toFixed(0)}%`,
+        cx, cy - r - localPx(view, 14));
+    } else if (!t.built) {
+      ctx.fillStyle = '#9aefad';
+      ctx.fillText(`BUILD ${(t.progress * 100).toFixed(0)}%`, cx, cy - r - localPx(view, 14));
     } else if (g.shelter.towerId === t.id && g.shelter.progress > 0) {
       const progress = g.shelter.progress / g.shelter.required;
       ctx.strokeStyle = '#7be196';
@@ -296,9 +428,22 @@ function drawTowers(ctx, g, view) {
 
 function drawEnemies(ctx, g, view) {
   for (const e of g.enemies) {
+    const visible = pointVisible(g, e.x, e.y);
     const cx = e.x * TP;
     const cy = e.y * TP;
     const r = Math.max(e.def.radius * TP, localPx(view, RENDER.enemyMinRadiusPx));
+    if (!visible) {
+      if (g.debug.showFog) {
+        ctx.strokeStyle = 'rgba(255,110,110,0.8)';
+        ctx.lineWidth = localPx(view, 1.5);
+        ctx.setLineDash([localPx(view, 3), localPx(view, 2)]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      continue;
+    }
     ctx.fillStyle = e.flash > 0 ? '#ffffff' : e.def.color;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -345,7 +490,7 @@ function drawPlayer(ctx, g, view) {
     p.hp / p.maxHp < 0.34 ? '#ff4d4d' : '#7be196');
 
   if (g.phase === 'combat' && g.occupiedTowerId === null) {
-    const hunters = g.enemies.filter((e) => isHunting(g, e)).length;
+    const hunters = g.enemies.filter((e) => isHunting(g, e) && pointVisible(g, e.x, e.y)).length;
     ctx.font = `bold ${localPx(view, RENDER.labelMinPx + 2)}px ui-monospace, monospace`;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ff5a5a';
@@ -359,6 +504,7 @@ function drawDepositMarkers(ctx, g, view) {
   const gap = localPx(view, 1.5);
   const height = localPx(view, 7);
   for (const d of g.map.deposits) {
+    if (!g.debug.showFog && !tileExplored(g, Math.floor(d.x), Math.floor(d.y))) continue;
     const tier = richnessTierForRate(d.income);
     const totalW = tier.bars * barW + (tier.bars - 1) * gap;
     const x = (d.x + 0.5) * TP - totalW / 2;
@@ -378,6 +524,17 @@ function drawDrops(ctx, g, view) {
     const bob = Math.sin(g.time * 5 + d.x) * localPx(view, 2);
     const radiusPx = d.category === 'equipment' ? 13 : 10;
     const r = localPx(view, radiusPx);
+    if (!pointVisible(g, d.x, d.y)) {
+      if (g.debug.showFog) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,185,90,0.85)';
+        ctx.lineWidth = localPx(view, 1.5);
+        ctx.setLineDash([localPx(view, 3), localPx(view, 2)]);
+        ctx.strokeRect(cx - r * 0.72, cy - r * 0.72, r * 1.44, r * 1.44);
+        ctx.restore();
+      }
+      continue;
+    }
     ctx.save();
     ctx.fillStyle = d.def.color;
     ctx.strokeStyle = '#0c0f14';
@@ -458,6 +615,7 @@ function drawPaused(ctx, view) {
 
 function drawFx(ctx, g, view) {
   for (const tr of g.tracers) {
+    if (!g.debug.showFog && (!pointVisible(g, tr.x0, tr.y0) || !pointVisible(g, tr.x1, tr.y1))) continue;
     ctx.strokeStyle = tr.color;
     ctx.globalAlpha = 1 - tr.t / tr.life;
     ctx.lineWidth = 2;
@@ -468,6 +626,7 @@ function drawFx(ctx, g, view) {
   }
   ctx.globalAlpha = 1;
   for (const p of g.particles) {
+    if (!g.debug.showFog && !pointVisible(g, p.x, p.y)) continue;
     ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
     ctx.fillStyle = p.color;
     ctx.fillRect(p.x * TP - p.size / 2, p.y * TP - p.size / 2, p.size, p.size);
@@ -476,6 +635,7 @@ function drawFx(ctx, g, view) {
   ctx.font = `bold ${localPx(view, 12)}px ui-monospace, monospace`;
   ctx.textAlign = 'center';
   for (const f of g.floaters) {
+    if (!g.debug.showFog && !pointVisible(g, f.x, f.y)) continue;
     ctx.globalAlpha = Math.max(0, 1 - f.t / f.life);
     ctx.fillStyle = f.color;
     ctx.fillText(f.text, f.x * TP, f.y * TP);
@@ -484,7 +644,7 @@ function drawFx(ctx, g, view) {
 }
 
 function drawBuildPreview(ctx, g) {
-  const { x, y } = g.cursor;
+  const { x, y } = g.buildSite || g.cursor;
   const check = g.buildCheck;
   if (!check) return;
   const cx = x * TP;
@@ -516,6 +676,68 @@ function drawBuildPreview(ctx, g) {
     ctx.beginPath();
     ctx.arc(t.x * TP, t.y * TP, TOWER.minSpacing * TP, 0, Math.PI * 2);
     ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawFogStateTint(ctx, g) {
+  if (!g.fog) return;
+  ctx.save();
+  for (let y = 0; y < MAP.h; y++) {
+    for (let x = 0; x < MAP.w; x++) {
+      const i = idx(x, y);
+      ctx.fillStyle = g.fog.visible[i] ? 'rgba(55,235,105,0.16)'
+        : g.fog.explored[i] ? 'rgba(255,180,45,0.18)'
+          : 'rgba(255,45,45,0.20)';
+      ctx.fillRect(x * TP, y * TP, TP, TP);
+    }
+  }
+  ctx.restore();
+}
+
+function drawFogDebug(ctx, g, view) {
+  if (!g.fog) return;
+  const sources = [{ x: g.player.x, y: g.player.y, radius: VISION.player }];
+  for (const t of g.towers) {
+    if (!t.built) continue;
+    sources.push({
+      x: t.x,
+      y: t.y,
+      radius: Math.max(VISION.towerMin, towerStats(g, t).range + VISION.towerRangeMargin),
+    });
+  }
+
+  ctx.save();
+  for (const source of sources) {
+    ctx.strokeStyle = 'rgba(195,245,255,0.8)';
+    ctx.lineWidth = localPx(view, 1.5);
+    ctx.beginPath();
+    ctx.arc(source.x * TP, source.y * TP, source.radius * TP, 0, Math.PI * 2);
+    ctx.stroke();
+
+    const minX = Math.max(0, Math.floor(source.x - source.radius));
+    const maxX = Math.min(MAP.w - 1, Math.ceil(source.x + source.radius));
+    const minY = Math.max(0, Math.floor(source.y - source.radius));
+    const maxY = Math.min(MAP.h - 1, Math.ceil(source.y + source.radius));
+    ctx.strokeStyle = 'rgba(255,50,50,0.82)';
+    ctx.lineWidth = localPx(view, 1);
+    const arm = localPx(view, 2.5);
+    for (let ty = minY; ty <= maxY; ty++) {
+      for (let tx = minX; tx <= maxX; tx++) {
+        const x = tx + 0.5;
+        const y = ty + 0.5;
+        if (Math.hypot(x - source.x, y - source.y) > source.radius) continue;
+        if (hasLineOfSight(g.map, source.x, source.y, x, y)) continue;
+        const cx = x * TP;
+        const cy = y * TP;
+        ctx.beginPath();
+        ctx.moveTo(cx - arm, cy - arm);
+        ctx.lineTo(cx + arm, cy + arm);
+        ctx.moveTo(cx + arm, cy - arm);
+        ctx.lineTo(cx - arm, cy + arm);
+        ctx.stroke();
+      }
+    }
   }
   ctx.restore();
 }

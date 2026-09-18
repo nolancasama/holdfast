@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-09-17 (aggro, road readability and edge-entry correction pass)
+Last updated: 2026-09-18 (fog, local construction and timed upgrades pass)
 
 ## What this is
 
@@ -14,6 +14,11 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 - The authored-and-validated terrain generator remains intact on a 104x52 map.
   Its ridges, deliberate gaps, river, explicit fords, open-ground band and
   seeded regeneration still pass through the validation gate.
+- Three-state fog is simulation-owned: player vision is 8 tiles and built-tower
+  vision is `max(9, current weapon range + 1.5)`, both using the existing D3
+  cliff/forest LOS rule. Visible tiles become permanently explored. Terrain is
+  bright while visible, dim/desaturated while remembered, and opaque near-black
+  while unexplored; units and effects do not leak through fog.
 - Every map has a separate `road` bitfield. Cost-carved west/east routes meet at
   the centre, reuse existing road cheaply, pass through the authored gaps and
   fords, and gain one or two connected lateral branches where unused gaps are
@@ -26,9 +31,17 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 - The camera, minimap and edge markers are gone. Resize computes an integer tile
   scale that fits the complete map and centres it with letterboxing. Towers,
   player, enemies, health bars and labels have minimum screen sizes.
-- Towers cannot be placed with any footprint tile on a road. The starting tower
-  is kept beside the central junction and generation verifies its footprint is
-  road-free.
+- Towers cannot be placed with any footprint tile on a road. Construction is
+  local: Build mode previews the nearest valid tile centre within 1.5 tiles of
+  the player and Enter, left click, or Build here confirms that site. The
+  starting tower is kept beside the central junction and generation verifies
+  its footprint is road-free. Unfinished construction continues unassisted when
+  the player leaves, with the existing presence multiplier when nearby.
+- Weapon and extraction upgrades are timed jobs (6/9/13 seconds unassisted for
+  levels 1/2/3). A tower keeps its old combat and extraction stats while the job
+  runs; presence applies the same x2.5 construction multiplier (x3.6 Engineer).
+  Only one upgrade job can run per tower, and destruction loses it without a
+  refund.
 - Shelter takes 0.7 seconds of continuous presence in a built tower. Occupancy
   bonuses and melee immunity begin only when that timer completes; leaving
   immediately resets shelter.
@@ -37,14 +50,20 @@ Victory is surviving the final wave; only player death ends the run in defeat.
   tower stays committed to it; enemies only heading for a tower the player leaves
   drop it within 0.9s and never start a siege there, and new spawns never pick
   it. Hunters within 12 tiles pursue directly (D31 interception); farther ones
-  travel toward the player on the road-discounted lane field. The HUD "HUNTING"
-  count is the near hunters only. Swarms are only slightly slower than the
+  travel toward the player on the road-discounted lane field.
+  `dangerState().hunters` retains the full near-hunter count, while HUD/canvas
+  displays use `visibleHunters` only. Swarms are only slightly slower than the
   player, Runners are faster, and ordinary hits kill in roughly two to four hits.
-- Warning highlights the incoming half of the road network. Combat HUD and
-  canvas feedback show EXPOSED state, shelter progress and current hunter count.
+- Warning highlights the incoming half of the road network, clipped to explored
+  road tiles. Combat HUD and canvas feedback show EXPOSED state, shelter progress
+  and visible hunter count. Damage from an unseen attacker triggers a 1.5-second
+  tower ring/UNDER ATTACK label and HUD notice, rate-limited sound, and episode
+  log without revealing the attacker.
 - `window.holdfast` retains `game`, `start()`, `errors`, `fastForward()` and all
-  prior `api` methods. `api.dangerState(game)` additionally exposes
-  `{ sheltered, shelterTowerId, shelterProgress, hunters }` for acceptance.
+  prior `api` methods. New read-only acceptance surfaces are
+  `isTileVisible`, `isTileExplored`, `isPointVisible`, `visibilityState`,
+  `playerBuildSite`, `upgradeState`, and `towerAlarmState`; `dangerState(game)`
+  exposes both `hunters` and `visibleHunters`.
 - Pause is available from the HUD and P. The normal simulation boundary freezes
   movement, combat, spawning and phase clocks, construction, extraction,
   repairs, drop/effect expiry and FX. Build, upgrade and collection functions
@@ -87,15 +106,46 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 
 ## Automated verification
 
-`npm test` runs 64 headless checks in ~40s. It covers 20 deterministic seeds,
+`npm test` runs 80 headless checks. It covers 20 deterministic seeds,
 terrain validation, road connectivity and legality, seed variation, lane/direct
 field behavior, road placement refusal, ford use and generated route character,
 road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
 20 seeds), D54 entry roads, delayed shelter occupancy, line of sight, richness
 thresholds, pause freezing and action refusal, equipment uniqueness/cap,
-collapse, D53 aggro (A-E), economy, escalation and a long simulation. Current
-result: 64 passed, 0 failed. `npm run road-report` prints per-seed features,
+collapse, D53 aggro (A-E), economy, escalation and a long simulation. It now
+also covers fog persistence/LOS, enemy hiding, built/unfinished tower vision,
+resource discovery, local and unassisted construction, upgrade timing and
+function, alarms, visibility performance, and five-seed prep scouting. Controller
+run 2026-09-18: 80 passed, 0 failed. The wall-clock road-analysis budget (400ms)
+is flaky under load: one worker run saw ALPHA at 734ms; no road code changed.
+`npm run road-report` prints per-seed features,
 efficiency, knots, readability defects, entry roads and attempts.
+
+## Fog and expansion measurements — 2026-09-18
+
+- Initial explored area on `FOG-INITIAL`: 190 / 5,408 tiles (3.51%).
+- Visibility recompute: 0.130ms average over 40 forced player-tile changes in
+  the latest headless run.
+- Prep expansion bot (time to a valid Moderate+ site at least 10 tiles from the
+  start tower / explored tiles): SCOUT-A 2.8s / 276; SCOUT-B 2.4s / 379;
+  SCOUT-C 3.3s / 421; SCOUT-D 2.6s / 367; SCOUT-E 1.9s / 355. This bot knows
+  the map, so it only proves such a site is near.
+- Controller browser acceptance (1600x900, no console errors): a *blind*
+  road-frontier scout (explored knowledge only) during the first 40s prep reached
+  a valid Moderate+ site 10+ tiles out at 3.3s (CHARLIE), 3.7s (GOLF), 3.4s
+  (KILO), 13.2s (HOTEL) and explored 28-45% of the map. Prep time is not a
+  constraint; exploration may be too cheap rather than too slow.
+- Seen in the rendered game: black unexplored, grey-but-navigable remembered
+  ground (roads, forest, cliffs, water, deposit bars legible), full-colour live
+  vision; the wave warning highlights explored road only; build preview snaps
+  at the player; scaffold + BUILD % and a cyan UPG ring + brackets read at
+  12px/tile; enemies hidden until seen (0/8 and 0/5 visible early in wave 1);
+  fog debug (V) shows state tint, vision circles and LOS-blocked tiles; an
+  unfinished tower sieged out of sight (KILO) pulsed red with UNDER ATTACK, HUD
+  chip and one log line while its attackers stayed hidden.
+- The first dim level (filter + black overlay, ~42% brightness) made
+  remembered ground nearly black; raised to grayscale 0.7 / brightness 0.64 with
+  the overlay only as a no-filter fallback (D61).
 
 ## Controller acceptance — measured, 2026-09-16
 
@@ -252,11 +302,22 @@ road-report` prints per-seed features, exposure ratios and knot counts.
    longer targets, every enemy not committed to a siege goes after an exposed
    player (far ones by road). Worth judging by hand whether tower-to-tower
    dashes still feel fair.
+8. **Fog pass open questions (2026-09-18).** (a) Unfinished and unoccupied
+   towers are not enemy targets (D53), so a construction site is only attacked
+   by enemies already committed to it; the "leave an unfinished tower" tension
+   is weaker than the plan assumed. (b) Attended upgrades are short (L3 5.2s,
+   Engineer 3.6s), so the "start now or wait" choice mostly bites when away.
+   (c) A road-following scout reveals 28-45% of the map in the first prep;
+   vision 8 may be generous. (d) Upgrades can still be bought for a remote
+   tower; only new construction is local. (e) Positional audio (tower hits,
+   pan) still carries direction for unseen sieges - intended as a hint, not
+   judged by ear.
 
 ## Next steps
 
 1. Play it by hand, with sound on. The unanswered questions are all about feel,
-   and now also whether the hairpin tower sites feel worth taking.
+   and now also whether the hairpin tower sites feel worth taking, whether
+   exploring the dark is interesting, and the fog-pass questions in risk 8.
 2. Road follow-ups: a debug overlay for exposure sites and readability defects;
    if converging diagonals still read as busy in play, consider drawing diagonal
    road segments as diagonal strokes instead of staircases (render-only).

@@ -728,3 +728,87 @@ and spawn caps (D54).
 double line where two approaches converge on a diagonal (KILO centre-left); a
 diagonal road renders as a two-tile staircase, which makes converging diagonals
 look busier than their tile count says.
+
+## 2026-09-18 — Fog of war, local construction, timed upgrades
+
+### D56 — Three-state fog; vision is line of sight from the player and built towers
+**Date:** 2026-09-18
+**Decision:** every tile is unexplored, explored (remembered) or visible. The
+simulation owns two per-tile arrays: `explored` (sticky) and `visible` (rebuilt
+when the player changes tile or the set/range of vision-giving towers changes).
+A tile is visible if the player or any *built* tower sees it using the existing
+D3 `hasLineOfSight` rule within a radius: player 8 tiles; tower
+max(9, current weapon range + 1.5), so a tower never fires into the dark after
+range upgrades or the Targeting Module. Unfinished towers give no vision.
+Terrain, roads, elevation, contours and deposit markers show once explored
+(dimmed and desaturated when not visible). Enemies, drops, tracers, particles
+and floaters render only on visible tiles. Own towers always render with their
+state. The wave-warning road highlight only covers explored road.
+**Why:** height is useful only if it changes what you see. Reusing the D3 rule
+makes high ground an observation post and forest a blindfold, with no numeric
+bonus (D34 still holds). Tying tower vision to range avoids tracers leaving
+visible towers toward invisible targets.
+**Rejected:** a fixed tower vision radius (breaks at range 11.9); a separate
+height bonus for vision; ghost markers or last-known enemy positions.
+
+### D57 — Towers are built where the player stands
+**Date:** 2026-09-18
+**Decision:** Build mode previews a site snapped to the nearest valid tile
+centre within 1.5 tiles of the player (falling back to the player's own tile
+with its refusal reasons). Confirming builds there. `tryBuild` refuses any site
+more than 1.5 tiles from the player, so remote construction is impossible for
+the harness as well as the UI. Construction continues after the player leaves,
+using the existing rate rule. Upgrades can still be bought for any selected
+tower (the plan did not ask for local upgrades; left open).
+**Why:** placement becomes a commitment ("build here") and exploration becomes
+a precondition for knowing a site's value.
+
+### D58 — Upgrades take time and keep the old level until complete
+**Date:** 2026-09-18
+**Decision:** buying an upgrade pays the full cost and starts one job per tower.
+Unassisted durations are 6 / 9 / 13 s for levels 1 / 2 / 3, the same scale as the
+9 s tower build. The tower keeps firing and extracting at its old level, and the
+new level applies only on completion. A destroyed tower loses its job with no
+refund. The speed-up is the existing construction rule: player within
+`PLAYER.presenceRadius` multiplies the rate by `occupancy.construction`
+(x2.5 base, x3.6 Engineer). No new Engineer bonus.
+**Why:** turns upgrades into a timing decision without making them
+self-sabotage. Reusing the build rate rule keeps one construction system.
+**Known concern:** attended upgrades are short (L3 5.2 s, Engineer 3.6 s), so the
+timing decision mostly bites when the player is away. Tune after play.
+
+### D59 — Tower alarm fires on damage from an unseen attacker
+**Date:** 2026-09-18
+**Decision:** when a tower takes damage from an enemy on a tile that is not
+currently visible, the tower's known position pulses, an UNDER ATTACK label and
+HUD notice appear, the log records it once per episode, and a rate-limited audio
+cue plays. Attackers are not revealed.
+**Why:** the plan's literal trigger ("the tower is unseen") almost never happens:
+a built tower always sees its own tile, and under D53 unfinished and never-
+occupied towers are not targets. The case that does happen is committed
+besiegers hidden behind forest, plus the construction-site case if it ever
+arises.
+
+### D60 — Visible hunter count only
+**Date:** 2026-09-18
+**Decision:** the HUD and canvas "N HUNTING" count only hunters on visible
+tiles. `dangerState().hunters` keeps its old meaning for acceptance. A new
+`visibleHunters` field drives the display.
+**Why:** hunters within 12 tiles include enemies outside the 8-tile vision; the
+count would leak their presence and movement.
+
+### D61 — Fog compositing uses exact tile copies at unexplored boundaries
+**Date:** 2026-09-18
+**Decision:** the cached terrain view begins with the dim terrain layer, copies
+bright terrain in exact visible-tile rectangles, then covers every unexplored
+tile with an opaque near-black rectangle. Debug reveal bypasses this composite
+but does not mutate simulation visibility or exploration.
+**Why:** canvas masks and filtering can sample across a tile edge at the fitted
+9–12 px scale, leaking a sliver of unexplored terrain. Exact source and
+destination rectangles keep the unexplored boundary hard while retaining a
+single cached full-map blit during ordinary rendering.
+**Remembered-ground level (controller, from screenshots):** the dim layer is
+`grayscale(0.7) brightness(0.64)`. The first version stacked a black overlay on
+a 0.55 brightness filter (~42% effective); remembered roads and forest were
+barely distinguishable from unexplored black, which the plan forbids. The
+overlay now applies only where canvas `filter` is unsupported.

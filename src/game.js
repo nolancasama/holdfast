@@ -3,6 +3,7 @@
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY, AGGRO,
   WAVE, START_MATERIALS, DROP, ELEVATION_NAMES, richnessTierForRate, AUDIO,
+  BUILD, VISION,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -49,11 +50,18 @@ export function createGame(seedString, archetypeKey) {
     playerField: null, playerFieldAt: -99, playerLaneField: null, playerLaneFieldAt: -99,
     log: [], audioEvents: [],
     stats: { kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0 },
-    debug: { showPaths: false, spawnPaused: false, open: false },
+    debug: { showPaths: false, showFog: false, spawnPaused: false, open: false },
+    fog: {
+      explored: new Uint8Array(MAP.w * MAP.h),
+      visible: new Uint8Array(MAP.w * MAP.h),
+      version: 0,
+    },
+    fogCache: { map, playerTile: null, towerSignature: null, towerTiles: new Map() },
   };
 
   const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true);
   start.hp = start.maxHp;
+  recomputeVisibility(g, true);
   say(g, `Seed ${seed} — survive ${WAVE.totalToSurvive} waves.`);
   return g;
 }
@@ -76,6 +84,102 @@ export function drainAudioEvents(g) {
   const events = g.audioEvents;
   g.audioEvents = [];
   return events;
+}
+
+// ---------------------------------------------------------------------------
+// Fog of war
+// ---------------------------------------------------------------------------
+
+function tilesVisibleFrom(map, x, y, radius) {
+  const tiles = [];
+  const minX = Math.max(0, Math.floor(x - radius));
+  const maxX = Math.min(MAP.w - 1, Math.floor(x + radius));
+  const minY = Math.max(0, Math.floor(y - radius));
+  const maxY = Math.min(MAP.h - 1, Math.floor(y + radius));
+  for (let ty = minY; ty <= maxY; ty++) {
+    for (let tx = minX; tx <= maxX; tx++) {
+      if (Math.hypot(tx + 0.5 - x, ty + 0.5 - y) > radius) continue;
+      if (hasLineOfSight(map, x, y, tx + 0.5, ty + 0.5)) tiles.push(idx(tx, ty));
+    }
+  }
+  return tiles;
+}
+
+function towerVisionRadius(g, t) {
+  return Math.max(VISION.towerMin, towerStats(g, t).range + VISION.towerRangeMargin);
+}
+
+/** Rebuild derived visibility only when a vision source changes. */
+export function recomputeVisibility(g, force = false) {
+  const playerTile = `${Math.floor(g.player.x)},${Math.floor(g.player.y)}`;
+  const towerSignature = g.towers.map((t) => (
+    t.built ? `${t.id}:1:${towerVisionRadius(g, t)}` : `${t.id}:0`
+  )).join('|');
+  const cache = g.fogCache;
+  if (cache.map !== g.map) {
+    cache.map = g.map;
+    cache.towerTiles.clear();
+    force = true;
+  } else if (force) {
+    cache.towerTiles.clear();
+  }
+  if (!force && cache.playerTile === playerTile && cache.towerSignature === towerSignature) return false;
+
+  g.fog.visible.fill(0);
+  for (const i of tilesVisibleFrom(g.map, g.player.x, g.player.y, VISION.player)) g.fog.visible[i] = 1;
+
+  const usedTowerKeys = new Set();
+  for (const t of g.towers) {
+    if (!t.built) continue;
+    const radius = towerVisionRadius(g, t);
+    const key = `${t.x},${t.y},${radius}`;
+    usedTowerKeys.add(key);
+    let tiles = cache.towerTiles.get(key);
+    if (!tiles) {
+      tiles = tilesVisibleFrom(g.map, t.x, t.y, radius);
+      cache.towerTiles.set(key, tiles);
+    }
+    for (const i of tiles) g.fog.visible[i] = 1;
+  }
+  for (const key of cache.towerTiles.keys()) {
+    if (!usedTowerKeys.has(key)) cache.towerTiles.delete(key);
+  }
+
+  for (let i = 0; i < g.fog.visible.length; i++) {
+    if (g.fog.visible[i]) g.fog.explored[i] = 1;
+  }
+  cache.playerTile = playerTile;
+  cache.towerSignature = towerSignature;
+  g.fog.version++;
+  return true;
+}
+
+export function isTileVisible(g, tx, ty) {
+  return inBounds(tx, ty) && !!g.fog.visible[idx(tx, ty)];
+}
+
+export function isTileExplored(g, tx, ty) {
+  return inBounds(tx, ty) && !!g.fog.explored[idx(tx, ty)];
+}
+
+export function isPointVisible(g, x, y) {
+  return isTileVisible(g, Math.floor(x), Math.floor(y));
+}
+
+export function visibilityState(g) {
+  let exploredCount = 0;
+  let visibleCount = 0;
+  for (let i = 0; i < g.fog.visible.length; i++) {
+    exploredCount += g.fog.explored[i];
+    visibleCount += g.fog.visible[i];
+  }
+  return {
+    exploredCount,
+    visibleCount,
+    total: g.fog.visible.length,
+    playerRadius: VISION.player,
+    towerRadii: g.towers.filter((t) => t.built).map((t) => ({ id: t.id, radius: towerVisionRadius(g, t) })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +252,28 @@ export function canPlaceAt(g, x, y) {
   };
 }
 
+/** Nearest buildable tile centre the player can physically reach to build. */
+export function playerBuildSite(g) {
+  const candidates = [];
+  for (let ty = Math.floor(g.player.y - BUILD.reach); ty <= Math.floor(g.player.y + BUILD.reach); ty++) {
+    for (let tx = Math.floor(g.player.x - BUILD.reach); tx <= Math.floor(g.player.x + BUILD.reach); tx++) {
+      if (!inBounds(tx, ty)) continue;
+      const x = tx + 0.5;
+      const y = ty + 0.5;
+      const distance = Math.hypot(g.player.x - x, g.player.y - y);
+      if (distance <= BUILD.reach + 1e-6) candidates.push({ x, y, distance });
+    }
+  }
+  candidates.sort((a, b) => a.distance - b.distance || a.y - b.y || a.x - b.x);
+  for (const candidate of candidates) {
+    const check = canPlaceAt(g, candidate.x, candidate.y);
+    if (check.ok) return { x: candidate.x, y: candidate.y, check };
+  }
+  const x = Math.floor(g.player.x) + 0.5;
+  const y = Math.floor(g.player.y) + 0.5;
+  return { x, y, check: canPlaceAt(g, x, y) };
+}
+
 function placeTower(g, x, y, instant = false) {
   const t = {
     id: g.nextTowerId++,
@@ -157,8 +283,10 @@ function placeTower(g, x, y, instant = false) {
     built: instant,
     progress: instant ? 1 : 0,
     wLevel: 0, eLevel: 0,
+    upgrade: null,
     shotCd: 0, targetId: null, retargetIn: 0,
     flash: 0, smoke: 0,
+    unseenHitAt: null,
     field: null,
     resourceScore: resourceScoreAt(g.map, x, y, TOWER.extraction.radius),
   };
@@ -168,7 +296,11 @@ function placeTower(g, x, y, instant = false) {
 
 export function tryBuild(g, x, y) {
   const check = canPlaceAt(g, x, y);
-  if (g.paused) return { ...check, ok: false, reasons: [...check.reasons, 'paused'] };
+  if (g.paused) return { ...check, ok: false, reason: 'paused', reasons: [...check.reasons, 'paused'] };
+  if (Math.hypot(g.player.x - x, g.player.y - y) > BUILD.reach + 1e-6) {
+    const reason = 'stand at the site to build';
+    return { ...check, ok: false, reason, reasons: [...check.reasons, reason] };
+  }
   if (!check.ok) return check;
   g.materials -= check.cost;
   const t = placeTower(g, x, y, false);
@@ -180,6 +312,10 @@ export function tryBuild(g, x, y) {
 
 export function occupancyMults(g) {
   return { ...OCCUPANCY, ...g.arch.occupancy };
+}
+
+export function constructionRateMult(g, t) {
+  return dist(g.player, t) <= PLAYER.presenceRadius ? occupancyMults(g).construction : 1;
 }
 
 export function towerStats(g, t) {
@@ -211,16 +347,20 @@ export function upgradeCost(t, which) {
 
 export function tryUpgrade(g, t, which) {
   if (g.paused) return false;
+  if (which !== 'weapon' && which !== 'extraction') return false;
   const cost = upgradeCost(t, which);
-  if (cost === null || g.materials < cost || !t.built) return false;
+  if (cost === null || g.materials < cost || !t.built || t.upgrade) return false;
   g.materials -= cost;
-  if (which === 'weapon') t.wLevel++;
-  else {
-    t.eLevel++;
-    t.resourceScore = resourceScoreAt(g.map, t.x, t.y, towerStats(g, t).extractRadius);
-  }
-  emitAudioEvent(g, 'upgrade', t);
+  const level = which === 'weapon' ? t.wLevel : t.eLevel;
+  t.upgrade = { which, toLevel: level + 1, progress: 0, duration: TOWER.upgrade.buildTime[level] };
+  emitAudioEvent(g, 'upgradeStart', t);
   return true;
+}
+
+export function upgradeState(t) {
+  if (!t.upgrade) return null;
+  const { which, toLevel, progress } = t.upgrade;
+  return { which, toLevel, progress };
 }
 
 export function repairCostPerHp(g) {
@@ -241,6 +381,7 @@ const clampTy = (y) => clamp(Math.floor(y), 0, MAP.h - 1);
 
 function destroyTower(g, t) {
   emitAudioEvent(g, 'towerDestroy', t);
+  t.upgrade = null;
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
@@ -390,15 +531,12 @@ function moveWithCollision(g, ent, dx, dy, radius) {
 // ---------------------------------------------------------------------------
 
 function updateTowers(g, dt) {
-  const occ = occupancyMults(g);
-
   for (const t of [...g.towers]) {
     t.flash = Math.max(0, t.flash - dt * 3);
     if (t.hp <= 0) { destroyTower(g, t); continue; }
 
     if (!t.built) {
-      const near = dist(g.player, t) <= PLAYER.presenceRadius;
-      const rate = (near ? occ.construction : 1) / TOWER.buildTime;
+      const rate = constructionRateMult(g, t) / TOWER.buildTime;
       const before = t.progress;
       t.progress = Math.min(1, t.progress + rate * dt);
       t.hp = Math.min(t.maxHp, t.hp + (t.progress - before) * t.maxHp * (1 - TOWER.buildHpFraction));
@@ -409,6 +547,25 @@ function updateTowers(g, dt) {
         emitAudioEvent(g, 'constructionComplete', t);
       }
       continue;
+    }
+
+    if (t.upgrade) {
+      t.upgrade.progress = Math.min(1, t.upgrade.progress
+        + dt * constructionRateMult(g, t) / t.upgrade.duration);
+      if (t.upgrade.progress >= 1) {
+        const { which, toLevel } = t.upgrade;
+        if (which === 'weapon') t.wLevel = toLevel;
+        else {
+          t.eLevel = toLevel;
+          const radius = TOWER.extraction.radius + TOWER.upgrade.extractRadiusPerLevel * t.eLevel;
+          t.resourceScore = resourceScoreAt(g.map, t.x, t.y, radius);
+        }
+        t.upgrade = null;
+        const short = which === 'weapon' ? 'W' : 'E';
+        say(g, `${which === 'weapon' ? 'Weapon' : 'Extraction'} upgrade complete.`);
+        floater(g, t.x, t.y - 1.2, `${short}${toLevel} ONLINE`, '#5ecbff');
+        emitAudioEvent(g, 'upgrade', t);
+      }
     }
 
     const s = towerStats(g, t);
@@ -629,6 +786,14 @@ function updateEnemies(g, dt) {
         const before = resolved.hp / resolved.maxHp;
         resolved.hp -= dealt;
         emitAudioEvent(g, e.type === 'heavy' ? 'heavyTowerHit' : 'towerHit', { ...resolved, enemyType: e.type });
+        if (!isPointVisible(g, e.x, e.y)) {
+          const previousHitAt = resolved.unseenHitAt;
+          if (!Number.isFinite(previousHitAt) || g.time - previousHitAt >= 5) {
+            say(g, `Tower #${resolved.id} UNDER ATTACK.`);
+          }
+          resolved.unseenHitAt = g.time;
+          emitAudioEvent(g, 'towerUnderAttack', resolved);
+        }
         resolved.flash = 1;
         if (before >= TOWER.collapsingAt && resolved.hp / resolved.maxHp < TOWER.collapsingAt) {
           say(g, 'A tower is COLLAPSING.');
@@ -960,12 +1125,21 @@ export function forceNextWave(g) {
 
 /** Stable semantic state for the acceptance harness and HUD. */
 export function dangerState(g) {
+  const hunters = g.enemies.filter((e) => isHunting(g, e));
   return {
     sheltered: g.occupiedTowerId !== null,
     shelterTowerId: g.shelter.towerId,
     shelterProgress: g.shelter.required ? g.shelter.progress / g.shelter.required : 0,
-    hunters: g.enemies.filter((e) => isHunting(g, e)).length,
+    hunters: hunters.length,
+    visibleHunters: hunters.filter((e) => isPointVisible(g, e.x, e.y)).length,
   };
+}
+
+export function towerAlarmState(g) {
+  return g.towers.map((t) => ({
+    id: t.id,
+    active: Number.isFinite(t.unseenHitAt) && g.time - t.unseenHitAt < 1.5,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1205,7 @@ export function update(g, dt, { ignorePause = false } = {}) {
   updatePlayer(g, dt);
   updateRepair(g, dt);
   updateTowers(g, dt);
+  recomputeVisibility(g);
   updateEnemies(g, dt);
   updateDrops(g, dt);
   updateFx(g, dt);

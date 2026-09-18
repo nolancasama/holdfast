@@ -6,11 +6,13 @@ import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade,
   forceNextWave, spawnGroupAt,
   towerStats, dangerState, setPaused, pauseState, equipmentState, depositRichness,
-  drainAudioEvents,
+  drainAudioEvents, playerBuildSite,
+  isTileVisible, isTileExplored, isPointVisible, visibilityState,
+  upgradeState, towerAlarmState,
 } from './game.js';
 import { createAudioSystem } from './audio.js';
 import {
-  buildTerrainLayer, screenToWorld, draw,
+  buildTerrainLayer, buildTerrainDimLayer, screenToWorld, draw,
 } from './render.js';
 import { $, renderPicks, updateHud, updateMapInfo, showEnd } from './ui.js';
 
@@ -21,7 +23,7 @@ let game = null;
 let layers = null;
 const view = { w: 0, h: 0, tilePx: 1, offsetX: 0, offsetY: 0 };
 const keys = new Set();
-let lastCursorTile = '';
+let lastBuildPlayerTile = '';
 let endShown = false;
 const audio = createAudioSystem();
 
@@ -44,9 +46,10 @@ $('again-btn').onclick = () => {
 
 function startRun(seed, archetype) {
   game = createGame(seed, archetype);
-  layers = { terrain: buildTerrainLayer(game.map) };
+  const terrain = buildTerrainLayer(game.map);
+  layers = { terrain, terrainDim: buildTerrainDimLayer(terrain), terrainView: null };
   endShown = false;
-  lastCursorTile = '';
+  lastBuildPlayerTile = '';
   $('select-overlay').hidden = true;
   $('end-overlay').hidden = true;
   updateMapInfo(game);
@@ -101,7 +104,7 @@ window.addEventListener('keydown', (e) => {
     if (e.code === 'Enter') $('start-btn').click();
     return;
   }
-  if (MOVE_KEYS[e.code] || e.code === 'Space' || e.code === 'KeyP') e.preventDefault();
+  if (MOVE_KEYS[e.code] || e.code === 'Space' || e.code === 'KeyP' || e.code === 'Enter') e.preventDefault();
   keys.add(e.code);
   if (!game || game.status !== 'playing') return;
 
@@ -111,10 +114,12 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.code === 'F1') { e.preventDefault(); toggleDebug(); return; }
   if (e.code === 'Escape') { setBuildMode(false); return; }
+  if (e.code === 'KeyV' && !e.repeat) { game.debug.showFog = !game.debug.showFog; return; }
   if (game.paused) return;
 
   switch (e.code) {
     case 'KeyB': setBuildMode(!game.buildMode); break;
+    case 'Enter': confirmBuild(); break;
     case 'Digit1': upgradeSelected('weapon'); break;
     case 'Digit2': upgradeSelected('extraction'); break;
     // debug
@@ -137,21 +142,22 @@ canvas.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
   const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
-  refreshBuildCheck();
 });
 
 canvas.addEventListener('mousedown', (e) => {
   audio.gesture();
   if (!game || game.status !== 'playing') return;
   e.preventDefault();
+  if (e.button !== 0) {
+    if (e.button === 2) setBuildMode(false);
+    return;
+  }
   const rect = canvas.getBoundingClientRect();
   const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
 
   if (game.buildMode && !game.paused) {
-    refreshBuildCheck(true);
-    const res = tryBuild(game, w.x, w.y);
-    if (res.ok) setBuildMode(false);
+    confirmBuild();
     return;
   }
   let best = null;
@@ -167,18 +173,35 @@ canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); setBuildMode
 function setBuildMode(on) {
   if (on && game.paused) return;
   game.buildMode = on;
-  lastCursorTile = '';
+  lastBuildPlayerTile = '';
   if (on) refreshBuildCheck(true);
-  else game.buildCheck = null;
+  else {
+    game.buildCheck = null;
+    game.buildSite = null;
+  }
 }
 
-/** canPlaceAt runs line-of-sight sampling, so only recompute when the tile changes. */
+/** Site evaluation can sample line of sight, so only recompute when the player changes tile. */
 function refreshBuildCheck(force = false) {
-  if (!game.buildMode) { game.buildCheck = null; return; }
-  const key = `${Math.floor(game.cursor.x)},${Math.floor(game.cursor.y)}`;
-  if (!force && key === lastCursorTile) return;
-  lastCursorTile = key;
-  game.buildCheck = canPlaceAt(game, game.cursor.x, game.cursor.y);
+  if (!game.buildMode) {
+    game.buildCheck = null;
+    game.buildSite = null;
+    return;
+  }
+  const key = `${Math.floor(game.player.x)},${Math.floor(game.player.y)}`;
+  if (!force && key === lastBuildPlayerTile) return;
+  lastBuildPlayerTile = key;
+  game.buildSite = playerBuildSite(game);
+  game.buildCheck = game.buildSite.check;
+}
+
+function confirmBuild() {
+  if (!game || game.paused || !game.buildMode) return;
+  refreshBuildCheck(true);
+  const site = game.buildSite;
+  if (!site) return;
+  const res = tryBuild(game, site.x, site.y);
+  if (res.ok) setBuildMode(false);
 }
 
 function upgradeSelected(which) {
@@ -233,12 +256,14 @@ $('d-spawn').onclick = () => { if (!game.paused) debugSpawn(); };
 $('d-dmg').onclick = () => { if (!game.paused) debugDamage(); };
 $('d-kill').onclick = () => { if (!game.paused) debugKill(); };
 $('d-paths').onclick = () => { game.debug.showPaths = !game.debug.showPaths; };
+$('d-fog').onclick = () => { game.debug.showFog = !game.debug.showFog; };
 $('d-pause').onclick = () => {
   game.debug.spawnPaused = !game.debug.spawnPaused;
   $('d-pause').textContent = game.debug.spawnPaused ? 'Resume spawning' : 'Pause spawning';
 };
 $('d-regen').onclick = () => startRun(randomSeed(), game.archetypeKey);
 $('build-toggle').onclick = () => { if (!game.paused) setBuildMode(!game.buildMode); };
+$('build-confirm').onclick = confirmBuild;
 $('up-weapon').onclick = () => upgradeSelected('weapon');
 $('up-extract').onclick = () => upgradeSelected('extraction');
 
@@ -253,6 +278,8 @@ window.holdfast = {
   errors: [],
   api: {
     canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave, dangerState,
+    playerBuildSite, isTileVisible, isTileExplored, isPointVisible, visibilityState,
+    upgradeState, towerAlarmState,
     pauseState, setPaused: (paused) => {
       const state = setPaused(game, paused);
       if (state) audio.suspendForPause(); else audio.resumeAfterPause();

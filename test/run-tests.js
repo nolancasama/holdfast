@@ -4,13 +4,13 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
-  EXPOSURE, READABILITY,
+  EXPOSURE, READABILITY, VISION, BUILD,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt,
   isTerrainBuildable,
 } from '../src/terrain.js';
-import { computeField } from '../src/flowfield.js';
+import { computeField, steer } from '../src/flowfield.js';
 import {
   straightRoadBaseline, pathExposure, measureSiteExposure, findExposureFeatures,
   analyseRoadKnots, analyseRoadReadability, exposureEfficiency, walkedExtraLength,
@@ -18,7 +18,9 @@ import {
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt,
   setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
-  emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID,
+  emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID, playerBuildSite,
+  isTileVisible, isTileExplored, isPointVisible, visibilityState, upgradeState,
+  towerAlarmState, recomputeVisibility,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -54,6 +56,13 @@ function syntheticMap() {
     spawns: { west: [], east: [] },
     roadCenter: { x: Math.floor(MAP.w / 2), y: Math.floor(MAP.h / 2) },
   };
+}
+
+/** Tests that need a tower move the player to the site before exercising tryBuild (D57). */
+function buildAt(g, x, y) {
+  g.player.x = x;
+  g.player.y = y;
+  return tryBuild(g, x, y);
 }
 
 function stampRoute(map, tiles, side = 'west') {
@@ -813,7 +822,7 @@ check('a sieging enemy does not abandon its target when the player leaves', () =
   // Put a second tower far enough away to be a genuinely different target.
   let placed = null;
   for (let d = TOWER.minSpacing + 1; d < 40 && !placed; d += 1) {
-    const r = tryBuild(g, a.x + d, a.y);
+    const r = buildAt(g, a.x + d, a.y);
     if (r.ok) placed = g.towers[g.towers.length - 1];
   }
   if (!placed) return 'could not place a second tower to test against';
@@ -853,7 +862,7 @@ check('an enemy that is not yet sieging does eventually re-prioritise', () => {
   const a = g.towers[0];
   let b = null;
   for (let d = TOWER.minSpacing + 1; d < 40 && !b; d += 1) {
-    const r = tryBuild(g, a.x + d, a.y);
+    const r = buildAt(g, a.x + d, a.y);
     if (r.ok) b = g.towers[g.towers.length - 1];
   }
   if (!b) return 'could not place a second tower';
@@ -886,10 +895,10 @@ function aggroFixture(seed) {
   }
   const far = (s, list, d) => list.every((t) => Math.hypot(s.x - t.x, s.y - t.y) >= d);
   const bSite = sites.filter((s) => far(s, [a], 30)).sort((p, q) => Math.abs(p.y - a.y) - Math.abs(q.y - a.y))[0];
-  if (!bSite || !tryBuild(g, bSite.x, bSite.y).ok) return null;
+  if (!bSite || !buildAt(g, bSite.x, bSite.y).ok) return null;
   const b = g.towers[g.towers.length - 1];
   const cSite = sites.find((s) => far(s, [a, b], 20));
-  if (!cSite || !tryBuild(g, cSite.x, cSite.y).ok) return null;
+  if (!cSite || !buildAt(g, cSite.x, cSite.y).ok) return null;
   const c = g.towers[g.towers.length - 1];
   for (const t of [b, c]) { t.built = true; t.progress = 1; t.hp = t.maxHp; }
   return { g, a, b, c };
@@ -1079,6 +1088,310 @@ check('the central starting area is never a rich extraction site', () => {
   return null;
 });
 
+// --- D56-D60: fog, local construction, timed upgrades and tower alarms -----
+
+check('initial fog is local, small, and leaves far corners unexplored', () => {
+  const g = createGame('FOG-INITIAL', 'gunner');
+  const state = visibilityState(g);
+  const fraction = state.exploredCount / state.total;
+  console.log(`Initial explored fraction: ${(fraction * 100).toFixed(2)}% (${state.exploredCount}/${state.total})`);
+  if (state.exploredCount !== state.visibleCount) return 'initial explored and visible sets differ';
+  if (fraction <= 0 || fraction >= 0.15) return `initial explored fraction ${fraction.toFixed(3)} is not small`;
+  for (const [x, y] of [[0, 0], [MAP.w - 1, 0], [0, MAP.h - 1], [MAP.w - 1, MAP.h - 1]]) {
+    if (isTileExplored(g, x, y)) return `far corner (${x},${y}) began explored`;
+  }
+  const sources = [g.player, ...g.towers.filter((t) => t.built)];
+  for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) {
+    if (!isTileExplored(g, x, y)) continue;
+    const within = sources.some((s, n) => Math.hypot(x + 0.5 - s.x, y + 0.5 - s.y)
+      <= (n === 0 ? VISION.player : state.towerRadii[n - 1].radius) + 1e-6);
+    if (!within) return `explored tile (${x},${y}) lies outside every initial vision radius`;
+  }
+  return null;
+});
+
+check('exploration persists after the player leaves while current visibility does not', () => {
+  const g = createGame('FOG-PERSIST', 'gunner');
+  const start = g.towers[0];
+  let far = null;
+  for (let y = 2; y < MAP.h - 2 && !far; y++) for (let x = 2; x < MAP.w - 2; x++) {
+    if (isPassable(g.map, x, y) && Math.hypot(x + 0.5 - start.x, y + 0.5 - start.y) > 24) {
+      far = { x: x + 0.5, y: y + 0.5 };
+      break;
+    }
+  }
+  if (!far) return 'no distant walkable tile';
+  g.player.x = far.x; g.player.y = far.y;
+  recomputeVisibility(g);
+  if (!isPointVisible(g, far.x, far.y) || !isTileExplored(g, Math.floor(far.x), Math.floor(far.y))) return 'visited tile was not visible/explored';
+  g.player.x = start.x; g.player.y = start.y;
+  recomputeVisibility(g);
+  if (isPointVisible(g, far.x, far.y)) return 'distant tile stayed visible after leaving';
+  return isTileExplored(g, Math.floor(far.x), Math.floor(far.y)) ? null : 'exploration was forgotten';
+});
+
+check('enemy point visibility follows fog without creating ghost knowledge', () => {
+  const g = createGame('FOG-ENEMY', 'gunner');
+  const a = { x: 8.5, y: 8.5 };
+  const b = { x: MAP.w - 8.5, y: MAP.h - 8.5 };
+  g.player.x = a.x; g.player.y = a.y;
+  recomputeVisibility(g);
+  spawnGroupAt(g, a.x, a.y, 'swarm', 1);
+  const e = g.enemies[0];
+  if (!isPointVisible(g, e.x, e.y)) return 'enemy beside player was hidden';
+  g.player.x = b.x; g.player.y = b.y;
+  recomputeVisibility(g);
+  return isPointVisible(g, e.x, e.y) ? 'enemy remained visible outside every source' : null;
+});
+
+check('built towers grant cached LOS vision and unfinished towers grant none', () => {
+  const g = createGame('FOG-TOWER', 'gunner');
+  g.map = syntheticMap();
+  const t = g.towers[0];
+  t.x = 40.5; t.y = 25.5; t.field = null;
+  g.player.x = 5.5; g.player.y = 5.5;
+  recomputeVisibility(g, true);
+  if (!isTileVisible(g, 49, 25)) return 'built tower did not reveal inside its minimum radius';
+  t.built = false;
+  recomputeVisibility(g);
+  if (isTileVisible(g, 40, 25)) return 'unfinished tower revealed its own tile';
+  t.built = true;
+  recomputeVisibility(g);
+  return isTileVisible(g, 40, 25) ? null : 'rebuilt tower did not restore vision';
+});
+
+check('fog vision obeys cliff, forest, and higher-source LOS rules', () => {
+  const g = createGame('FOG-LOS', 'gunner');
+  g.map = syntheticMap();
+  const t = g.towers[0];
+  t.x = 10.5; t.y = 10.5; t.field = null;
+  g.player.x = 90.5; g.player.y = 40.5;
+  g.map.kind[idx(11, 10)] = T.CLIFF;
+  recomputeVisibility(g, true);
+  if (isTileVisible(g, 14, 10)) return 'tower vision passed through a cliff';
+  g.map.kind[idx(11, 10)] = T.FOREST;
+  g.map.elev[idx(10, 10)] = 1;
+  g.map.elev[idx(11, 10)] = 1;
+  recomputeVisibility(g, true);
+  if (isTileVisible(g, 14, 10)) return 'same-band forest did not block tower vision';
+  g.map.elev[idx(10, 10)] = 2;
+  recomputeVisibility(g, true);
+  return isTileVisible(g, 14, 10) ? null : 'higher tower did not see over lower forest';
+});
+
+check('tower vision radius always covers current upgraded weapon range', () => {
+  const g = createGame('FOG-RANGE', 'gunner');
+  const t = g.towers[0];
+  t.wLevel = TOWER.upgrade.maxLevel;
+  if (!grantEquipment(g, 'targetingModule')) return 'could not grant targeting module';
+  recomputeVisibility(g);
+  const radius = visibilityState(g).towerRadii.find((r) => r.id === t.id)?.radius;
+  const range = towerStats(g, t).range;
+  if (radius < VISION.towerMin) return `tower vision ${radius} below minimum ${VISION.towerMin}`;
+  return radius + 1e-9 >= range + VISION.towerRangeMargin
+    ? null : `tower vision ${radius} does not cover range ${range}`;
+});
+
+check('rich resource deposits are discovered once and remain explored', () => {
+  const g = createGame('FOG-RESOURCE', 'prospector');
+  const t = g.towers[0];
+  const d = g.map.deposits.find((o) => o.richness === 'rich'
+    && Math.hypot(o.x + 0.5 - t.x, o.y + 0.5 - t.y) > 18
+    && !isTileExplored(g, Math.floor(o.x), Math.floor(o.y)));
+  if (!d) return 'no initially hidden Rich deposit centroid';
+  g.player.x = d.x + 0.5; g.player.y = d.y + 0.5;
+  recomputeVisibility(g);
+  if (!isTileExplored(g, Math.floor(d.x), Math.floor(d.y))) return 'visit did not discover deposit centroid';
+  g.player.x = t.x; g.player.y = t.y;
+  recomputeVisibility(g);
+  if (isTileVisible(g, Math.floor(d.x), Math.floor(d.y))) return 'deposit stayed visible after leaving';
+  return isTileExplored(g, Math.floor(d.x), Math.floor(d.y)) ? null : 'deposit discovery was forgotten';
+});
+
+check('construction is local and playerBuildSite can be built while standing there', () => {
+  const g = createGame('LOCAL-BUILD', 'engineer');
+  g.materials = 99999;
+  let site = null;
+  for (let y = 3; y < MAP.h - 3 && !site; y++) for (let x = 3; x < MAP.w - 3; x++) {
+    if (Math.hypot(x + 0.5 - g.towers[0].x, y + 0.5 - g.towers[0].y) < 12) continue;
+    g.player.x = x + 0.5; g.player.y = y + 0.5;
+    const candidate = playerBuildSite(g);
+    if (candidate.check.ok) { site = candidate; break; }
+  }
+  if (!site) return 'no local valid site found';
+  g.player.x = g.towers[0].x; g.player.y = g.towers[0].y;
+  const remote = tryBuild(g, site.x, site.y);
+  if (remote.ok || remote.reason !== 'stand at the site to build') return 'remote build did not return the local-build refusal';
+  g.player.x = site.x; g.player.y = site.y;
+  return tryBuild(g, site.x, site.y).ok ? null : 'build failed while standing at playerBuildSite';
+});
+
+check('unfinished construction continues unassisted after the player leaves', () => {
+  const g = createGame('BUILD-AWAY', 'gunner');
+  g.materials = 99999; g.phaseLeft = 999;
+  let site = null;
+  for (let y = 3; y < MAP.h - 3 && !site; y++) for (let x = 3; x < MAP.w - 3; x++) {
+    g.player.x = x + 0.5; g.player.y = y + 0.5;
+    const c = playerBuildSite(g);
+    if (c.check.ok) { site = c; break; }
+  }
+  if (!site || !tryBuild(g, site.x, site.y).ok) return 'could not start construction';
+  const t = g.towers[g.towers.length - 1];
+  g.player.x = g.towers[0].x; g.player.y = g.towers[0].y;
+  const before = t.progress;
+  update(g, 1);
+  if (!(t.progress > before) || t.built) return 'unassisted progress did not advance normally';
+  update(g, TOWER.buildTime);
+  return t.built ? null : 'unassisted tower never completed';
+});
+
+check('timed upgrade keeps old stats until completion and refuses a second job', () => {
+  const g = createGame('UPGRADE-TIMED', 'gunner');
+  g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  g.player.x = t.x + PLAYER.presenceRadius + 5;
+  const old = towerStats(g, t);
+  if (!tryUpgrade(g, t, 'weapon')) return 'first upgrade refused';
+  if (tryUpgrade(g, t, 'extraction')) return 'second concurrent upgrade accepted';
+  if (t.wLevel !== 0 || !upgradeState(t)) return 'upgrade applied immediately or has no state';
+  update(g, TOWER.upgrade.buildTime[0] * 0.5);
+  const mid = towerStats(g, t);
+  if (t.wLevel !== 0 || mid.damage !== old.damage || mid.range !== old.range) return 'stats changed mid-upgrade';
+  update(g, TOWER.upgrade.buildTime[0] * 0.5 + 0.01);
+  const done = towerStats(g, t);
+  if (t.wLevel !== 1 || upgradeState(t) !== null) return 'upgrade did not complete at its duration';
+  return done.damage > old.damage && done.range > old.range ? null : 'completed weapon stats did not improve';
+});
+
+check('a tower keeps extracting and acquiring targets during an upgrade', () => {
+  const g = createGame('UPGRADE-FUNCTION', 'gunner');
+  g.map = syntheticMap(); g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  t.x = 30.5; t.y = 20.5; t.field = null; t.resourceScore = 1;
+  g.player.x = 5.5; g.player.y = 5.5;
+  const e = testEnemy(g, { x: t.x + 3, y: t.y }, null);
+  if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
+  const before = g.materials;
+  update(g, 0.5);
+  if (!(g.materials > before)) return 'extraction stopped during upgrade';
+  if (t.targetId !== e.id) return 'tower did not acquire a target during upgrade';
+  return t.wLevel === 0 ? null : 'level changed before upgrade duration';
+});
+
+check('upgrade speed matches unassisted, Gunner-present, and Engineer-present multipliers', () => {
+  const measure = (arch, present) => {
+    const g = createGame(`UPGRADE-${arch}-${present}`, arch);
+    g.materials = 99999; g.phaseLeft = 999;
+    const t = g.towers[0];
+    g.player.x = present ? t.x : t.x + PLAYER.presenceRadius + 5;
+    g.player.y = t.y;
+    if (!tryUpgrade(g, t, 'weapon')) return Infinity;
+    let elapsed = 0;
+    while (t.wLevel === 0 && elapsed < 20) { update(g, 0.02); elapsed += 0.02; }
+    return elapsed;
+  };
+  const away = measure('gunner', false);
+  const gunner = measure('gunner', true);
+  const engineer = measure('engineer', true);
+  const duration = TOWER.upgrade.buildTime[0];
+  if (Math.abs(away - duration) > 0.021) return `unassisted completed in ${away.toFixed(2)}s`;
+  if (Math.abs(gunner - duration / 2.5) > 0.021) return `present Gunner completed in ${gunner.toFixed(2)}s`;
+  return Math.abs(engineer - duration / 3.6) <= 0.021
+    ? null : `present Engineer completed in ${engineer.toFixed(2)}s`;
+});
+
+check('destroying a tower loses its upgrade job without a refund', () => {
+  const g = createGame('UPGRADE-DESTROY', 'gunner');
+  g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
+  const paid = g.materials;
+  t.hp = -1;
+  update(g, TOWER.upgrade.buildTime[0] + 1);
+  if (g.towers.includes(t) || t.wLevel !== 0) return 'destroyed tower survived or completed upgrade';
+  return g.materials === paid ? null : `materials changed after destruction (${paid} -> ${g.materials})`;
+});
+
+check('tower alarm fires for unseen damage but not visible damage', () => {
+  const fixture = (visible) => {
+    const g = createGame(`ALARM-${visible}`, 'gunner');
+    g.map = syntheticMap(); g.phaseLeft = 999;
+    const t = g.towers[0];
+    t.x = 10.5; t.y = 10.5; t.field = null; t.hp = t.maxHp = 1e6;
+    g.player.x = 90.5; g.player.y = 40.5;
+    if (!visible) g.map.kind[idx(11, 10)] = T.FOREST;
+    const e = testEnemy(g, { x: visible ? 11.5 : 13.1, y: 10.5 }, t.id);
+    e.sieging = true; e.siegedId = t.id;
+    e.def = { ...e.def, towerDps: 10 };
+    recomputeVisibility(g, true);
+    const seen = isPointVisible(g, e.x, e.y);
+    update(g, 0.1);
+    return { g, t, seen, active: towerAlarmState(g).find((a) => a.id === t.id)?.active };
+  };
+  const hidden = fixture(false);
+  if (hidden.seen) return 'hidden-attacker precondition was visible';
+  if (!hidden.active) return 'unseen hit did not activate tower alarm';
+  const shown = fixture(true);
+  if (!shown.seen) return 'visible-attacker precondition was hidden';
+  return shown.active ? 'visible hit activated unseen tower alarm' : null;
+});
+
+check('visibility recompute remains inexpensive headlessly', () => {
+  const g = createGame('FOG-PERF', 'gunner');
+  const count = 40;
+  const before = performance.now();
+  for (let n = 0; n < count; n++) {
+    g.player.x = 2.5 + (n % (MAP.w - 5));
+    g.player.y = 2.5 + ((n * 7) % (MAP.h - 5));
+    recomputeVisibility(g);
+  }
+  const per = (performance.now() - before) / count;
+  console.log(`Visibility recompute: ${per.toFixed(3)} ms/recompute (${count} samples)`);
+  return Number.isFinite(per) ? null : 'visibility timing was non-finite';
+});
+
+check('prep bot reaches a Moderate+ expansion site on five seeds before 40 seconds', () => {
+  const reports = [];
+  for (const seed of ['SCOUT-A', 'SCOUT-B', 'SCOUT-C', 'SCOUT-D', 'SCOUT-E']) {
+    const g = createGame(seed, 'gunner');
+    g.materials = 99999;
+    const start = g.towers[0];
+    const candidates = [];
+    for (let y = 2; y < MAP.h - 2; y++) for (let x = 2; x < MAP.w - 2; x++) {
+      const wx = x + 0.5; const wy = y + 0.5;
+      if (Math.hypot(wx - start.x, wy - start.y) < 10) continue;
+      const c = canPlaceAt(g, wx, wy);
+      if (!c.ok || c.richness.key === 'poor') continue;
+      candidates.push({ x: wx, y: wy, distance: Math.hypot(wx - g.player.x, wy - g.player.y) });
+    }
+    candidates.sort((a, b) => a.distance - b.distance);
+    let target = null; let field = null;
+    for (const c of candidates) {
+      const f = computeField(g.map, [idx(Math.floor(c.x), Math.floor(c.y))], 'direct');
+      if (Number.isFinite(f[idx(Math.floor(g.player.x), Math.floor(g.player.y))])) { target = c; field = f; break; }
+    }
+    if (!target) return `${seed}: no reachable Moderate+ expansion target`;
+    const dt = 1 / 15;
+    let reachedAt = null;
+    for (let elapsed = 0; elapsed < WAVE.prepFirst; elapsed += dt) {
+      const dir = steer(g.map, field, g.player.x, g.player.y);
+      g.input.mx = dir?.x ?? 0; g.input.my = dir?.y ?? 0;
+      update(g, dt);
+      const site = playerBuildSite(g);
+      if (site.check.ok && site.check.richness.key !== 'poor'
+          && Math.hypot(site.x - start.x, site.y - start.y) >= 10) {
+        reachedAt = elapsed + dt;
+        break;
+      }
+    }
+    const explored = visibilityState(g).exploredCount;
+    reports.push(`${seed} ${reachedAt === null ? 'unreached' : reachedAt.toFixed(1) + 's'} / ${explored} tiles`);
+    if (reachedAt === null || reachedAt >= WAVE.prepFirst) return `${seed}: expansion site not reached during prep`;
+  }
+  console.log(`Prep viability: ${reports.join('; ')}`);
+  return null;
+});
+
 // --- D37/D39: equipment and pause ------------------------------------------
 
 check('run-long equipment is one-of-each and capped at four', () => {
@@ -1122,11 +1435,13 @@ check('pause freezes simulation and refuses player actions', () => {
     return null;
   };
   const site = findSite();
-  if (!site || !tryBuild(g, site.x, site.y).ok) return 'could not establish construction precondition';
+  if (!site || !buildAt(g, site.x, site.y).ok) return 'could not establish construction precondition';
   const building = g.towers[g.towers.length - 1];
   const secondSite = findSite();
   if (!secondSite) return 'could not establish paused-build precondition';
 
+  g.player.x = secondSite.x;
+  g.player.y = secondSite.y;
   setPaused(g, true);
   const before = {
     time: g.time, phaseLeft: g.phaseLeft, materials: g.materials,
@@ -1232,7 +1547,7 @@ check('a full run simulates for several waves without crashing', () => {
 
     if (built < 3 && step % 900 === 400 && g.materials > TOWER.cost) {
       for (let d = TOWER.minSpacing + 1; d < 25; d += 2) {
-        if (tryBuild(g, g.map.start.x + d, g.map.start.y).ok) { built++; break; }
+        if (buildAt(g, g.map.start.x + d, g.map.start.y).ok) { built++; break; }
       }
     }
     if (g.status !== 'playing') break;

@@ -1,7 +1,10 @@
 // DOM HUD. Functional, not pretty (plan §16).
 
 import { ARCHETYPES, TOWER, WAVE, TILE_NAME, DROP } from './config.js';
-import { towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState } from './game.js';
+import {
+  towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState,
+  upgradeState, towerAlarmState,
+} from './game.js';
 
 export const $ = (id) => document.getElementById(id);
 
@@ -51,7 +54,7 @@ export function updateHud(g) {
 
   const dangerChip = $('hud-danger');
   if (g.phase === 'combat' && !danger.sheltered) {
-    dangerChip.textContent = `EXPOSED · ${danger.hunters} HUNTING`;
+    dangerChip.textContent = `EXPOSED · ${danger.visibleHunters} HUNTING`;
     dangerChip.style.color = 'var(--red)';
     dangerChip.style.borderColor = 'var(--red)';
   } else {
@@ -59,6 +62,11 @@ export function updateHud(g) {
     dangerChip.style.color = danger.sheltered ? 'var(--green)' : 'var(--dim)';
     dangerChip.style.borderColor = '';
   }
+
+  const activeAlarm = towerAlarmState(g).find((alarm) => alarm.active);
+  const alarmChip = $('hud-tower-alarm');
+  alarmChip.hidden = !activeAlarm;
+  if (activeAlarm) alarmChip.textContent = `TOWER #${activeAlarm.id} UNDER ATTACK`;
 
   const fx = Object.entries(g.effects);
   const fxChip = $('hud-effects');
@@ -81,7 +89,7 @@ export function updateHud(g) {
   $('p-danger').innerHTML = danger.sheltered
     ? '<span class="good">sheltered</span>'
     : g.phase === 'combat'
-      ? `<span class="warn">EXPOSED · ${danger.hunters} hunting</span>`
+      ? `<span class="warn">EXPOSED · ${danger.visibleHunters} hunting</span>`
       : danger.shelterTowerId ? `<span class="good">sheltering ${shelterPct}%</span>` : 'safe during prep';
   $('p-equipment').textContent = g.equipment.length
     ? g.equipment.map((key) => DROP.equipment[key].name).join(' · ')
@@ -93,13 +101,22 @@ export function updateHud(g) {
   $('sel-body').hidden = !sel;
   if (sel) {
     const s = towerStats(g, sel);
+    const upgrading = upgradeState(sel);
+    const alarm = towerAlarmState(g).find((state) => state.id === sel.id)?.active;
     const frac = sel.hp / sel.maxHp;
     const collapsing = sel.built && frac < TOWER.collapsingAt;
     $('sel-title').textContent = `Tower #${sel.id}`;
     $('sel-state').innerHTML = !sel.built
       ? `<span class="muted">building ${(sel.progress * 100).toFixed(0)}%</span>`
       : collapsing ? '<span class="warn">COLLAPSING</span>'
+      : alarm ? '<span class="warn">UNDER ATTACK</span>'
       : s.occupied ? '<span style="color:var(--gold)">OCCUPIED</span>' : 'automated';
+    const upgradeEl = $('sel-upgrade');
+    upgradeEl.hidden = !upgrading;
+    if (upgrading) {
+      const kind = upgrading.which === 'weapon' ? 'W' : 'E';
+      upgradeEl.textContent = `UPGRADING ${kind}${upgrading.toLevel} ${(upgrading.progress * 100).toFixed(0)}%`;
+    }
     $('sel-hp').textContent = `${Math.round(sel.hp)} / ${sel.maxHp}`;
     $('sel-hpbar').style.width = `${frac * 100}%`;
     $('sel-hpbar').style.background = collapsing ? 'var(--red)' : frac < 0.5 ? 'var(--gold)' : 'var(--green)';
@@ -109,8 +126,8 @@ export function updateHud(g) {
     $('sel-range').textContent = `${fmt(s.range, 1)} tiles`;
     $('sel-levels').textContent = `W${sel.wLevel} / E${sel.eLevel} (max ${TOWER.upgrade.maxLevel})`;
 
-    setUpgradeButton($('up-weapon'), '[1] Weapon upgrade', upgradeCost(sel, 'weapon'), g.materials, sel.built && !g.paused);
-    setUpgradeButton($('up-extract'), '[2] Extraction upgrade', upgradeCost(sel, 'extraction'), g.materials, sel.built && !g.paused);
+    setUpgradeButton($('up-weapon'), '[1] Weapon upgrade', upgradeCost(sel, 'weapon'), g.materials, sel.built && !g.paused && !upgrading);
+    setUpgradeButton($('up-extract'), '[2] Extraction upgrade', upgradeCost(sel, 'extraction'), g.materials, sel.built && !g.paused && !upgrading);
 
     const perHp = repairCostPerHp(g);
     const missing = sel.maxHp - sel.hp;
@@ -125,6 +142,7 @@ export function updateHud(g) {
   // --- build ---
   $('build-cost').textContent = `${towerCost(g)} M`;
   $('build-toggle').disabled = g.paused;
+  $('build-confirm').disabled = g.paused || !g.buildMode || !g.buildCheck?.ok;
   $('build-state').textContent = g.buildMode ? '— ACTIVE' : '';
   $('build-state').className = g.buildMode ? 'good' : 'muted';
   const info = $('build-info');
@@ -134,12 +152,14 @@ export function updateHud(g) {
       `<b>${TILE_NAME[c.terrain]}</b>, elevation <b>${c.elevationName}</b> — ${sightMeaning(c)}`,
       `Extraction: <span style="color:var(--gold)">${'▰'.repeat(c.richness.bars)}</span> <b>${c.richness.name}</b> - ${fmt(c.income, 2)} Materials/sec`,
       `Visibility: <b>${(c.coverage * 100).toFixed(0)}%</b> of ground in range`,
-      c.ok ? '<span class="good">Valid site — click to build.</span>'
+      c.ok ? '<span class="good">Valid site — press Enter, click the map, or use Build here.</span>'
            : `<span class="warn">Blocked: ${c.reasons.join(', ')}</span>`,
     ].filter(Boolean).join('<br />');
   } else {
-    info.innerHTML = 'Press <b>B</b>, then click a spot. Preview shows income and sight lines.';
+    info.innerHTML = 'Press <b>B</b>, walk to a site, then press <b>Enter</b> to build here. Preview shows income and sight lines.';
   }
+
+  $('d-fog').textContent = g.debug.showFog ? 'Hide fog debug [V]' : 'Show fog debug [V]';
 
   // --- log ---
   if (g.log.length !== lastLogLen) {

@@ -157,6 +157,16 @@ export const PLAYER = {
   shelterTime: 0.7,
 };
 
+export const BUILD = {
+  reach: 1.5,
+};
+
+export const VISION = {
+  player: 8,
+  towerMin: 9,
+  towerRangeMargin: 1.5,
+};
+
 // --- towers -----------------------------------------------------------------
 export const TOWER = {
   cost: 100,
@@ -176,6 +186,7 @@ export const TOWER = {
 
   upgrade: {
     maxLevel: 3,
+    buildTime: [6, 9, 13],
     weaponCost: [140, 230, 360],
     extractionCost: [120, 200, 320],
     weaponDamagePerLevel: 0.45,   // +45% damage per level
@@ -351,7 +362,7 @@ export const AUDIO = {
   farDistance: 42,
   rateLimits: {
     towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
-    heavyTowerHit: 0.22, collapsing: 0.75, repair: 0.16, default: 0.08,
+    heavyTowerHit: 0.22, towerUnderAttack: 2.5, collapsing: 0.75, repair: 0.16, default: 0.08,
   },
   limiter: { threshold: -12, ratio: 16 },
   envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
@@ -360,7 +371,8 @@ export const AUDIO = {
     towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'], towerDestroy: [56, .72, 'triangle'],
     collapsing: [92, .70, 'sawtooth'], playerDamage: [880, .11, 'square'], exposed: [720, .16, 'sawtooth'],
     towerEntry: [145, .18, 'triangle'], constructionStart: [180, .13, 'square'], constructionComplete: [620, .24, 'triangle'],
-    repair: [760, .06, 'sine'], upgrade: [720, .18, 'triangle'], waveWarning: [185, .40, 'sawtooth'],
+    repair: [760, .06, 'sine'], upgradeStart: [180, .13, 'square'], upgrade: [720, .18, 'triangle'],
+    towerUnderAttack: [105, .32, 'sawtooth'], waveWarning: [185, .40, 'sawtooth'],
     waveStart: [230, .32, 'sawtooth'], finalWave: [155, .48, 'sawtooth'], victory: [660, .38, 'triangle'], playerDeath: [110, .44, 'sawtooth'],
   },
   dropFrequencies: { temporary: 620, materials: 310, equipment: 880 },

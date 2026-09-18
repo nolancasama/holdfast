@@ -50,6 +50,7 @@
   .chip.phase-combat { border-color: var(--red); }
   .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
   .chip.phase-prep { border-color: var(--green); }
+  #hud-tower-alarm { color: var(--red); border-color: var(--red); font-weight: 700; animation: pulse 0.45s infinite alternate; }
   @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
 
   /* ---- event log ---- */
@@ -120,7 +121,7 @@
   .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
   .start:hover { background: #ffe08a; }
 
-  @media (prefers-reduced-motion: reduce) { .chip.phase-warning { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .chip.phase-warning, #hud-tower-alarm { animation: none; } }
   button:focus-visible, .start:focus-visible, .seedrow input:focus-visible {
     outline: 2px solid var(--gold); outline-offset: 2px;
   }
@@ -155,6 +156,7 @@
       <button id="pause-toggle">[P] Pause</button>
       <div class="chip" id="hud-occ">Unoccupied</div>
       <div class="chip" id="hud-danger">SAFE DURING PREP</div>
+      <div class="chip" id="hud-tower-alarm" hidden>TOWER UNDER ATTACK</div>
       <div class="chip muted" id="hud-seed">seed</div>
       <div class="chip" id="hud-effects" hidden></div>
     </div>
@@ -174,7 +176,7 @@
         </div>
         <button class="start" id="start-btn">Start run</button>
         <p class="keys" style="margin-top:14px">
-          <b>WASD</b> move · <b>B</b> build mode · <b>click</b> place / select tower ·
+          <b>WASD</b> move · <b>B</b> build mode · <b>Enter</b>/<b>click</b> build here / select tower ·
           <b>R</b> hold to repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
         </p>
       </div>
@@ -214,6 +216,7 @@
         <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
         <div class="row"><span>Range</span><span id="sel-range">—</span></div>
         <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
+        <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:4px" hidden></div>
         <button id="up-weapon">[1] Weapon upgrade<span class="cost"></span></button>
         <button id="up-extract">[2] Extraction upgrade<span class="cost"></span></button>
         <div class="row" style="margin-top:6px"><span>Repair cost</span><span id="sel-repair">—</span></div>
@@ -224,13 +227,14 @@
     <div class="sec">
       <h2>Build <span id="build-state" class="muted"></span></h2>
       <button id="build-toggle">[B] Toggle build mode<span class="cost" id="build-cost"></span></button>
-      <div id="build-info" class="keys" style="margin-top:6px">Press B, then click a spot.</div>
+      <button id="build-confirm" disabled>Build here [Enter]</button>
+      <div id="build-info" class="keys" style="margin-top:6px">Press B, walk to a site, Enter to build here.</div>
     </div>
 
     <div class="sec">
       <h2>Controls</h2>
       <div class="keys">
-        <b>WASD</b> move · <b>B</b> build · <b>click</b> place/select<br />
+        <b>WASD</b> move · <b>B</b> build · <b>Enter</b>/<b>click</b> build here/select<br />
         <b>R</b> hold repair · <b>1</b>/<b>2</b> upgrade · <b>Space</b> melee<br />
         <b>P</b> pause · <b>Esc</b> cancel build · <b>F1</b> debug panel
       </div>
@@ -251,11 +255,12 @@
         <button id="d-dmg" style="width:auto">Damage tower 25%</button>
         <button id="d-kill" style="width:auto">Destroy tower</button>
         <button id="d-paths" style="width:auto">Toggle paths</button>
+        <button id="d-fog" style="width:auto">Show fog debug [V]</button>
         <button id="d-pause" style="width:auto">Pause spawning</button>
         <button id="d-regen" style="width:auto">Regenerate map</button>
         <div class="keys" style="margin-top:8px">
           <b>M</b> materials · <b>N</b> next wave · <b>G</b> spawn · <b>K</b> damage ·
-          <b>J</b> destroy · <b>H</b> paths · <b>L</b> pause spawns · <b>O</b> regen
+          <b>J</b> destroy · <b>H</b> paths · <b>V</b> fog · <b>L</b> pause spawns · <b>O</b> regen
         </div>
         <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>
       </div>
