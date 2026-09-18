@@ -4,7 +4,7 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
-  EXPOSURE, READABILITY, VISION, BUILD,
+  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt,
@@ -20,7 +20,7 @@ import {
   setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
   emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState, upgradeState,
-  towerAlarmState, recomputeVisibility,
+  upgradeRateMult, towerAlarmState, recomputeVisibility, stuckState, endState,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -40,6 +40,17 @@ function check(name, fn) {
 const SEEDS = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 'HOTEL',
                'INDIA', 'JULIET', 'KILO', 'LIMA', 'MIKE', 'NOVEMBER', 'OSCAR', 'PAPA',
                'QUEBEC', 'ROMEO', 'SIERRA', 'TANGO'];
+
+function withSeededRandom(seed, fn) {
+  const previous = Math.random;
+  let state = 2166136261;
+  for (const ch of seed) state = Math.imul(state ^ ch.charCodeAt(0), 16777619) >>> 0;
+  Math.random = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+  try { return fn(); } finally { Math.random = previous; }
+}
 
 console.log(`Generating ${SEEDS.length} maps...`);
 const maps = SEEDS.map((s) => generateMap(s));
@@ -813,6 +824,103 @@ check('standing clear of a collapsing tower is safe', () => {
   return g.player.hp === before ? null : `lost ${before - g.player.hp} hp while clear`;
 });
 
+// --- D64: one centralized defeat resolution ---------------------------------
+
+check('one remaining or COLLAPSING tower keeps the run playing', () => {
+  const g = createGame('DEFEAT-TOWER-LIVE', 'gunner');
+  update(g, 0.01);
+  if (endState(g).status !== 'playing') return 'one live tower caused defeat';
+  g.towers[0].hp = g.towers[0].maxHp * TOWER.collapsingAt - 1;
+  update(g, 0.01);
+  return endState(g).status === 'playing' ? null : 'COLLAPSING tower did not count';
+});
+
+check('an unfinished tower prevents defeat when the last finished tower falls', () => {
+  const g = createGame('DEFEAT-BUILDING', 'gunner');
+  g.materials = 99999; g.phaseLeft = 999;
+  const finished = g.towers[0];
+  let building = null;
+  for (let y = 3; y < MAP.h - 3 && !building; y++) {
+    for (let x = 3; x < MAP.w - 3; x++) {
+      if (Math.hypot(x + 0.5 - finished.x, y + 0.5 - finished.y) < TOWER.minSpacing) continue;
+      if (buildAt(g, x + 0.5, y + 0.5).ok) { building = g.towers[g.towers.length - 1]; break; }
+    }
+  }
+  if (!building || building.built) return 'could not establish unfinished tower';
+  g.player.x = building.x; g.player.y = building.y;
+  finished.hp = -1;
+  update(g, 0.01);
+  return g.towers.includes(building) && endState(g).status === 'playing'
+    ? null : 'unfinished tower did not keep the run alive';
+});
+
+check('destroying the last tower loses to the tower cause in the same update', () => {
+  const g = createGame('DEFEAT-LAST', 'gunner');
+  drainAudioEvents(g);
+  const t = g.towers[0];
+  g.player.x = t.x + TOWER.collapseRadius + 2;
+  t.hp = -1;
+  update(g, 0.01);
+  const state = endState(g);
+  if (state.status !== 'lost' || state.lossCause !== 'towers') return `got ${JSON.stringify(state)}`;
+  if (drainAudioEvents(g).filter((e) => e.type === 'towerDestroy').length !== 1) return 'tower loss did not emit exactly one end cue';
+  return g.log[0]?.text === 'All towers destroyed. Position lost.' ? null : 'tower-loss log missing';
+});
+
+check('player death with towers remaining resolves only as died', () => {
+  const g = createGame('DEFEAT-DIED', 'gunner');
+  g.phase = 'combat';
+  g.pendingSpawns = [{ type: 'swarm', side: 'west', point: 0, at: 999 }];
+  g.player.hp = 0;
+  update(g, 0.01);
+  const state = endState(g);
+  if (state.status !== 'lost' || state.lossCause !== 'died') return `got ${JSON.stringify(state)}`;
+  const deaths = drainAudioEvents(g).filter((e) => e.type === 'playerDeath').length;
+  update(g, 1);
+  return endState(g).lossCause === 'died' && deaths === 1 ? null : 'death was overwritten or emitted twice';
+});
+
+check('last-tower collapse gives death priority only when it kills the player', () => {
+  for (const [hp, cause] of [[10, 'died'], [PLAYER.maxHp, 'towers']]) {
+    const g = createGame(`DEFEAT-CRUSH-${cause}`, 'gunner');
+    const t = g.towers[0];
+    g.player.x = t.x; g.player.y = t.y; g.player.hp = hp;
+    t.hp = -1;
+    update(g, 0.01);
+    const state = endState(g);
+    if (state.status !== 'lost' || state.lossCause !== cause) {
+      return `${hp} hp collapse resolved ${JSON.stringify(state)}`;
+    }
+    update(g, 1);
+    const settled = endState(g);
+    if (settled.status !== 'lost' || settled.lossCause !== cause) {
+      return `${hp} hp collapse end state was overwritten: ${JSON.stringify(settled)}`;
+    }
+  }
+  return null;
+});
+
+check('defeat freezes waves, spawns, extraction, construction and upgrades', () => {
+  const g = createGame('DEFEAT-FREEZE', 'gunner');
+  g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  if (!tryUpgrade(g, t, 'weapon')) return 'upgrade precondition failed';
+  g.phase = 'combat'; g.phaseLeft = 17; g.combatT = 0;
+  g.pendingSpawns = [{ type: 'heavy', side: 'west', point: 0, at: 50 }];
+  g.player.hp = 0;
+  update(g, 0.01);
+  const snapshot = {
+    time: g.time, phaseLeft: g.phaseLeft, combatT: g.combatT, pending: g.pendingSpawns.length,
+    enemies: g.enemies.length, materials: g.materials, progress: t.upgrade.progress,
+  };
+  update(g, 5);
+  const after = {
+    time: g.time, phaseLeft: g.phaseLeft, combatT: g.combatT, pending: g.pendingSpawns.length,
+    enemies: g.enemies.length, materials: g.materials, progress: t.upgrade.progress,
+  };
+  return JSON.stringify(after) === JSON.stringify(snapshot) ? null : 'simulation advanced after defeat';
+});
+
 // --- D5: aggro commitment ----------------------------------------------------
 
 check('a sieging enemy does not abandon its target when the player leaves', () => {
@@ -1039,6 +1147,199 @@ check('D53-E: a never-occupied tower is not a strategic target, sheltered or exp
   return [sheltered, exposed].some((e) => e.targetId === c.id) ? 'an enemy targeted unoccupied C' : null;
 });
 
+// --- D63: field-progress stuck recovery --------------------------------------
+
+function radiusClear(map, tx, ty, radius) {
+  if (!isPassable(map, tx, ty)) return false;
+  if (radius <= 0.5) return true;
+  for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+    if (!isPassable(map, tx + ox, ty + oy)) return false;
+  }
+  return true;
+}
+
+function addRealEnemy(g, x, y, type, targetId, speed = ENEMIES[type].speed) {
+  const base = ENEMIES[type];
+  const def = { ...base, speed, towerDps: 0, playerHit: 0 };
+  const e = {
+    id: g.nextEnemyId++, type, side: 'debug', def,
+    x, y, hp: 1e6, maxHp: 1e6, targetId,
+    sieging: false, siegeAngle: 0, retargetIn: 99, hitCd: 99, flash: 0,
+  };
+  g.enemies.push(e);
+  return e;
+}
+
+function embeddedRecoveryFixture(type = 'swarm') {
+  const g = createGame(`STUCK-EMBEDDED-${type}`, 'gunner');
+  g.phaseLeft = 999; g.materials = 0;
+  const t = g.towers[0];
+  t.hp = t.maxHp = 1e9; t.shotCd = 1e9; t.resourceScore = 0;
+  if (!occupy(g, t)) return null;
+  const field = computeField(g.map, [idx(Math.floor(t.x), Math.floor(t.y))], 'lane');
+  t.field = field;
+  const radius = ENEMIES[type].radius;
+  let embedded = null;
+  for (let y = 2; y < MAP.h - 2 && !embedded; y++) for (let x = 2; x < MAP.w - 2; x++) {
+    if (isPassable(g.map, x, y)) continue;
+    let adjacentFinite = false;
+    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+      if ((ox || oy) && Number.isFinite(field[idx(x + ox, y + oy)]) && isPassable(g.map, x + ox, y + oy)) {
+        adjacentFinite = true;
+      }
+    }
+    if (adjacentFinite) continue;
+    let hasRecovery = false;
+    for (let oy = -STUCK.searchRadius; oy <= STUCK.searchRadius && !hasRecovery; oy++) {
+      for (let ox = -STUCK.searchRadius; ox <= STUCK.searchRadius; ox++) {
+        const nx = x + ox; const ny = y + oy;
+        if (nx < 1 || ny < 1 || nx >= MAP.w - 1 || ny >= MAP.h - 1) continue;
+        if (Number.isFinite(field[idx(nx, ny)]) && radiusClear(g.map, nx, ny, radius)) {
+          hasRecovery = true; break;
+        }
+      }
+    }
+    if (hasRecovery) embedded = { x, y };
+  }
+  if (!embedded) return null;
+  const e = addRealEnemy(g, embedded.x + 0.5, embedded.y + 0.5, type, t.id);
+  return { g, t, e, field, embedded };
+}
+
+check('an enemy embedded in a real cliff is recovered onto finite valid terrain', () => {
+  const f = embeddedRecoveryFixture('swarm');
+  if (!f) return 'could not find a thick real cliff with a nearby recovery tile';
+  const { g, e, field } = f;
+  runFor(g, STUCK.detectAfter + 0.5);
+  if (!g.enemies.includes(e)) return 'embedded enemy was despawned instead of recovered';
+  const tx = Math.floor(e.x); const ty = Math.floor(e.y);
+  const state = stuckState(g);
+  if (!isPassable(g.map, tx, ty) || !Number.isFinite(field[idx(tx, ty)])) return 'recovery landed on invalid terrain';
+  return state.detections >= 1 && state.recoveries >= 1 ? null : `counters are ${JSON.stringify(state)}`;
+});
+
+check('a recovered enemy resumes decreasing its target field value', () => {
+  const f = embeddedRecoveryFixture('swarm');
+  if (!f) return 'could not create recovery fixture';
+  const { g, e, field } = f;
+  runFor(g, STUCK.detectAfter + 0.5);
+  if (!g.enemies.includes(e)) return 'enemy disappeared during recovery';
+  const before = field[idx(Math.floor(e.x), Math.floor(e.y))];
+  runFor(g, 2.5);
+  const after = field[idx(Math.floor(e.x), Math.floor(e.y))];
+  return after < before - STUCK.minProgress ? null : `field only changed ${before.toFixed(2)} -> ${after.toFixed(2)}`;
+});
+
+check('an unreachable enemy is silently despawned after repeated stuck confirmation', () => {
+  const g = createGame('STUCK-DESPAWN', 'gunner');
+  const map = syntheticMap();
+  map.kind.fill(T.CLIFF);
+  // One isolated walkable pocket for the enemy and a separate valid target
+  // island. The deliberately non-finite field also exercises the guarded
+  // normTo fallback: the enemy must not walk directly through the cliff.
+  map.kind[idx(10, 10)] = T.PLAIN;
+  for (let y = 38; y <= 42; y++) for (let x = 78; x <= 82; x++) map.kind[idx(x, y)] = T.PLAIN;
+  g.map = map; g.phaseLeft = 999;
+  const t = g.towers[0];
+  t.x = 80.5; t.y = 40.5;
+  t.hp = t.maxHp = 1e9; t.shotCd = 1e9; t.resourceScore = 0;
+  g.player.x = t.x; g.player.y = t.y;
+  if (!occupy(g, t)) return 'could not occupy target tower';
+  t.field = new Float32Array(MAP.w * MAP.h).fill(Infinity);
+  const e = addRealEnemy(g, 10.5, 10.5, 'swarm', t.id);
+  const before = { kills: g.stats.kills, materials: g.materials, drops: g.drops.length };
+  drainAudioEvents(g);
+  runFor(g, 2);
+  if (!g.enemies.includes(e) || e.x !== 10.5 || e.y !== 10.5) {
+    return 'non-finite-field fallback moved the enemy through invalid terrain';
+  }
+  const nudge = g.debug.stuckEpisodes.find((episode) => episode.stage === 'nudge');
+  if (!nudge || nudge.recovered) return 'failed neighbour nudge was not instrumented';
+  runFor(g, STUCK.detectAfter + STUCK.despawnAfter);
+  const audio = drainAudioEvents(g);
+  if (g.enemies.includes(e)) return 'unreachable enemy was never despawned';
+  if (g.stats.kills !== before.kills || g.materials !== before.materials || g.drops.length !== before.drops) {
+    return 'silent despawn changed kills, materials, or drops';
+  }
+  if (audio.some((event) => event.type === 'enemyDeath')) return 'silent despawn emitted enemyDeath';
+  return stuckState(g).despawns === 1 ? null : 'despawn counter did not increment';
+});
+
+check('a sieging enemy standing still for ten seconds is never detected', () => {
+  const g = createGame('STUCK-SIEGE', 'gunner');
+  g.phaseLeft = 999;
+  const t = g.towers[0];
+  t.hp = t.maxHp = 1e9; t.shotCd = 1e9;
+  if (!occupy(g, t)) return 'could not occupy tower';
+  const e = addRealEnemy(g, t.x + TOWER.radius + ENEMY.attackRange, t.y, 'heavy', t.id, 0);
+  runFor(g, 10);
+  return e.sieging && stuckState(g).detections === 0 ? null : 'intentional siege was treated as stuck';
+});
+
+check('a twelve-enemy narrow-pass crowd for two seconds is not detected', () => {
+  const g = createGame('STUCK-CROWD', 'gunner');
+  const map = syntheticMap();
+  map.kind.fill(T.CLIFF);
+  for (let x = 1; x < MAP.w - 1; x++) { map.kind[idx(x, 25)] = T.PLAIN; map.road[idx(x, 25)] = 1; }
+  g.map = map; g.phaseLeft = 999;
+  const t = g.towers[0];
+  t.x = 85.5; t.y = 25.5; t.field = null; t.hp = t.maxHp = 1e9; t.shotCd = 1e9;
+  g.player.x = t.x; g.player.y = t.y;
+  if (!occupy(g, t)) return 'could not occupy corridor tower';
+  for (let n = 0; n < 12; n++) addRealEnemy(g, 10.2 + (n % 4) * 0.18, 25.35 + (n % 3) * 0.12, 'swarm', t.id);
+  runFor(g, 2);
+  return stuckState(g).detections === 0 ? null : 'ordinary two-second crowding triggered detection';
+});
+
+check('Heavy recovery requires a passable 3x3 clearance', () => {
+  const f = embeddedRecoveryFixture('heavy');
+  if (!f) return 'could not create Heavy recovery fixture';
+  runFor(f.g, STUCK.detectAfter + 0.5);
+  if (!f.g.enemies.includes(f.e)) return 'Heavy was despawned';
+  const tx = Math.floor(f.e.x); const ty = Math.floor(f.e.y);
+  return radiusClear(f.g.map, tx, ty, f.e.def.radius) ? null : `Heavy recovered without clearance at ${tx},${ty}`;
+});
+
+check('all mouth spawns on 20 seeds start passable with a finite target field', () => {
+  const g = createGame('SPAWN-AUDIT', 'gunner');
+  const t = g.towers[0];
+  t.hp = t.maxHp = 1e9; t.shotCd = 1e9;
+  return withSeededRandom('SPAWN-AUDIT-RNG', () => {
+    let sampled = 0;
+    for (const map of maps) {
+      g.map = map; g.wave = 8; g.status = 'playing'; g.phase = 'combat'; g.combatT = 0;
+      t.x = map.start.x + 0.5; t.y = map.start.y + 0.5; t.field = null;
+      g.player.x = t.x; g.player.y = t.y;
+      g.shelter = { towerId: t.id, progress: PLAYER.shelterTime, required: PLAYER.shelterTime };
+      g.occupiedTowerId = t.id; g.playerField = null; g.playerLaneField = null;
+      const field = computeField(map, [idx(map.start.x, map.start.y)], 'lane');
+      for (const side of ['west', 'east']) for (let point = 0; point < map.spawns[side].length; point++) {
+        for (const type of Object.keys(ENEMIES)) for (let repeat = 0; repeat < 3; repeat++) {
+          g.enemies = [];
+          g.pendingSpawns = [{ type, side, point, at: 0 }];
+          update(g, 0);
+          const e = g.enemies[0];
+          if (!e) return `${map.seed}/${side}/${point}/${type}: no enemy spawned`;
+          const tx = Math.floor(e.x); const ty = Math.floor(e.y);
+          if (tx !== (side === 'west' ? 1 : MAP.w - 2)) return `${map.seed}: spawn left mouth column (${tx})`;
+          if (!isPassable(map, tx, ty) || !Number.isFinite(field[idx(tx, ty)])) {
+            return `${map.seed}/${side}/${point}/${type}: invalid spawn at ${tx},${ty}`;
+          }
+          const probe = Math.min(e.def.radius, 0.3);
+          for (const [ox, oy] of [[probe, 0], [-probe, 0], [0, probe], [0, -probe]]) {
+            if (!isPassable(map, Math.floor(e.x + ox), Math.floor(e.y + oy))) {
+              return `${map.seed}/${side}/${point}/${type}: spawn probe overlaps invalid terrain`;
+            }
+          }
+          sampled++;
+        }
+      }
+    }
+    console.log(`Spawn audit: ${sampled} mouth spawns, 0 invalid`);
+    return null;
+  });
+});
+
 // --- occupancy is actually a large bonus -------------------------------------
 
 check('occupying a tower is a large, visible upgrade', () => {
@@ -1253,51 +1554,126 @@ check('timed upgrade keeps old stats until completion and refuses a second job',
   const old = towerStats(g, t);
   if (!tryUpgrade(g, t, 'weapon')) return 'first upgrade refused';
   if (tryUpgrade(g, t, 'extraction')) return 'second concurrent upgrade accepted';
-  if (t.wLevel !== 0 || !upgradeState(t)) return 'upgrade applied immediately or has no state';
+  const started = upgradeState(g, t);
+  if (t.wLevel !== 0 || !started) return 'upgrade applied immediately or has no state';
+  if (started.which !== 'weapon' || started.fromLevel !== 0 || started.toLevel !== 1
+      || started.duration !== 15 || Math.abs(started.remaining - 15) > 1e-9) {
+    return `upgrade state is incomplete: ${JSON.stringify(started)}`;
+  }
   update(g, TOWER.upgrade.buildTime[0] * 0.5);
   const mid = towerStats(g, t);
   if (t.wLevel !== 0 || mid.damage !== old.damage || mid.range !== old.range) return 'stats changed mid-upgrade';
   update(g, TOWER.upgrade.buildTime[0] * 0.5 + 0.01);
   const done = towerStats(g, t);
   if (t.wLevel !== 1 || upgradeState(t) !== null) return 'upgrade did not complete at its duration';
+  const completed = { damage: done.damage, range: done.range, level: t.wLevel };
+  update(g, 1);
+  if (t.wLevel !== completed.level || towerStats(g, t).damage !== completed.damage
+      || towerStats(g, t).range !== completed.range) return 'weapon upgrade applied more than once';
   return done.damage > old.damage && done.range > old.range ? null : 'completed weapon stats did not improve';
 });
 
-check('a tower keeps extracting and acquiring targets during an upgrade', () => {
+check('old weapon and extraction output persist during timed upgrades', () => {
   const g = createGame('UPGRADE-FUNCTION', 'gunner');
   g.map = syntheticMap(); g.materials = 99999; g.phaseLeft = 999;
   const t = g.towers[0];
   t.x = 30.5; t.y = 20.5; t.field = null; t.resourceScore = 1;
   g.player.x = 5.5; g.player.y = 5.5;
   const e = testEnemy(g, { x: t.x + 3, y: t.y }, null);
+  const old = towerStats(g, t);
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
   const before = g.materials;
   update(g, 0.5);
-  if (!(g.materials > before)) return 'extraction stopped during upgrade';
+  const midWeapon = towerStats(g, t);
+  if (Math.abs((g.materials - before) - old.income * 0.5) > 1e-6) return 'old extraction output did not persist';
   if (t.targetId !== e.id) return 'tower did not acquire a target during upgrade';
-  return t.wLevel === 0 ? null : 'level changed before upgrade duration';
+  if (t.wLevel !== 0 || midWeapon.damage !== old.damage || midWeapon.range !== old.range) {
+    return 'old weapon output did not persist';
+  }
+  t.upgrade = null;
+  if (!tryUpgrade(g, t, 'extraction')) return 'extraction upgrade refused';
+  const extractionBefore = towerStats(g, t).income;
+  update(g, 0.5);
+  return t.eLevel === 0 && towerStats(g, t).income === extractionBefore
+    ? null : 'extraction level/output changed before completion';
 });
 
-check('upgrade speed matches unassisted, Gunner-present, and Engineer-present multipliers', () => {
-  const measure = (arch, present) => {
-    const g = createGame(`UPGRADE-${arch}-${present}`, arch);
+check('weapon and extraction completion each apply exactly once', () => {
+  for (const which of ['weapon', 'extraction']) {
+    const g = createGame(`UPGRADE-ONCE-${which}`, 'gunner');
     g.materials = 99999; g.phaseLeft = 999;
     const t = g.towers[0];
-    g.player.x = present ? t.x : t.x + PLAYER.presenceRadius + 5;
-    g.player.y = t.y;
-    if (!tryUpgrade(g, t, 'weapon')) return Infinity;
-    let elapsed = 0;
-    while (t.wLevel === 0 && elapsed < 20) { update(g, 0.02); elapsed += 0.02; }
-    return elapsed;
+    g.player.x = t.x + PLAYER.presenceRadius + 5;
+    const old = towerStats(g, t);
+    if (!tryUpgrade(g, t, which)) return `${which} upgrade refused`;
+    update(g, TOWER.upgrade.buildTime[0] + 0.01);
+    const completed = towerStats(g, t);
+    const level = which === 'weapon' ? t.wLevel : t.eLevel;
+    if (level !== 1) return `${which} did not increment exactly once`;
+    if (which === 'weapon' && !(completed.damage > old.damage && completed.range > old.range)) {
+      return 'weapon stats did not apply';
+    }
+    if (which === 'extraction' && !(completed.income > old.income)) return 'extraction income did not apply';
+    update(g, 2);
+    if ((which === 'weapon' ? t.wLevel : t.eLevel) !== 1) return `${which} incremented again`;
+  }
+  return null;
+});
+
+check('upgrade durations use x1 except for an occupying Engineer', () => {
+  const measure = (arch, occupied) => {
+    const g = createGame(`UPGRADE-DUR-${arch}-${occupied}`, arch);
+    g.materials = 99999; g.phaseLeft = 9999;
+    const t = g.towers[0];
+    if (occupied) {
+      if (!occupy(g, t)) return { error: 'could not occupy tower' };
+    } else {
+      g.player.x = t.x + PLAYER.presenceRadius + 5;
+      g.player.y = t.y;
+      update(g, 0);
+    }
+    const times = [];
+    for (let level = 0; level < 3; level++) {
+      if (!tryUpgrade(g, t, 'weapon')) return { error: `level ${level + 1} refused` };
+      let elapsed = 0;
+      while (t.wLevel === level && elapsed < 50) { update(g, 0.02); elapsed += 0.02; }
+      times.push(elapsed);
+    }
+    return { times };
   };
-  const away = measure('gunner', false);
-  const gunner = measure('gunner', true);
-  const engineer = measure('engineer', true);
-  const duration = TOWER.upgrade.buildTime[0];
-  if (Math.abs(away - duration) > 0.021) return `unassisted completed in ${away.toFixed(2)}s`;
-  if (Math.abs(gunner - duration / 2.5) > 0.021) return `present Gunner completed in ${gunner.toFixed(2)}s`;
-  return Math.abs(engineer - duration / 3.6) <= 0.021
-    ? null : `present Engineer completed in ${engineer.toFixed(2)}s`;
+  for (const [arch, occupied, divisor] of [
+    ['gunner', false, 1], ['engineer', false, 1], ['gunner', true, 1], ['engineer', true, 3.6],
+  ]) {
+    const result = measure(arch, occupied);
+    if (result.error) return result.error;
+    for (let i = 0; i < 3; i++) {
+      const expected = TOWER.upgrade.buildTime[i] / divisor;
+      if (Math.abs(result.times[i] - expected) > 0.021) {
+        return `${arch}/${occupied ? 'occupied' : 'away'} L${i + 1} took ${result.times[i].toFixed(2)}s, expected ${expected.toFixed(2)}s`;
+      }
+    }
+  }
+  return null;
+});
+
+check('an Engineer leaving mid-upgrade continues at x1 with blended timing', () => {
+  const g = createGame('UPGRADE-LEAVE', 'engineer');
+  g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  if (!occupy(g, t) || upgradeRateMult(g, t) !== 3.6) return 'Engineer did not occupy at x3.6';
+  if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
+  update(g, 2);
+  const accelerated = t.upgrade.progress;
+  g.player.x = t.x + PLAYER.presenceRadius + 2;
+  update(g, 0.01);
+  if (g.occupiedTowerId !== null || upgradeRateMult(g, t) !== 1) return 'leaving did not drop upgrade rate to x1';
+  const afterLeave = t.upgrade.progress;
+  if (Math.abs((afterLeave - accelerated) - 0.01 / 15) > 1e-6) return 'progress did not continue at x1';
+  let after = 0.01;
+  while (t.wLevel === 0 && after < 20) { update(g, 0.02); after += 0.02; }
+  const total = 2 + after;
+  return Math.abs(total - (2 + (15 - 2 * 3.6))) <= 0.031
+    ? null : `blended completion took ${total.toFixed(2)}s`;
 });
 
 check('destroying a tower loses its upgrade job without a refund', () => {
@@ -1310,6 +1686,21 @@ check('destroying a tower loses its upgrade job without a refund', () => {
   update(g, TOWER.upgrade.buildTime[0] + 1);
   if (g.towers.includes(t) || t.wLevel !== 0) return 'destroyed tower survived or completed upgrade';
   return g.materials === paid ? null : `materials changed after destruction (${paid} -> ${g.materials})`;
+});
+
+check('pausing freezes an upgrade already in progress', () => {
+  const g = createGame('UPGRADE-PAUSE', 'engineer');
+  g.materials = 99999; g.phaseLeft = 999;
+  const t = g.towers[0];
+  if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
+  update(g, 1);
+  const before = t.upgrade.progress;
+  setPaused(g, true);
+  update(g, 20);
+  if (t.upgrade.progress !== before) return 'paused update advanced upgrade progress';
+  setPaused(g, false);
+  update(g, 1);
+  return t.upgrade.progress > before ? null : 'upgrade did not resume';
 });
 
 check('tower alarm fires for unseen damage but not visible damage', () => {
@@ -1527,6 +1918,79 @@ check('shelter grants occupancy only after the transition delay', () => {
   g.player.x += PLAYER.presenceRadius + 1;
   update(g, 0.01);
   if (g.occupiedTowerId !== null || g.shelter.progress !== 0) return 'leaving did not reset shelter';
+  return null;
+});
+
+// --- D63 dense-wave instrumentation -----------------------------------------
+
+check('dense waves 3-8 report stuck counters without last-resort despawns', () => {
+  const rows = [];
+  let measuredMs = 0;
+  let measuredFrames = 0;
+  for (const seed of SEEDS.slice(0, 8)) {
+    const result = withSeededRandom(`DENSE-${seed}`, () => {
+      const g = createGame(seed, 'engineer');
+      const t = g.towers[0];
+      t.hp = t.maxHp = 1e9; t.shotCd = 1e9; t.resourceScore = 0;
+      g.player.hp = g.player.maxHp = 1e9;
+      for (let wave = 3; wave <= 8; wave++) {
+        const sheltered = wave % 2 === 1;
+        g.wave = wave; g.status = 'playing'; g.phase = 'combat'; g.combatT = 0; g.phaseLeft = 0;
+        g.enemies = [];
+        if (sheltered) {
+          g.player.x = t.x; g.player.y = t.y;
+          g.shelter = { towerId: t.id, progress: PLAYER.shelterTime, required: PLAYER.shelterTime };
+          g.occupiedTowerId = t.id;
+        } else {
+          const exposed = walkableNear(g, t.x, t.y, PLAYER.presenceRadius + 2, false);
+          if (!exposed) return { error: `${seed} wave ${wave} has no exposed walkable player position` };
+          g.player.x = exposed.x; g.player.y = exposed.y;
+          g.shelter = { towerId: null, progress: 0, required: PLAYER.shelterTime };
+          g.occupiedTowerId = null;
+        }
+        g.pendingSpawns = Array.from({ length: 18 }, (_, n) => ({
+          type: n % 3 === 0 ? 'heavy' : n % 3 === 1 ? 'runner' : 'swarm',
+          side: n % 2 ? 'west' : 'east', point: n, at: 0,
+        }));
+        const started = performance.now();
+        // 36 simulated seconds lets even a Heavy traverse a half-map and
+        // encounter authored crossings; 0.1 s steps keep this diagnostic cheap.
+        for (let frame = 0; frame < 36 * 10 && g.status === 'playing'; frame++) {
+          if (!sheltered) {
+            const quadrant = Math.floor(frame / 25) % 4;
+            g.input = { mx: [1, 0, -1, 0][quadrant], my: [0, 1, 0, -1][quadrant], melee: false, repair: false };
+          } else {
+            g.input = { mx: 0, my: 0, melee: false, repair: false };
+          }
+          update(g, 1 / 10);
+          measuredFrames++;
+        }
+        measuredMs += performance.now() - started;
+        if (g.status !== 'playing') return { error: `${seed} wave ${wave} ended the run` };
+        if (stuckState(g).despawns) {
+          const tail = g.debug.stuckEpisodes.slice(-12).map((episode) => ({
+            stage: episode.stage, time: Number(episode.time.toFixed(1)),
+            x: Number(episode.x.toFixed(2)), y: Number(episode.y.toFixed(2)),
+            tileKind: episode.tileKind, fieldFinite: episode.fieldFinite,
+            source: episode.source, target: episode.target,
+          }));
+          return { error: `${seed} wave ${wave} produced a stuck despawn: ${JSON.stringify(tail)}` };
+        }
+        g.enemies = []; g.pendingSpawns = [];
+      }
+      const causes = {};
+      for (const episode of g.debug.stuckEpisodes) {
+        const key = `${episode.stage}:${episode.source}`;
+        causes[key] = (causes[key] || 0) + 1;
+      }
+      return { state: stuckState(g), causes };
+    });
+    if (result.error) return result.error;
+    const causes = Object.entries(result.causes).map(([key, count]) => `${key}=${count}`).join(',') || 'none';
+    rows.push(`${seed} ${result.state.detections}/${result.state.recoveries}/${result.state.despawns} [${causes}]`);
+  }
+  console.log(`Dense stuck d/r/x: ${rows.join('; ')}`);
+  console.log(`Dense enemy update (tracking included): ${(measuredMs / measuredFrames).toFixed(4)} ms/frame`);
   return null;
 });
 

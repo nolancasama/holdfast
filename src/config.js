@@ -186,7 +186,7 @@ export const TOWER = {
 
   upgrade: {
     maxLevel: 3,
-    buildTime: [6, 9, 13],
+    buildTime: [15, 25, 40],
     weaponCost: [140, 230, 360],
     extractionCost: [120, 200, 320],
     weaponDamagePerLevel: 0.45,   // +45% damage per level
@@ -265,6 +265,14 @@ export const ENEMY = {
   // pursuer cuts the corner - without a leash, an aura or a speed buff.
   pursuitLeadTime: 1.15,     // seconds of lead, capped by time-to-intercept
   pursuitLeadRange: 12,      // only lead when close enough to actually cut in
+};
+
+export const STUCK = {
+  detectAfter: 3.0,
+  minProgress: 0.75,
+  searchRadius: 6,
+  despawnAfter: 9.0,
+  maxRecoveries: 3,
 };
 
 // D5: aggro moves as a rolling commitment, never a synchronized 180.

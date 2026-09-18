@@ -3,7 +3,7 @@
 import { ARCHETYPES, TOWER, WAVE, TILE_NAME, DROP } from './config.js';
 import {
   towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState,
-  upgradeState, towerAlarmState,
+  upgradeState, upgradeRateMult, towerAlarmState, stuckState,
 } from './game.js';
 
 export const $ = (id) => document.getElementById(id);
@@ -101,7 +101,7 @@ export function updateHud(g) {
   $('sel-body').hidden = !sel;
   if (sel) {
     const s = towerStats(g, sel);
-    const upgrading = upgradeState(sel);
+    const upgrading = upgradeState(g, sel);
     const alarm = towerAlarmState(g).find((state) => state.id === sel.id)?.active;
     const frac = sel.hp / sel.maxHp;
     const collapsing = sel.built && frac < TOWER.collapsingAt;
@@ -114,8 +114,13 @@ export function updateHud(g) {
     const upgradeEl = $('sel-upgrade');
     upgradeEl.hidden = !upgrading;
     if (upgrading) {
+      const name = upgrading.which === 'weapon' ? 'Weapon' : 'Extraction';
       const kind = upgrading.which === 'weapon' ? 'W' : 'E';
-      upgradeEl.textContent = `UPGRADING ${kind}${upgrading.toLevel} ${(upgrading.progress * 100).toFixed(0)}%`;
+      $('sel-upgrade-label').textContent = `${name} ${kind}${upgrading.fromLevel} -> ${kind}${upgrading.toLevel}`;
+      $('sel-upgrade-time').textContent = `${upgrading.remaining.toFixed(1)}s`;
+      $('sel-upgrade-bar').style.width = `${upgrading.progress * 100}%`;
+      const rate = upgradeRateMult(g, sel);
+      $('sel-upgrade-rate').textContent = rate > 1 ? `Engineer x${rate.toFixed(1)}` : '';
     }
     $('sel-hp').textContent = `${Math.round(sel.hp)} / ${sel.maxHp}`;
     $('sel-hpbar').style.width = `${frac * 100}%`;
@@ -160,6 +165,8 @@ export function updateHud(g) {
   }
 
   $('d-fog').textContent = g.debug.showFog ? 'Hide fog debug [V]' : 'Show fog debug [V]';
+  const stuck = stuckState(g);
+  $('d-stuck').textContent = `Stuck: ${stuck.detections} detected / ${stuck.recoveries} recovered / ${stuck.despawns} despawned`;
 
   // --- log ---
   if (g.log.length !== lastLogLen) {
@@ -204,11 +211,13 @@ export function updateMapInfo(g) {
 
 export function showEnd(g) {
   const won = g.status === 'won';
-  $('end-title').textContent = won ? 'Line held' : 'Run over';
+  $('end-title').textContent = won ? 'Line held' : g.lossCause === 'towers' ? 'Position lost' : 'You died';
   $('end-title').style.color = won ? 'var(--green)' : 'var(--red)';
   $('end-sub').textContent = won
     ? `You survived all ${WAVE.totalToSurvive} waves as the ${g.arch.name}.`
-    : `Killed on wave ${g.wave} as the ${g.arch.name}. Towers are expendable. You were not.`;
+    : g.lossCause === 'towers'
+      ? `Every tower was destroyed on wave ${g.wave} as the ${g.arch.name}.`
+      : `Killed on wave ${g.wave} as the ${g.arch.name}. Towers are expendable. You were not.`;
   $('end-stats').innerHTML = [
     ['Waves cleared', g.stats.wavesCleared],
     ['Enemies killed', g.stats.kills],

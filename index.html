@@ -224,7 +224,11 @@
         <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
         <div class="row"><span>Range</span><span id="sel-range">—</span></div>
         <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
-        <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:4px" hidden></div>
+        <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:4px" hidden>
+          <div class="row"><span id="sel-upgrade-label"></span><span id="sel-upgrade-time"></span></div>
+          <div class="bar"><i id="sel-upgrade-bar" style="background:var(--blue)"></i></div>
+          <div id="sel-upgrade-rate" style="text-align:right"></div>
+        </div>
         <button id="up-weapon">[1] Weapon upgrade<span class="cost"></span></button>
         <button id="up-extract">[2] Extraction upgrade<span class="cost"></span></button>
         <div class="row" style="margin-top:6px"><span>Repair cost</span><span id="sel-repair">—</span></div>
@@ -271,6 +275,7 @@
           <b>J</b> destroy · <b>H</b> paths · <b>V</b> fog · <b>L</b> pause spawns · <b>O</b> regen
         </div>
         <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>
+        <div class="keys" id="d-stuck" style="margin-top:4px">Stuck: 0 detected / 0 recovered / 0 despawned</div>
       </div>
     </div>
   </div>

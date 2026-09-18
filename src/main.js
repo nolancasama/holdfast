@@ -8,7 +8,7 @@ import {
   towerStats, dangerState, setPaused, pauseState, equipmentState, depositRichness,
   drainAudioEvents, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState,
-  upgradeState, towerAlarmState,
+  upgradeState, towerAlarmState, stuckState, endState,
 } from './game.js';
 import { createAudioSystem } from './audio.js';
 import {
@@ -279,7 +279,9 @@ window.holdfast = {
   api: {
     canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt, forceNextWave, dangerState,
     playerBuildSite, isTileVisible, isTileExplored, isPointVisible, visibilityState,
-    upgradeState, towerAlarmState,
+    upgradeState: (...args) => args.length > 1
+      ? upgradeState(args[0], args[1]) : upgradeState(game, args[0]),
+    towerAlarmState, stuckState, endState,
     pauseState, setPaused: (paused) => {
       const state = setPaused(game, paused);
       if (state) audio.suspendForPause(); else audio.resumeAfterPause();

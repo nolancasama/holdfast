@@ -1,13 +1,48 @@
 # Current State
 
-Last updated: 2026-09-18 (fog, local construction and timed upgrades pass)
+Last updated: 2026-09-19 (resumed long-upgrade, stuck-recovery and tower-loss pass)
+
+## D62–D64 pass — REVIEWED, ACCEPTED AND COMMITTED
+
+Long upgrades (D62), stuck-enemy recovery (D63) and tower-loss defeat (D64)
+were finished by Codex on 2026-09-19 after the usage-limit stop, reviewed by
+the controller, accepted in the browser and committed on `master` (the previous
+commit is `9f7b2e2`; push to GitHub Pages pending the user). It touched `src/game.js`,
+`src/config.js`, `src/main.js`, `src/ui.js`, `index.html`, `test/run-tests.js`,
+`CURRENT_STATE.md`, `DESIGN_DECISIONS.md`. `npm test`: 97 passed, 0 failed.
+
+Controller browser acceptance (1600x900, no console or page errors):
+
+- **Upgrade timing, W0->W1:** Gunner occupied / unoccupied / leaving halfway
+  15.0s each; Engineer unoccupied 15.0s, occupied 4.17s, leaving at 50% 9.6s
+  (expected 2.08 + 7.5). The side panel reads `Weapon W0 -> W1`, blue progress
+  bar, remaining seconds and `Engineer x3.6`; the rate note and the faster
+  countdown disappear as soon as the Engineer leaves.
+- **Dense waves 3-8** (CHARLIE, GOLF, KILO, R7KD2P; sheltered and exposed waves
+  alternating, player made unkillable): waves 3-7 all ended normally with 0
+  enemies left. Detections/recoveries/despawns 12/12/0, 18/18/0, 33/32/1,
+  29/29/0. The single KILO despawn did not reproduce on a rerun. Wave 8 exposed
+  with one unupgraded tower did not finish in 300s, but all 35 remaining enemies
+  were chasing the circling player inside tower range and moving 5-9 tiles per
+  5s - a harness artifact (unkillable player), not a stall.
+- **Defeat:** last finished tower destroyed with a construction site standing ->
+  still playing; site then destroyed -> `lost/'towers'`; last tower at 1 HP
+  (COLLAPSING) -> playing; last tower destroyed with no site -> `lost/'towers'`,
+  end screen "Position lost / Every tower was destroyed on wave 1 as the
+  Engineer."; player HP to 0 with towers standing -> `lost/'died'`, "You died".
+- Review notes: a player-hunting enemy's progress episode restarts whenever the
+  player changes tile, so a stuck enemy chasing a constantly moving player
+  relies on the older 1.5s nudge rather than the 3s recovery. `spawnEnemy`
+  now drops an enemy silently if no authored mouth tile on its side is passable
+  with a finite field (never observed).
 
 ## What this is
 
 `holdfast` is a playable 2D top-down tower-defense/survival prototype. The
 current loop is: read the generated terrain and road network, build towers
 beside the lanes, shelter in a tower during combat, and survive eight waves.
-Victory is surviving the final wave; only player death ends the run in defeat.
+Victory is surviving the final wave; defeat follows player death or destruction
+of the entire tower network.
 
 ## Implemented state
 
@@ -26,8 +61,10 @@ Victory is surviving the final wave; only player death ends the run in defeat.
   fords and never cross impassable terrain.
 - Tower-target flow fields use `lane` cost, which discounts roads. The player
   pursuit field uses `direct` cost and ignores the road bitfield. Tower fields
-  remain lazily cached, and the existing narrow-pass collision probe and stuck
-  nudge remain active.
+  remain lazily cached. The existing 1.5s narrow-pass nudge remains first;
+  field-progress detection now confirms after 3s without a 0.75-unit gain,
+  performs radius-clear BFS recovery (local radius 6, then a wider fallback),
+  and silently despawns only after 9s from first detection or three recoveries.
 - The camera, minimap and edge markers are gone. Resize computes an integer tile
   scale that fits the complete map and centres it with letterboxing. Towers,
   player, enemies, health bars and labels have minimum screen sizes.
@@ -37,11 +74,21 @@ Victory is surviving the final wave; only player death ends the run in defeat.
   starting tower is kept beside the central junction and generation verifies
   its footprint is road-free. Unfinished construction continues unassisted when
   the player leaves, with the existing presence multiplier when nearby.
-- Weapon and extraction upgrades are timed jobs (6/9/13 seconds unassisted for
-  levels 1/2/3). A tower keeps its old combat and extraction stats while the job
-  runs; presence applies the same x2.5 construction multiplier (x3.6 Engineer).
-  Only one upgrade job can run per tower, and destruction loses it without a
-  refund.
+- Weapon and extraction upgrades are timed jobs with
+  `{which,toLevel,progress,duration}` state and 15/25/40 second base durations
+  for levels 1/2/3. A tower keeps its old combat and extraction stats while the
+  job runs. Only an Engineer occupying that exact tower accelerates it (x3.6:
+  4.17/6.94/11.11s); every unoccupied tower and every other archetype runs at
+  x1. New-tower construction keeps its separate proximity rule unchanged. Only
+  one job runs per tower, and destruction loses it without a refund.
+- Enemy mouth spawns are constrained to a passable authored mouth with a finite
+  target field. Progress tracking uses the exact tower-lane/player-lane/direct
+  field selected for steering, excludes sieging and attack-reach states, and
+  records compact diagnostic snapshots for nudges and confirmations. Recovery
+  destinations prefer road at equal range and require a Heavy-clear 3x3.
+- End state is resolved once, at the end of each simulation step. Player death
+  has priority; otherwise zero towers means `lost/'towers'`. Unfinished and
+  positive-HP COLLAPSING towers count. Terminal updates advance FX only.
 - Shelter takes 0.7 seconds of continuous presence in a built tower. Occupancy
   bonuses and melee immunity begin only when that timer completes; leaving
   immediately resets shelter.
@@ -62,8 +109,10 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 - `window.holdfast` retains `game`, `start()`, `errors`, `fastForward()` and all
   prior `api` methods. New read-only acceptance surfaces are
   `isTileVisible`, `isTileExplored`, `isPointVisible`, `visibilityState`,
-  `playerBuildSite`, `upgradeState`, and `towerAlarmState`; `dangerState(game)`
-  exposes both `hunters` and `visibleHunters`.
+  `playerBuildSite`, `upgradeState`, `towerAlarmState`, `stuckState`, and
+  `endState`; `dangerState(game)` exposes both `hunters` and `visibleHunters`.
+  `upgradeState(game,tower)` adds from/to levels, duration, and rate-adjusted
+  remaining time while the browser API preserves `upgradeState(tower)`.
 - Pause is available from the HUD and P. The normal simulation boundary freezes
   movement, combat, spawning and phase clocks, construction, extraction,
   repairs, drop/effect expiry and FX. Build, upgrade and collection functions
@@ -106,7 +155,7 @@ Victory is surviving the final wave; only player death ends the run in defeat.
 
 ## Automated verification
 
-`npm test` runs 80 headless checks. It covers 20 deterministic seeds,
+`npm test` runs 97 checks. It covers 20 deterministic seeds,
 terrain validation, road connectivity and legality, seed variation, lane/direct
 field behavior, road placement refusal, ford use and generated route character,
 road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
@@ -114,12 +163,43 @@ road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
 thresholds, pause freezing and action refusal, equipment uniqueness/cap,
 collapse, D53 aggro (A-E), economy, escalation and a long simulation. It now
 also covers fog persistence/LOS, enemy hiding, built/unfinished tower vision,
-resource discovery, local and unassisted construction, upgrade timing and
-function, alarms, visibility performance, and five-seed prep scouting. Controller
-run 2026-09-18: 80 passed, 0 failed. The wall-clock road-analysis budget (400ms)
-is flaky under load: one worker run saw ALPHA at 734ms; no road code changed.
+resource discovery, local and unassisted construction, exact three-level upgrade
+timing/function/pause/destruction, alarms, visibility performance, and five-seed
+prep scouting. It now also covers cliff recovery and resumed progress, silent
+unreachable despawn, siege/crowd exclusions, Heavy clearance, mouth-spawn validity,
+waves 3-8 dense diagnostics on eight seeds, all tower-loss/death priority cases,
+and terminal-state freezing. Resumed-run result: **97 passed, 0 failed**. The
+wall-clock road-analysis budget (400ms) remains load-sensitive; no road code
+changed.
 `npm run road-report` prints per-seed features,
 efficiency, knots, readability defects, entry roads and attempts.
+
+## Stuck diagnosis and measurements — 2026-09-19
+
+- Root causes: unchecked mouth scatter could enter adjacent invalid terrain;
+  even centre-in-tile jitter could put a collision probe into adjacent cliff or
+  deep water; embedded terrain produced zero expected speed so the old strict
+  nudge test never accumulated; and non-finite fields fell through to direct
+  steering against a wall while the local nudge had no finite neighbour. A
+  moving player's replacement fields were also being compared as one metric,
+  causing one false last-resort despawn on CHARLIE wave 6 before the goal-tile
+  key/reset fix and zero after. Separation remained collision-checked. D52
+  spines are revalidated after stamping and were not an unchecked mutation.
+- Before/after cause fixtures: embedded cliff 1 permanent episode -> 1
+  detection, 1 recovery, 0 despawns; isolated non-finite pocket 1 permanent
+  episode -> 4 confirmations, 0 recoveries, 1 silent despawn; moving-target
+  field mismatch 1 false dense-wave despawn -> 0 after the field-key fix.
+  Unchecked scatter was structural but did not reproduce across the 43 canonical
+  mouths; the runtime audit sampled 387 spawns with 0 invalid centres or probes.
+- Dense waves 3–8, alternating sheltered and exposed/moving play, reported
+  detections/recoveries/despawns: ALPHA 17/17/0; BRAVO 17/17/0; CHARLIE 9/9/0;
+  DELTA 16/16/0; ECHO 16/16/0; FOXTROT 6/6/0; GOLF 24/24/0; HOTEL 16/16/0.
+  Instrumentation recorded 507 two-second no-progress snapshots, 25 legacy
+  nudges and 121 recoveries: recovery sources were 114 steering+separation,
+  5 separation-push and 2 steering-only episodes.
+- Tracking-inclusive dense enemy updates measured 0.5676ms/frame. This is a
+  conservative upper bound for stuck tracking because it also includes
+  steering, collision and O(N²) crowd separation for the same 18-enemy frames.
 
 ## Fog and expansion measurements — 2026-09-18
 
@@ -305,8 +385,10 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 8. **Fog pass open questions (2026-09-18).** (a) Unfinished and unoccupied
    towers are not enemy targets (D53), so a construction site is only attacked
    by enemies already committed to it; the "leave an unfinished tower" tension
-   is weaker than the plan assumed. (b) Attended upgrades are short (L3 5.2s,
-   Engineer 3.6s), so the "start now or wait" choice mostly bites when away.
+   is weaker than the plan assumed. (b) Upgrades now take 15/25/40s at x1;
+   only an occupying Engineer gets x3.6 (4.17/6.94/11.11s). The timings are
+   verified in the browser; whether they create the intended timing commitment
+   is a feel question for hand play.
    (c) A road-following scout reveals 28-45% of the map in the first prep;
    vision 8 may be generous. (d) Upgrades can still be bought for a remote
    tower; only new construction is local. (e) Positional audio (tower hits,
@@ -315,6 +397,7 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 
 ## Next steps
 
+0. Push the D62-D64 commit to `origin/master` (GitHub Pages) if not yet pushed.
 1. Play it by hand, with sound on. The unanswered questions are all about feel,
    and now also whether the hairpin tower sites feel worth taking, whether
    exploring the dark is interesting, and the fog-pass questions in risk 8.

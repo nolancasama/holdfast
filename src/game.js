@@ -3,7 +3,7 @@
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY, AGGRO,
   WAVE, START_MATERIALS, DROP, ELEVATION_NAMES, richnessTierForRate, AUDIO,
-  BUILD, VISION,
+  BUILD, VISION, STUCK,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -26,6 +26,7 @@ export function createGame(seedString, archetypeKey) {
     seed, map, arch, archetypeKey,
     time: 0,
     status: 'playing',
+    lossCause: null,
     paused: false,
     materials: START_MATERIALS,
     phase: 'prep',
@@ -49,8 +50,11 @@ export function createGame(seedString, archetypeKey) {
     input: { mx: 0, my: 0, melee: false, repair: false },
     playerField: null, playerFieldAt: -99, playerLaneField: null, playerLaneFieldAt: -99,
     log: [], audioEvents: [],
-    stats: { kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0 },
-    debug: { showPaths: false, showFog: false, spawnPaused: false, open: false },
+    stats: {
+      kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0,
+      stuckDetections: 0, stuckRecoveries: 0, stuckDespawns: 0,
+    },
+    debug: { showPaths: false, showFog: false, spawnPaused: false, open: false, stuckEpisodes: [] },
     fog: {
       explored: new Uint8Array(MAP.w * MAP.h),
       visible: new Uint8Array(MAP.w * MAP.h),
@@ -318,6 +322,10 @@ export function constructionRateMult(g, t) {
   return dist(g.player, t) <= PLAYER.presenceRadius ? occupancyMults(g).construction : 1;
 }
 
+export function upgradeRateMult(g, t) {
+  return g.occupiedTowerId === t.id ? (g.arch.occupancy.construction ?? 1) : 1;
+}
+
 export function towerStats(g, t) {
   const occupied = g.occupiedTowerId === t.id;
   const m = occupied ? occupancyMults(g) : { damage: 1, fireRate: 1, extraction: 1, damageTaken: 1 };
@@ -357,10 +365,20 @@ export function tryUpgrade(g, t, which) {
   return true;
 }
 
-export function upgradeState(t) {
+export function upgradeState(gOrTower, maybeTower) {
+  const g = maybeTower ? gOrTower : null;
+  const t = maybeTower || gOrTower;
   if (!t.upgrade) return null;
-  const { which, toLevel, progress } = t.upgrade;
-  return { which, toLevel, progress };
+  const { which, toLevel, progress, duration } = t.upgrade;
+  const rate = g ? upgradeRateMult(g, t) : 1;
+  return {
+    which,
+    fromLevel: toLevel - 1,
+    toLevel,
+    progress,
+    duration,
+    remaining: duration * (1 - progress) / rate,
+  };
 }
 
 export function repairCostPerHp(g) {
@@ -381,6 +399,7 @@ const clampTy = (y) => clamp(Math.floor(y), 0, MAP.h - 1);
 
 function destroyTower(g, t) {
   emitAudioEvent(g, 'towerDestroy', t);
+  g.lastTowerDestroyAt = g.time;
   t.upgrade = null;
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
@@ -499,11 +518,6 @@ function updatePlayer(g, dt) {
     burst(g, p.x + p.facing.x, p.y + p.facing.y, hit ? '#ffffff' : '#666c78', 6, 3);
   }
 
-  if (p.hp <= 0 && g.status === 'playing') {
-    g.status = 'lost';
-    emitAudioEvent(g, 'playerDeath', p);
-    say(g, 'You died. Run over.');
-  }
 }
 
 /**
@@ -551,7 +565,7 @@ function updateTowers(g, dt) {
 
     if (t.upgrade) {
       t.upgrade.progress = Math.min(1, t.upgrade.progress
-        + dt * constructionRateMult(g, t) / t.upgrade.duration);
+        + dt * upgradeRateMult(g, t) / t.upgrade.duration);
       if (t.upgrade.progress >= 1) {
         const { which, toLevel } = t.upgrade;
         if (which === 'weapon') t.wLevel = toLevel;
@@ -640,14 +654,37 @@ function spawnEnemy(g, typeKey, side, pointSeed) {
   const hpScale = 1 + WAVE.hpScalePerWave * (g.wave - 1);
   const e = {
     id: g.nextEnemyId++, type: typeKey, def, side,
-    x: p.x + 0.5 + (Math.random() - 0.5), y: p.y + 0.5 + (Math.random() - 0.5) * 2,
+    x: p.x + 0.5, y: p.y + 0.5,
     hp: def.hp * hpScale, maxHp: def.hp * hpScale,
     targetId: null, sieging: false, siegeAngle: 0,
     retargetIn: AGGRO.retargetMin + Math.random() * (AGGRO.retargetMax - AGGRO.retargetMin),
-    hitCd: 0, flash: 0,
+    hitCd: 0, flash: 0, stuckOrigin: 'spawn',
   };
+  retarget(g, e);
+  const target = enemyTargetField(g, e);
+  const spawn = validSpawnPosition(g, e, p, target?.field);
+  if (!spawn) return null;
+  e.x = spawn.x;
+  e.y = spawn.y;
   g.enemies.push(e);
   return e;
+}
+
+/** Keep a spawn in its authored mouth column and on terrain connected to its target. */
+function validSpawnPosition(g, e, mouth, field) {
+  const authored = e.side === 'west' ? g.map.spawns.west : g.map.spawns.east;
+  for (const candidate of [mouth, ...authored.filter((p) => p !== mouth)]) {
+    const ti = idx(candidate.x, candidate.y);
+    if (!isPassable(g.map, candidate.x, candidate.y) || !Number.isFinite(field?.[ti])) continue;
+    // Keep every collision probe inside the validated mouth tile. A centre can
+    // be on valid terrain while a +/-0.3 probe overlaps the cliff next to it.
+    const jitter = 0.18;
+    return {
+      x: candidate.x + 0.5 + (Math.random() - 0.5) * jitter * 2,
+      y: candidate.y + 0.5 + (Math.random() - 0.5) * jitter * 2,
+    };
+  }
+  return null;
 }
 
 export function spawnGroupAt(g, x, y, typeKey, count) {
@@ -657,7 +694,7 @@ export function spawnGroupAt(g, x, y, typeKey, count) {
       id: g.nextEnemyId++, type: typeKey, def, side: 'debug',
       x: x + (Math.random() - 0.5) * 3, y: y + (Math.random() - 0.5) * 3,
       hp: def.hp, maxHp: def.hp, targetId: null, sieging: false, siegeAngle: 0,
-      retargetIn: Math.random() * 2, hitCd: 0, flash: 0,
+      retargetIn: Math.random() * 2, hitCd: 0, flash: 0, stuckOrigin: 'spawn',
     });
   }
 }
@@ -724,6 +761,27 @@ function playerField(g) {
   return g.playerField;
 }
 
+function fieldValueAt(field, x, y) {
+  const tx = Math.floor(x);
+  const ty = Math.floor(y);
+  return field && inBounds(tx, ty) ? field[idx(tx, ty)] : Infinity;
+}
+
+function enemyTargetField(g, e, resolved = null, directPursuit = null) {
+  resolved ||= g.towers.find((t) => t.id === e.targetId) || null;
+  if (resolved) return { field: towerField(g, resolved), key: `tower:${resolved.id}` };
+  if (e.targetId !== PLAYER_TARGET_ID || g.occupiedTowerId !== null) return null;
+  const direct = directPursuit ?? dist(e, g.player) <= AGGRO.directPursuitRange;
+  return direct
+    ? { field: playerField(g), key: 'player:direct' }
+    : { field: playerLaneField(g), key: 'player:lane' };
+}
+
+function safeNormTo(g, from, to, field) {
+  return Number.isFinite(fieldValueAt(field, from.x, from.y))
+    && hasClearWalk(g.map, from.x, from.y, to.x, to.y) ? normTo(from, to) : null;
+}
+
 function updateEnemies(g, dt) {
   const p = g.player;
 
@@ -768,7 +826,10 @@ function updateEnemies(g, dt) {
     }
     const huntingPlayer = e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null;
     const directPursuit = huntingPlayer && dPlayer <= AGGRO.directPursuitRange;
+    const playerGoalKey = `${clampTx(p.x)},${clampTy(p.y)}`;
     let aim = null;
+    let motionField = null;
+    let motionFieldKey = null;
     let reach = 0;
 
     if (resolved) {
@@ -809,13 +870,24 @@ function updateEnemies(g, dt) {
         aim = l > 0.08 ? { x: aim.x / l, y: aim.y / l } : null;
       } else {
         e.sieging = false;
-        aim = steer(g.map, towerField(g, resolved), e.x, e.y);
-        if (!aim) aim = normTo(e, resolved);
+        motionField = towerField(g, resolved);
+        motionFieldKey = `tower:${resolved.id}`;
+        aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, resolved, motionField);
       }
     } else if (directPursuit) {
-      aim = interceptAim(g, e, p) || steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
+      motionField = playerField(g);
+      motionFieldKey = `player:direct:${playerGoalKey}`;
+      aim = interceptAim(g, e, p) || steer(g.map, motionField, e.x, e.y)
+        || safeNormTo(g, e, p, motionField);
     } else if (huntingPlayer) {
-      aim = steer(g.map, playerLaneField(g), e.x, e.y) || steer(g.map, playerField(g), e.x, e.y) || normTo(e, p);
+      motionField = playerLaneField(g);
+      motionFieldKey = `player:lane:${playerGoalKey}`;
+      aim = steer(g.map, motionField, e.x, e.y);
+      if (!aim) {
+        motionField = playerField(g);
+        motionFieldKey = `player:direct:${playerGoalKey}`;
+        aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, p, motionField);
+      }
     }
 
     // Separation keeps the crowd from collapsing into one dot.
@@ -833,13 +905,19 @@ function updateEnemies(g, dt) {
       sy += (dy / d) * (1 - d / rad);
     }
 
-    const speed = e.def.speed / Math.max(1, moveCostAt(g.map, Math.floor(e.x), Math.floor(e.y)));
+    const terrainCost = moveCostAt(g.map, Math.floor(e.x), Math.floor(e.y));
+    const speed = e.def.speed / Math.max(1, Number.isFinite(terrainCost) ? terrainCost : 1);
     const vx = (aim ? aim.x : 0) + sx * 1.6;
     const vy = (aim ? aim.y : 0) + sy * 1.6;
     const l = Math.hypot(vx, vy);
     const px = e.x;
     const py = e.y;
     if (l > 0.01) moveWithCollision(g, e, (vx / l) * speed * dt, (vy / l) * speed * dt, e.def.radius);
+    if (Math.hypot(e.x - px, e.y - py) > 1e-6) {
+      const separationStrength = Math.hypot(sx, sy) * 1.6;
+      e.stuckOrigin = separationStrength > (aim ? 1 : 0) ? 'separation push'
+        : separationStrength > 0.15 ? 'steering + separation' : 'steering';
+    }
 
     // Last-resort unstick. An enemy that cannot make progress and is not
     // besieging anything would otherwise hold the wave open forever.
@@ -848,12 +926,19 @@ function updateEnemies(g, dt) {
       if (e.stuck > 1.5 && (resolved || huntingPlayer)) {
         const field = resolved ? towerField(g, resolved) : directPursuit ? playerField(g) : playerLaneField(g);
         const nudge = bestNeighbourTile(g, field, e.x, e.y);
+        recordStuckEpisode(g, e, field, 'nudge', !!nudge);
         if (nudge) { e.x = nudge.x; e.y = nudge.y; }
         e.stuck = 0;
       }
     } else {
       e.stuck = 0;
     }
+
+
+    const inTowerReach = resolved && dist(e, resolved) <= reach;
+    const inPlayerReach = huntingPlayer && dPlayer <= ENEMY.playerAttackRange + e.def.radius;
+    if (trackEnemyProgress(g, e, motionField, motionFieldKey,
+      !!motionField && !e.sieging && !inTowerReach && !inPlayerReach)) continue;
   }
 }
 
@@ -873,6 +958,163 @@ function bestNeighbourTile(g, field, x, y) {
     }
   }
   return Number.isFinite(bestD) ? best : null;
+}
+
+function enemyFitsTile(g, e, tx, ty) {
+  if (!inBounds(tx, ty) || !isPassable(g.map, tx, ty)) return false;
+  if (e.def.radius <= 0.5) return true;
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      if (!inBounds(tx + ox, ty + oy) || !isPassable(g.map, tx + ox, ty + oy)) return false;
+    }
+  }
+  return true;
+}
+
+/** Breadth-first recovery, with road and lower-field tie breaks at equal range. */
+function recoveryTile(g, e, field, radius) {
+  const sx = clampTx(e.x);
+  const sy = clampTy(e.y);
+  const startValue = fieldValueAt(field, e.x, e.y);
+  const seen = new Uint8Array(MAP.w * MAP.h);
+  const queue = [{ x: sx, y: sy, d: 0 }];
+  seen[idx(sx, sy)] = 1;
+  let head = 0;
+  let best = null;
+  while (head < queue.length) {
+    const cur = queue[head++];
+    if (cur.d > radius) break;
+    if (cur.d > 0) {
+      const value = field[idx(cur.x, cur.y)];
+      if (Number.isFinite(value)
+          && (!Number.isFinite(startValue) || value <= startValue + 1e-6)
+          && enemyFitsTile(g, e, cur.x, cur.y)) {
+        const candidate = { x: cur.x + 0.5, y: cur.y + 0.5, d: cur.d,
+          road: !!g.map.road[idx(cur.x, cur.y)], value };
+        candidate.strict = !Number.isFinite(startValue) || candidate.value < startValue - 1e-6;
+        if (!best || candidate.d < best.d
+            || (candidate.d === best.d && candidate.strict && !best.strict)
+            || (candidate.d === best.d && candidate.strict === best.strict && candidate.road && !best.road)
+            || (candidate.d === best.d && candidate.strict === best.strict
+              && candidate.road === best.road && candidate.value < best.value)) {
+          best = candidate;
+        }
+      }
+    }
+    if (best && cur.d >= best.d) continue;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        if (!ox && !oy) continue;
+        const nx = cur.x + ox;
+        const ny = cur.y + oy;
+        if (!inBounds(nx, ny)) continue;
+        const ni = idx(nx, ny);
+        if (seen[ni]) continue;
+        seen[ni] = 1;
+        queue.push({ x: nx, y: ny, d: cur.d + 1 });
+      }
+    }
+  }
+  return best;
+}
+
+function clearProgressEpisode(e) {
+  e.fieldProgress = null;
+  e.stuckEpisodeAt = null;
+  e.stuckRecoveries = 0;
+}
+
+function recordStuckEpisode(g, e, field, stage, recovered) {
+  const tx = clampTx(e.x);
+  const ty = clampTy(e.y);
+  const neighbours = [];
+  for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+    if (!ox && !oy) continue;
+    const nx = tx + ox; const ny = ty + oy;
+    if (!inBounds(nx, ny)) continue;
+    const value = field?.[idx(nx, ny)];
+    neighbours.push({ dx: ox, dy: oy, kind: kindAt(g.map, nx, ny), finite: Number.isFinite(value) });
+  }
+  g.debug.stuckEpisodes ||= [];
+  if (g.debug.stuckEpisodes.length < 10000) g.debug.stuckEpisodes.push({
+    stage, time: g.time, enemyId: e.id, x: e.x, y: e.y, tileKind: kindAt(g.map, tx, ty), neighbours,
+    enemyType: e.type, radius: e.def.radius, target: e.targetId,
+    fieldFinite: Number.isFinite(fieldValueAt(field, e.x, e.y)),
+    source: e.stuckOrigin || 'steering', recovered,
+  });
+}
+
+/** Returns true when the enemy was silently removed. */
+function trackEnemyProgress(g, e, field, key, candidate) {
+  if (!candidate) {
+    clearProgressEpisode(e);
+    return false;
+  }
+  const value = fieldValueAt(field, e.x, e.y);
+  const targetKey = key?.startsWith('player:') ? 'player' : key;
+  let progress = e.fieldProgress;
+  if (!progress || progress.targetKey !== targetKey) {
+    e.fieldProgress = { key, targetKey, best: value, improvedAt: g.time, observed: false };
+    e.stuckEpisodeAt = null;
+    e.stuckRecoveries = 0;
+    return false;
+  }
+  if (progress.key !== key) {
+    e.fieldProgress = { key, targetKey, best: value, improvedAt: g.time, observed: false };
+    // A moving player changes the goal tile, and lane/direct switches replace
+    // the metric. Values from those fields are not comparable, so they begin a
+    // fresh episode rather than aging an enemy toward a false recovery/despawn.
+    e.stuckEpisodeAt = null;
+    e.stuckRecoveries = 0;
+    return false;
+  }
+  const improved = (!Number.isFinite(progress.best) && Number.isFinite(value))
+    || (Number.isFinite(value) && progress.best - value >= STUCK.minProgress);
+  if (improved) {
+    progress.best = value;
+    progress.improvedAt = g.time;
+    progress.observed = false;
+    e.stuckEpisodeAt = null;
+    e.stuckRecoveries = 0;
+    return false;
+  }
+  if (!progress.observed && g.time - progress.improvedAt >= 2) {
+    recordStuckEpisode(g, e, field, 'no-progress-2s', false);
+    progress.observed = true;
+  }
+  if (g.time - progress.improvedAt < STUCK.detectAfter) return false;
+
+  g.stats.stuckDetections = (g.stats.stuckDetections || 0) + 1;
+  e.stuckEpisodeAt ??= g.time;
+  e.stuckRecoveries ||= 0;
+  const expired = g.time - e.stuckEpisodeAt >= STUCK.despawnAfter;
+  if (expired || e.stuckRecoveries >= STUCK.maxRecoveries) {
+    recordStuckEpisode(g, e, field, 'despawn', false);
+    g.enemies = g.enemies.filter((o) => o !== e);
+    g.stats.stuckDespawns = (g.stats.stuckDespawns || 0) + 1;
+    return true;
+  }
+
+  const tile = recoveryTile(g, e, field, STUCK.searchRadius)
+    || recoveryTile(g, e, field, Math.max(MAP.w, MAP.h));
+  progress.improvedAt = g.time;
+  progress.observed = false;
+  if (!tile) {
+    recordStuckEpisode(g, e, field, 'failed-recovery', false);
+    return false;
+  }
+  recordStuckEpisode(g, e, field, 'recovery', true);
+  e.x = tile.x;
+  e.y = tile.y;
+  e.stuck = 0;
+  e.stuckOrigin = null;
+  e.stuckRecoveries++;
+  g.stats.stuckRecoveries = (g.stats.stuckRecoveries || 0) + 1;
+  retarget(g, e);
+  e.fieldProgress = {
+    key, targetKey, best: fieldValueAt(field, e.x, e.y), improvedAt: g.time, observed: false,
+  };
+  return false;
 }
 
 /**
@@ -1142,6 +1384,18 @@ export function towerAlarmState(g) {
   }));
 }
 
+export function stuckState(g) {
+  return {
+    detections: g.stats.stuckDetections || 0,
+    recoveries: g.stats.stuckRecoveries || 0,
+    despawns: g.stats.stuckDespawns || 0,
+  };
+}
+
+export function endState(g) {
+  return { status: g.status, lossCause: g.lossCause || null };
+}
+
 // ---------------------------------------------------------------------------
 // Repair
 // ---------------------------------------------------------------------------
@@ -1197,6 +1451,21 @@ export function pauseState(g) {
   return { paused: !!g.paused };
 }
 
+function resolveEndState(g) {
+  if (g.status !== 'playing') return;
+  if (g.player.hp <= 0) {
+    g.status = 'lost';
+    g.lossCause = 'died';
+    emitAudioEvent(g, 'playerDeath', g.player);
+    say(g, 'You died. Run over.');
+  } else if (g.towers.length === 0) {
+    g.status = 'lost';
+    g.lossCause = 'towers';
+    say(g, 'All towers destroyed. Position lost.');
+    if (g.lastTowerDestroyAt !== g.time) emitAudioEvent(g, 'towerDestroy', g.player);
+  }
+}
+
 export function update(g, dt, { ignorePause = false } = {}) {
   if (g.paused && !ignorePause) return;
   if (g.status !== 'playing') { updateFx(g, dt); return; }
@@ -1209,4 +1478,5 @@ export function update(g, dt, { ignorePause = false } = {}) {
   updateEnemies(g, dt);
   updateDrops(g, dt);
   updateFx(g, dt);
+  resolveEndState(g);
 }

@@ -812,3 +812,86 @@ single cached full-map blit during ordinary rendering.
 a 0.55 brightness filter (~42% effective); remembered roads and forest were
 barely distinguishable from unexplored black, which the plan forbids. The
 overlay now applies only where canvas `filter` is unsupported.
+
+## 2026-09-18 — Long upgrades, stuck-enemy recovery, tower-loss defeat
+
+### D62 — Upgrades are long, and only the Engineer can hurry them
+**Date:** 2026-09-18
+**Decision:** upgrade durations are 15 / 25 / 40 s to reach levels 1 / 2 / 3
+(was 6 / 9 / 13, D58). Upgrade progress is multiplied only by the archetype's
+own `occupancy.construction` override (Engineer x3.6; every other archetype
+x1), and only while the player *occupies* that tower. New-tower construction
+keeps the D58 rule unchanged: within the presence radius, x2.5 base, x3.6
+Engineer. Engineer times while occupying: 4.2 / 6.9 / 11.1 s.
+**Why:** the plan's stated experience is "other classes wait a long time for
+major upgrades; Engineer can personally oversee one and get it online much
+faster". Reusing the construction rule verbatim would give every class x2.5
+(Gunner 6 / 10 / 16 s), leaving the Engineer only 1.44x faster, and would
+collapse the long timers the plan asks for. This reuses the Engineer's existing
+multiplier rather than inventing a new bonus.
+**Rejected:** base x2.5 for everyone (defeats the long timers); a new upgrade-
+specific Engineer number.
+
+### D63 — Stuck enemies: fix causes, then recover, then despawn as a last resort
+**Date:** 2026-09-18
+**Decision:** stuck episodes are measured and their causes fixed first. The
+existing 1.5 s one-tile nudge stays as the first rung. Above it: an enemy with a
+movement goal that is not sieging or attacking, and that has made no progress
+along its target field for ~3 s, is recovered to the nearest passable tile that
+clears its radius, has a finite field to its target and prefers road. Stale
+steering state is cleared. After ~9 s of total stuck time, or repeated failed
+recoveries, it is despawned with no kill credit, drop, reward or death effect.
+Detections, recoveries and despawns are counted and exposed for acceptance.
+**Why:** despawning silently makes waves easier and hides bugs; the counters
+make a regression visible.
+
+### D64 — Defeat when the tower network is gone
+**Date:** 2026-09-18
+**Decision:** the run is lost when the player dies, or when no tower remains
+(finished or under construction). An unfinished tower and a COLLAPSING tower
+both count as a remaining tower; only its destruction removes it from the
+network. The end state is resolved in one place at the end of each simulation
+step: player death takes priority over tower loss, so a last-tower collapse
+that crushes the player reads as a death, and one the player survives reads as
+losing the position. The end screen names the cause.
+**Why:** a single resolution point prevents contradictory double end states
+(player death was previously only checked inside the player update).
+
+### D65 — Recovery crosses invalid geometry, but destinations obey full clearance
+**Date:** 2026-09-18
+**Decision:** the recovery search expands geometrically through coordinate
+neighbours, including blocked tiles, because a flood restricted to passable
+tiles cannot escape an enemy embedded in a cliff or enclosed pocket. Candidate
+destinations must be passable, finite in the exact field currently steering the
+enemy, no farther along that field, and radius-clear; Heavies conservatively
+require the surrounding 3x3. The normal collision probe remains unchanged.
+Spawn jitter is kept inside an authored mouth tile (falling back only to another
+authored mouth on that side), and direct `normTo` fallback is allowed only with
+a finite local field and a clear walk to the target.
+**Root causes found:** unchecked spawn scatter could cross into an adjacent
+cliff/deep tile; once embedded, infinite terrain cost made speed zero and the
+old `moved < expected * 0.2` check become `0 < 0`, so its nudge never fired.
+Separately, a non-finite field made `steer` return null, `normTo` point into a
+wall, and the 3x3 neighbour nudge repeatedly find no finite tile. Separation
+was not a terrain-entry cause because its vector still passes through collision.
+D52 feature spines were also cleared: they are revalidated after stamping,
+though validation remains point-sized rather than Heavy-clearance-sized.
+**Measured diagnosis:** all 43 authored mouths in the canonical 20 seeds
+happened to have safe adjacent rows, so the unchecked-spawn cause was structural
+rather than reproduced there. The
+deterministic embedded-cliff fixture was one permanent episode before and one
+detection/recovery after; the deliberately non-finite pocket was one permanent
+episode before and four confirmations followed by one silent despawn after.
+
+### D66 — Moving-target fields start a new progress metric
+**Date:** 2026-09-19
+**Decision:** player-target progress keys include the player's current goal
+tile and whether steering uses the lane or direct field. A goal-tile or field-
+mode change resets the current stuck episode and recovery count because values
+from the replaced field are not comparable. A stationary exposed player still
+has a stable key and remains eligible for detection.
+**Why:** the first 36-second dense diagnostic produced one false last-resort
+despawn on CHARLIE wave 6 while the player was moving. The enemy was on passable
+terrain with a finite field; the apparent lack of progress came from comparing
+successive fields to different player positions. After keying the metric, all
+eight dense seeds completed waves 3–8 with zero despawns.
