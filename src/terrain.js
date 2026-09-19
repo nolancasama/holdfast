@@ -256,8 +256,10 @@ function clearArea(map, cx, cy, r, kind = T.PLAIN, elev = 1) {
 /** D9: resource richness is placed as discrete deposits so the player can see it. */
 function placeDeposits(map, rng, start) {
   const deposits = [];
-  const add = (cx, cy, radius, peak) => {
-    deposits.push({ x: cx, y: cy, r: radius, peak });
+  const add = (cx, cy, radius, peak, apply = true) => {
+    const deposit = { x: cx, y: cy, r: radius, peak };
+    deposits.push(deposit);
+    if (!apply) return deposit;
     for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
       for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
         if (!inBounds(x, y)) continue;
@@ -268,11 +270,20 @@ function placeDeposits(map, rng, start) {
         map.res[i] = Math.min(1.8, map.res[i] + fall);
       }
     }
+    return deposit;
   };
 
   const n = randInt(rng, GEN.deposits.min, GEN.deposits.max);
-  // The safe central junction deliberately offers only mediocre extraction.
-  add(start.x + (rng() - 0.5) * 6, start.y + (rng() - 0.5) * 6, 5, GEN.deposits.startPeak);
+  // Consume the same seeded centre rolls before the remote seams, but defer
+  // this blob until every other deposit and the ambient floor are present.
+  const startDeposit = add(
+    start.x + (rng() - 0.5) * 6,
+    start.y + (rng() - 0.5) * 6,
+    5,
+    0,
+    false,
+  );
+  startDeposit.start = true;
 
   let placed = 0;
   let tries = 0;
@@ -310,12 +321,61 @@ function placeDeposits(map, rng, start) {
   for (let i = 0; i < map.res.length; i++) {
     if (PASSABLE[map.kind[i]]) map.res[i] = Math.min(1.8, map.res[i] + GEN.ambientResource);
   }
+
+  // D68: deterministically solve the deferred start blob against the actual
+  // generated tower site. The monotone binary search accounts for overlap with
+  // remote seams and the per-tile 1.8 cap without moving any rich seam closer.
+  const startCells = [];
+  for (let y = Math.floor(startDeposit.y - startDeposit.r); y <= Math.ceil(startDeposit.y + startDeposit.r); y++) {
+    for (let x = Math.floor(startDeposit.x - startDeposit.r); x <= Math.ceil(startDeposit.x + startDeposit.r); x++) {
+      if (!inBounds(x, y)) continue;
+      const distance = Math.hypot(x - startDeposit.x, y - startDeposit.y);
+      if (distance > startDeposit.r) continue;
+      startCells.push({ i: idx(x, y), kernel: (1 - distance / startDeposit.r) ** 1.4 });
+    }
+  }
+  const base = new Float32Array(startCells.length);
+  for (let n = 0; n < startCells.length; n++) base[n] = map.res[startCells[n].i];
+  const incomeAtStart = (peak) => {
+    let sum = 0;
+    const radius = TOWER.extraction.radius;
+    for (let y = Math.floor(start.y + 0.5 - radius); y <= Math.ceil(start.y + 0.5 + radius); y++) {
+      for (let x = Math.floor(start.x + 0.5 - radius); x <= Math.ceil(start.x + 0.5 + radius); x++) {
+        if (!inBounds(x, y) || Math.hypot(x - start.x, y - start.y) > radius) continue;
+        const cell = startCells.findIndex((entry) => entry.i === idx(x, y));
+        sum += cell < 0 ? map.res[idx(x, y)] : Math.min(1.8, base[cell] + peak * startCells[cell].kernel);
+      }
+    }
+    return (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
+  };
+  let lo = 0;
+  let hi = 1;
+  while (incomeAtStart(hi) < GEN.deposits.startIncomeTarget && hi < 16) hi *= 2;
+  for (let pass = 0; pass < 32; pass++) {
+    const mid = (lo + hi) * 0.5;
+    if (incomeAtStart(mid) < GEN.deposits.startIncomeTarget) lo = mid;
+    else hi = mid;
+  }
+  startDeposit.peak = (lo + hi) * 0.5;
+  for (let n = 0; n < startCells.length; n++) {
+    const cell = startCells[n];
+    map.res[cell.i] = Math.min(1.8, base[n] + startDeposit.peak * cell.kernel);
+  }
+  // The start marker represents the calibrated extraction site, not the
+  // jittered kernel centre (whose local preview can differ from the tower).
+  startDeposit.markerX = start.x;
+  startDeposit.markerY = start.y;
+
   for (const d of deposits) {
     let sum = 0;
     const radius = TOWER.extraction.radius;
-    for (let y = Math.floor(d.y - radius); y <= Math.ceil(d.y + radius); y++) {
-      for (let x = Math.floor(d.x - radius); x <= Math.ceil(d.x + radius); x++) {
-        if (!inBounds(x, y) || Math.hypot(x + 0.5 - (d.x + 0.5), y + 0.5 - (d.y + 0.5)) > radius) continue;
+    // The authored start-region marker describes the starting tower site; a
+    // jittered blob centroid can otherwise label the same calibrated region Rich.
+    const cx = d.markerX ?? d.x;
+    const cy = d.markerY ?? d.y;
+    for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
+      for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
+        if (!inBounds(x, y) || Math.hypot(x - cx, y - cy) > radius) continue;
         sum += map.res[idx(x, y)];
       }
     }
@@ -323,6 +383,23 @@ function placeDeposits(map, rng, start) {
     d.richness = richnessTierForRate(d.income).key;
   }
   return deposits;
+}
+
+/** D69: towers grade only nearby forest; every other map layer is immutable. */
+export function clearTowerForest(map, x, y, radius = TOWER.forestClearRadius) {
+  let changed = 0;
+  for (let ty = Math.floor(y - radius); ty <= Math.ceil(y + radius); ty++) {
+    for (let tx = Math.floor(x - radius); tx <= Math.ceil(x + radius); tx++) {
+      if (!inBounds(tx, ty)) continue;
+      if (Math.hypot(tx + 0.5 - x, ty + 0.5 - y) > radius + 1e-9) continue;
+      const i = idx(tx, ty);
+      if (map.kind[i] !== T.FOREST) continue;
+      map.kind[i] = T.PLAIN;
+      changed++;
+    }
+  }
+  if (changed) map.terrainVersion = (map.terrainVersion || 0) + 1;
+  return changed;
 }
 
 /** The terrain-only half of tower placement (D49).
@@ -818,6 +895,7 @@ function buildMap(rng) {
     elev: new Uint8Array(size),
     res: new Float32Array(size),
     road: new Uint8Array(size),
+    terrainVersion: 0,
   };
 
   const elevNoise = makeNoise2D(rng);

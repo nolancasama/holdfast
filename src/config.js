@@ -40,7 +40,7 @@ export const GEN = {
   fords: { min: 2, max: 4, heightMin: 4, heightMax: 7 },
   deposits: {
     min: 26, max: 38, radiusMin: 4, radiusMax: 9,
-    peakMin: 0.45, peakMax: 1.55, startPeak: 0.36,
+    peakMin: 0.45, peakMax: 1.55, startIncomeTarget: 0.90,
     startExclusionRadius: 12, startBufferRadius: 18, startBufferRejectChance: 0.70,
     roadSearchRadius: 7, roadDistanceNormalizer: 8,
     distanceWeight: 0.70, roadDistanceWeight: 0.30,
@@ -180,6 +180,10 @@ export const TOWER = {
   collapsingAt: 0.20,       // D6: visible COLLAPSING state below 20% hp
   collapseDamageFrac: 0.85, // of player MAX hp, to anyone in the footprint
   collapseRadius: 2.2,
+  // D69: max siege reach is 0.95 + 1.5 + 0.62 = 3.07. Because LOS ignores
+  // its endpoint, the farthest possible blocking lattice tile is offset (2,1):
+  // sqrt(5), the 5x5 neighbourhood minus its four corners.
+  forestClearRadius: Math.sqrt(5),
 
   weapon: { damage: 11, fireRate: 1.6, range: 7.5 },
   extraction: { radius: 4.5, baseRate: 0.85, normalizer: 30 },
@@ -243,11 +247,11 @@ export const ARCHETYPES = {
 export const ENEMIES = {
   swarm: {
     name: 'Swarm', color: '#c98bd8', radius: 0.34,
-    hp: 30, speed: 4.9, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
+    hp: 30, speed: 3.8, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
   },
   runner: {
     name: 'Runner', color: '#78e08f', radius: 0.30,
-    hp: 46, speed: 6.2, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
+    hp: 46, speed: 5.8, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
   },
   heavy: {
     name: 'Heavy', color: '#e8833a', radius: 0.62,

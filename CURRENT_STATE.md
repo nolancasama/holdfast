@@ -1,13 +1,47 @@
 # Current State
 
-Last updated: 2026-09-19 (resumed long-upgrade, stuck-recovery and tower-loss pass)
+Last updated: 2026-09-19 (pacing/economy/forest pass accepted and committed)
+
+## Codex / Delegated Work — none in flight
+
+## D67–D70 pacing/economy/forest pass — REVIEWED, ACCEPTED AND COMMITTED
+
+Codex implemented it across two usage-limit stops (final chain
+`351fa03c-a728-4888-a63e-66ddc55e0006`). The controller reviewed the source
+diff, observed `npm test` **106 passed, 0 failed**, and accepted it in the
+browser. The strategy-comparison bots once planned as "part 2" were dropped by
+the user (D71); no HP/wave balance pass is queued.
+
+Swarm is 3.8, Runner 5.8, Heavy 1.7 and player 5.3. The start tower is
+deterministically calibrated to 0.90 Materials/s base and its anchored marker is
+Moderate. Placing either the generated tower or a construction site converts
+only Forest tile centres within `sqrt(5)` to Plain, invalidates movement and
+normal-LOS visibility caches, and increments a terrain version that rebuilds
+both renderer layers. `node tools/pacing-report.js [source-root] [label]`
+produced the before/after data below from an `ef78ec7` checkout and this tree.
+No HP, wave composition, timer, tower/upgrade, road, LOS-rule, fog, aggro or
+player-speed balance changed.
+
+Controller browser acceptance (CHARLIE, 1600x900, no console or page errors):
+
+- Start tower: `towerStats` income 0.90/s base; the occupied Gunner panel reads
+  Production 1.35/s (x1.5 occupancy).
+- Forest site at (57,37), forest to radius 3 at equal elevation: `tryBuild`
+  cleared exactly 21 Forest tiles, `terrainVersion` 0 -> 1, and the next frame
+  drew a plain 5x5-minus-corners patch with forest intact beyond it.
+- A Heavy placed 2.9 tiles east was visible, besieged the tower and dropped
+  270 -> 74 HP in 4s of occupied fire. A Swarm 6 tiles out in forest was
+  hidden (`isPointVisible` false) and not drawn.
+- Real wave 4 at the start tower, measured over 1s off-siege: Swarm median
+  3.74 tiles/s (n=6), Runner 5.35 (n=2, turning/terrain below the 5.8 cap).
+  No Heavy in that wave; Heavy speed is unchanged and test-asserted.
 
 ## D62–D64 pass — REVIEWED, ACCEPTED AND COMMITTED
 
 Long upgrades (D62), stuck-enemy recovery (D63) and tower-loss defeat (D64)
 were finished by Codex on 2026-09-19 after the usage-limit stop, reviewed by
-the controller, accepted in the browser and committed on `master` (the previous
-commit is `9f7b2e2`; push to GitHub Pages pending the user). It touched `src/game.js`,
+the controller, accepted in the browser and pushed to `master` as `ef78ec7`
+(live on GitHub Pages; the previous commit is `9f7b2e2`). It touched `src/game.js`,
 `src/config.js`, `src/main.js`, `src/ui.js`, `index.html`, `test/run-tests.js`,
 `CURRENT_STATE.md`, `DESIGN_DECISIONS.md`. `npm test`: 97 passed, 0 failed.
 
@@ -99,8 +133,9 @@ of the entire tower network.
   it. Hunters within 12 tiles pursue directly (D31 interception); farther ones
   travel toward the player on the road-discounted lane field.
   `dangerState().hunters` retains the full near-hunter count, while HUD/canvas
-  displays use `visibleHunters` only. Swarms are only slightly slower than the
-  player, Runners are faster, and ordinary hits kill in roughly two to four hits.
+  displays use `visibleHunters` only. Runner 5.8 remains faster than the 5.3
+  player; Swarm 3.8 is substantially slower, and Heavy remains 1.7. Ordinary
+  hits still kill in roughly two to four hits.
 - Warning highlights the incoming half of the road network, clipped to explored
   road tiles. Combat HUD and canvas feedback show EXPOSED state, shelter progress
   and visible hunter count. Damage from an unseen attacker triggers a 1.5-second
@@ -141,10 +176,17 @@ of the entire tower network.
 - Walkable elevation is now Low / Normal / High, with a stronger shading ramp,
   quiet contour boundaries and build-preview sight explanations. Height still
   changes line of sight only; it provides no range or damage bonus.
-- Deposit regions carry a centroid extraction figure and a shared Poor /
+- Deposit regions carry an extraction figure and a shared Poor /
   Moderate / Rich classification. One to three gold bars render once per region
   at legible map scales, and the preview shows bars, tier and exact
-  Materials/second together. The starting area is kept below the Rich tier.
+  Materials/second together. The start kernel is applied after remote deposits
+  and ambient resources, then its peak is solved deterministically so the real
+  start tower earns 0.90/s base. Its marker is anchored to that tower and is
+  Moderate; other markers stay at their deposit centroids.
+- Tower placement clears only Forest to Plain inside `sqrt(5)` (21 possible tile
+  centres, a 5x5 square without corners). Elevation, resources, roads, marsh,
+  shallow/deep water and cliffs are unchanged. All tower/player movement fields,
+  LOS-derived visibility and cached bright/dim terrain layers are refreshed.
 - Drops now roll approximately 70% temporary effects, 22% small Materials
   caches and 8% run-long equipment. Equipment is one-of-each, capped at four,
   resets on a new run and is listed in the HUD. Category-specific bolt, bars and
@@ -155,7 +197,7 @@ of the entire tower network.
 
 ## Automated verification
 
-`npm test` runs 97 checks. It covers 20 deterministic seeds,
+`npm test` runs 106 checks. It covers 20 deterministic seeds,
 terrain validation, road connectivity and legality, seed variation, lane/direct
 field behavior, road placement refusal, ford use and generated route character,
 road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
@@ -168,11 +210,155 @@ timing/function/pause/destruction, alarms, visibility performance, and five-seed
 prep scouting. It now also covers cliff recovery and resumed progress, silent
 unreachable despawn, siege/crowd exclusions, Heavy clearance, mouth-spawn validity,
 waves 3-8 dense diagnostics on eight seeds, all tower-loss/death priority cases,
-and terminal-state freezing. Resumed-run result: **97 passed, 0 failed**. The
+and terminal-state freezing. D67-D69 add exact speed/order and increased
+isolated-engagement checks, 20-seed start-income/remote-Rich assertions, and
+all-angle forest siege/fire, distant blocking, elevation, layer-invariant,
+open-ground and cache-invalidation tests plus a real-seed reproduction. Final
+result: **106 passed, 0 failed**. The
 wall-clock road-analysis budget (400ms) remains load-sensitive; no road code
 changed.
 `npm run road-report` prints per-seed features,
 efficiency, knots, readability defects, entry roads and attempts.
+
+## D67-D70 pacing/economy/forest measurements — 2026-09-19
+
+`tools/pacing-report.js` ran unchanged against a detached `ef78ec7` checkout
+(`before`) and this working tree (`after`). Simulation rows use ALPHA-HOTEL,
+seeded `Math.random`, real wave-8 composition/spawning and W0 occupied Gunner
+towers. Engagement pools the same 162 Swarms, 83 Runners and 60 Heavies in each
+version. Hairpin sites were the best D52 hairpin on each seed (39.5,36.5;
+20.5,15.5; 27.5,28.5; 26.5,38.5; 60.5,7.5; 62.5,24.5; 74.5,27.5;
+20.5,37.5 respectively) and were built through the real placement path. No
+harness precondition failed.
+
+Configured movement changed only as D67 specifies:
+
+| unit | before | after |
+|---|---:|---:|
+| Player | 5.3 | 5.3 |
+| Swarm | 4.9 | 3.8 |
+| Runner | 6.2 | 5.8 |
+| Heavy | 1.7 | 1.7 |
+
+Engagement seconds are p25 / median / p75 of time both inside W0 range and in
+LOS. The last column is fraction killed in range / fraction that reached siege
+distance. Real-wave per-enemy medians do not move monotonically with speed:
+slower arrivals spread the crowd and reduce time queued inside a saturated
+single tower's range. The separate isolated-approach regression test removes
+that crowd interaction and asserts that lowering Swarm/Runner speed strictly
+increases engagement time (Heavy is unchanged).
+
+| site/type | before seconds | after seconds | before killed/reached | after killed/reached |
+|---|---:|---:|---:|---:|
+| start / Swarm | 6.06 / 12.15 / 23.64 | 6.22 / 10.90 / 18.49 | 100.0% / 98.8% | 100.0% / 96.9% |
+| start / Runner | 3.37 / 7.00 / 15.85 | 2.97 / 5.00 / 11.08 | 100.0% / 98.8% | 100.0% / 97.6% |
+| start / Heavy | 25.30 / 39.30 / 54.31 | 22.44 / 42.67 / 59.59 | 96.7% / 98.3% | 96.7% / 96.7% |
+| hairpin / Swarm | 6.06 / 12.08 / 45.41 | 6.01 / 11.88 / 39.21 | 100.0% / 96.9% | 99.4% / 92.6% |
+| hairpin / Runner | 4.62 / 10.85 / 33.43 | 3.50 / 5.95 / 26.08 | 100.0% / 95.2% | 100.0% / 91.6% |
+| hairpin / Heavy | 22.00 / 34.30 / 52.91 | 24.78 / 36.70 / 52.19 | 93.3% / 95.0% | 91.7% / 91.7% |
+
+Exposure starts only after six real wave-8 enemies are within 12 tiles. Standing
+trials place the player four to six tiles from the start tower; all eight died.
+Dashes build a second real W0 tower across a straight passable corridor. Times
+and HP loss are p25 / median / p75; dash maximum is included because the short
+median is zero in both versions.
+
+| exposed measure | before | after |
+|---|---:|---:|
+| time to first hit | 0.89 / 1.72 / 1.99 s | 1.02 / 1.22 / 1.49 s |
+| time to death | 2.32 / 2.85 / 2.92 s | 1.97 / 2.08 / 2.48 s |
+
+| dash corridor (8 runs) | before HP loss (max), deaths | after HP loss (max), deaths |
+|---|---:|---:|
+| short covered, 8 tiles | 0 / 0 / 0 (76), 0/8 | 0 / 0 / 0 (38), 0/8 |
+| mid covered, 13 tiles | 0 / 35 / 100 (100), 3/8 | 0 / 19 / 82 (100), 2/8 |
+| long uncovered, ~24 tiles | 0 / 35 / 82 (100), 2/8 | 0 / 0 / 53.5 (100), 2/8 |
+
+Sheltered outcomes use fresh Gunner runs sitting in the start W0 tower with no
+repair, upgrades or building. HP loss is gross damage, not end-minus-start.
+
+| outcome | before | after |
+|---|---:|---:|
+| waves survived, min / median / max | 2 / 3 / 3 | 2 / 3 / 4 |
+| wave duration, p25 / median / p75 | 27.8 / 29.9 / 41.65 s | 31.2 / 34.6 / 45.55 s |
+| tower HP lost/wave, p25 / median / p75 | 47.0 / 86.6 / 214.6 | 26.7 / 76.3 / 223.25 |
+| enemies reaching/wave, p25 / median / p75 | 8 / 10 / 13.5 | 5 / 8.5 / 13.25 |
+
+| seed | waves before | waves after |
+|---|---:|---:|
+| ALPHA | 3 | 3 |
+| BRAVO | 3 | 4 |
+| CHARLIE | 2 | 2 |
+| DELTA | 3 | 3 |
+| ECHO | 3 | 3 |
+| FOXTROT | 3 | 3 |
+| GOLF | 3 | 3 |
+| HOTEL | 3 | 3 |
+
+D68 removes the fixed `startPeak: 0.36`. The two seeded jitter rolls and radius
+5 are unchanged; remote seams are laid with the unchanged 12-tile exclusion and
+18-tile buffer, then the ambient floor is added. Only then a 32-pass monotone
+binary search solves the start kernel peak against the real start tower,
+including overlap and the 1.8 per-cell cap. The start marker is anchored to that
+site (D70). Remote best income, road geometry and road bitfields are unchanged.
+
+| 44 generated seeds | before min / median / max | after min / median / max |
+|---|---:|---:|
+| start base income | 0.311 / 0.368 / 0.392 (Poor) | 0.900 / 0.900 / 0.900 (Moderate) |
+| remote Rich build sites/map | 258 / 540 / 817 | 258 / 540 / 817 |
+| best remote / start ratio | 5.71 / 8.29 / 10.35x | 2.28 / 3.33 / 3.86x |
+
+Canonical 20-seed details follow. `Rich` counts tile-centre build sites at least
+12 tiles from start with base income >= 1.18; `road` is raw road tiles within W0
+range. Best income and both road/count columns are unchanged before/after.
+
+| seed | Rich sites | best income | best/start before | best/start after | road |
+|---|---:|---:|---:|---:|---:|
+| ALPHA | 585 | 2.820 | 7.58x | 3.13x | 36 |
+| BRAVO | 738 | 2.650 | 6.79x | 2.94x | 18 |
+| CHARLIE | 539 | 2.693 | 6.96x | 2.99x | 34 |
+| DELTA | 541 | 2.497 | 7.00x | 2.77x | 28 |
+| ECHO | 521 | 2.440 | 6.43x | 2.71x | 27 |
+| FOXTROT | 579 | 3.056 | 9.21x | 3.40x | 40 |
+| GOLF | 817 | 2.994 | 7.86x | 3.33x | 29 |
+| HOTEL | 470 | 2.999 | 7.88x | 3.33x | 24 |
+| INDIA | 594 | 3.092 | 8.01x | 3.44x | 31 |
+| JULIET | 773 | 2.738 | 8.05x | 3.04x | 23 |
+| KILO | 431 | 2.947 | 7.78x | 3.27x | 14 |
+| LIMA | 352 | 2.744 | 8.55x | 3.05x | 32 |
+| MIKE | 395 | 2.912 | 7.59x | 3.24x | 7 |
+| NOVEMBER | 545 | 3.231 | 8.60x | 3.59x | 28 |
+| OSCAR | 558 | 3.414 | 9.97x | 3.79x | 29 |
+| PAPA | 468 | 3.347 | 10.35x | 3.72x | 23 |
+| QUEBEC | 447 | 2.318 | 5.98x | 2.58x | 28 |
+| ROMEO | 337 | 2.950 | 8.39x | 3.28x | 22 |
+| SIERRA | 258 | 2.999 | 8.86x | 3.33x | 23 |
+| TANGO | 521 | 3.170 | 8.13x | 3.52x | 27 |
+
+D69's radius is exactly `sqrt(5) = 2.236...`: maximum Heavy reach is
+`0.95 + 1.5 + 0.62 = 3.07`, and because Bresenham ignores shooter and target
+endpoint tiles, the farthest possible intervening lattice offset is (2,1).
+Thus the clear set is the 5x5 neighbourhood minus four corners. Tests sample 32
+angles at both full reach and the `reach - 0.35` settle ring for all three enemy
+types and verify actual tower damage, not LOS alone.
+
+Concrete root cause: on generated seed ALPHA a tower at tile (70,3), centre
+(70.5,3.5), could be sieged by a Heavy at (73.22,3.5); LOS was false because
+intermediate same-height Forest tile (71,3) blocked it. Clearing makes that same
+LOS true. A target six tiles away on the same bearing remains hidden (`false`),
+proving forest beyond the ring still works. High-over-Normal-forest behavior is
+also unchanged. Only Forest becomes Plain; elevation, resources, roads and all
+other terrain kinds are byte-identical. Start placement normally clears zero
+tiles because generation already has a radius-4 open start, but it uses the same
+safe path.
+
+Performance (wall clock is load-sensitive): across the same 44 maps generation
+median/p75/max was 539.8/816.5/1964.6ms before and
+584.9/893.6/2138.1ms after. A warmed isolated calibration body measured 0.54ms
+per final map, so the much noisier process-level difference should not be
+attributed wholly to D68. Forest clearing examines at most 49 cells; 2,000
+reset-map placements measured 0.0012ms median, 0.0019ms p75 and 0.0967ms max.
+Renderer rebuilding happens only after an actual change, on the next frame.
 
 ## Stuck diagnosis and measurements — 2026-09-19
 
@@ -243,8 +429,9 @@ alternates survive and multiple routes remain.
 1280x800 at 9px/tile; the minimum entity sizes keep towers, player and enemies
 legible at both. The 2:1 map in a ~1.4:1 stage letterboxes top and bottom.
 
-**Outside is lethal, as intended.** Standing still exposed mid-wave: first hit
-after 4.4-5.7s, dead in 5.5-6.0s. Enemy hits are 32/38/55, so 2-4 hits kill.
+**Historical pre-D67 exposure result (superseded above).** Standing still
+exposed mid-wave took 4.4-5.7s to first hit and 5.5-6.0s to death under that
+older harness. Enemy hit values remain 32/38/55.
 
 **Tower-to-tower escape has the right gradient** (24 sampled dashes across a
 contested corridor):
@@ -287,10 +474,9 @@ generates in under 400ms.
 
 **Elevation is legible but its advantage is modest (see known risks).**
 
-**Richness bars are consistent.** Tiers are disjoint (poor < 0.62 <= moderate <
-1.18 <= rich Materials/sec), so a bar can never contradict its number; the
-centre sits at the 34th-44th income percentile; single, double and triple bars
-remain distinguishable at full-map scale.
+**Historical pre-D68 richness result (superseded above).** Tiers remain disjoint
+(poor < 0.62 <= moderate < 1.18 <= rich Materials/sec). The old centre sat at
+the 34th-44th percentile; D68 now directly calibrates home to 0.90 Moderate.
 
 **Rich and defensible sites are independent.** Of the top-quartile-income sites,
 26% are also top-quartile for sightlines - essentially the 25% expected if the
@@ -306,10 +492,10 @@ audio on costs 65-94ms and starts ~6 voices. Enemy hit/death cues were silently
 replaced by a generic beep until D47 fixed it. COLLAPSING announces once, then
 reminds quietly every 2.6s, and is silent while paused.
 
-**Danger tuning did not regress.** Exposed player: first hit 3.0-4.7s, dead in
-5.4-5.7s. Circular kiting dies in ~7s on CHARLIE and BRAVO (the seed where it
-originally worked). Contested dash: 8t covered 29 HP lost, 13t covered 25, 20t
-uncovered 53, 28t uncovered dead.
+**Historical pre-D67 danger result (superseded above).** This older harness saw
+first hit in 3.0-4.7s, death in 5.4-5.7s and contested dash losses of 29/25/53
+HP at 8/13/20 tiles. The current same-checkout before/after harness is the D67
+table above.
 
 ## Road exposure pass - measured, 2026-09-17 (shipped as-is)
 
@@ -369,8 +555,11 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 4. **Feel is unverified.** Whether equipment drops are worth the risk, whether
    COLLAPSING gives enough time to decide, whether reaching a tower feels like
    relief, and whether repeated gunfire becomes irritating all need a human.
-5. From the previous pass: a long uncovered run kills about a quarter of the
-   time rather than "usually"; waves run 56-118s.
+5. **Current D67 exposure remains noisy.** In the eight-seed headless harness,
+   long uncovered dashes killed 2/8 both before and after; median HP loss fell
+   35 -> 0, but standing median death also fell 2.85 -> 2.08s because the fixed
+   six-enemy trigger presents a different crowd shape at the lower speeds.
+   Controller play remains the authority for feel.
 
 6. **Road readability is much better, not perfect (D55 known gaps).** About 1 in
    7 maps keeps one short side-by-side band; converging diagonal approaches can
@@ -378,10 +567,11 @@ road-report` prints per-seed features, exposure ratios and knot counts.
    in-game debug overlay shows exposure or readability defects. Where a river
    meets the map edge beside a spawn mouth, a road can be forced along the
    boundary (seen on random seed M4XQ9A only).
-7. **Exposed-player pressure rose slightly (D53).** With unoccupied towers no
-   longer targets, every enemy not committed to a siege goes after an exposed
-   player (far ones by road). Worth judging by hand whether tower-to-tower
-   dashes still feel fair.
+7. **D67 has mixed exposure effects.** With unoccupied towers still excluded by
+   D53, every uncommitted enemy attacks an exposed player. Covered dash damage
+   improved in the headless before/after runs, but stationary mid-wave death did
+   not; controller acceptance should judge whether tower-to-tower travel feels
+   fair under real play.
 8. **Fog pass open questions (2026-09-18).** (a) Unfinished and unoccupied
    towers are not enemy targets (D53), so a construction site is only attacked
    by enemies already committed to it; the "leave an unfinished tower" tension
@@ -397,10 +587,10 @@ road-report` prints per-seed features, exposure ratios and knot counts.
 
 ## Next steps
 
-0. Push the D62-D64 commit to `origin/master` (GitHub Pages) if not yet pushed.
 1. Play it by hand, with sound on. The unanswered questions are all about feel,
    and now also whether the hairpin tower sites feel worth taking, whether
-   exploring the dark is interesting, and the fog-pass questions in risk 8.
+   exploring the dark is interesting, the fog-pass questions in risk 8, and
+   whether the slower Swarm/Runner pacing (D67) feels right.
 2. Road follow-ups: a debug overlay for exposure sites and readability defects;
    if converging diagonals still read as busy in play, consider drawing diagonal
    road segments as diagonal strokes instead of staircases (render-only).
@@ -409,3 +599,7 @@ road-report` prints per-seed features, exposure ratios and knot counts.
    self-blinded.
 4. If the map reads as cluttered in a big wave, cull richness bars during combat
    before removing anything else.
+5. D67 left two measured questions for hand play rather than a tuning pass:
+   standing exposed mid-wave now dies faster (median 2.85 -> 2.08s), and
+   slower enemies do not raise per-enemy time in range in crowded real waves
+   (see risk 5 and the D67-D70 tables).

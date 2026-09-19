@@ -8,6 +8,7 @@ import {
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
   kindAt, elevAt, hasLineOfSight, hasClearWalk, isTerrainBuildable,
+  clearTowerForest,
 } from './terrain.js';
 import { computeField, steer } from './flowfield.js';
 
@@ -295,6 +296,17 @@ function placeTower(g, x, y, instant = false) {
     resourceScore: resourceScoreAt(g.map, x, y, TOWER.extraction.radius),
   };
   g.towers.push(t);
+  if (clearTowerForest(g.map, x, y)) {
+    // Forest -> plain changes movement cost and every LOS-derived view. Keep
+    // placement validation on the original terrain, then invalidate only after
+    // the tower has been accepted and the clearing has actually changed tiles.
+    for (const tower of g.towers) tower.field = null;
+    g.playerField = null;
+    g.playerFieldAt = -99;
+    g.playerLaneField = null;
+    g.playerLaneFieldAt = -99;
+    recomputeVisibility(g, true);
+  }
   return t;
 }
 

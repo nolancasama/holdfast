@@ -504,11 +504,13 @@ function drawDepositMarkers(ctx, g, view) {
   const gap = localPx(view, 1.5);
   const height = localPx(view, 7);
   for (const d of g.map.deposits) {
-    if (!g.debug.showFog && !tileExplored(g, Math.floor(d.x), Math.floor(d.y))) continue;
+    const markerX = d.markerX ?? d.x;
+    const markerY = d.markerY ?? d.y;
+    if (!g.debug.showFog && !tileExplored(g, Math.floor(markerX), Math.floor(markerY))) continue;
     const tier = richnessTierForRate(d.income);
     const totalW = tier.bars * barW + (tier.bars - 1) * gap;
-    const x = (d.x + 0.5) * TP - totalW / 2;
-    const y = (d.y + 0.5) * TP - height / 2;
+    const x = (markerX + 0.5) * TP - totalW / 2;
+    const y = (markerY + 0.5) * TP - height / 2;
     ctx.fillStyle = 'rgba(18,15,9,0.68)';
     ctx.fillRect(x - gap, y - gap, totalW + gap * 2, height + gap * 2);
     ctx.fillStyle = 'rgba(255,205,74,0.88)';

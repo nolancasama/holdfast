@@ -7,8 +7,8 @@ import {
   EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK,
 } from '../src/config.js';
 import {
-  generateMap, validateMap, idx, isPassable, hasLineOfSight, kindAt, elevAt,
-  isTerrainBuildable,
+  generateMap, validateMap, idx, inBounds, isPassable, hasLineOfSight, kindAt, elevAt,
+  isTerrainBuildable, clearTowerForest,
 } from '../src/terrain.js';
 import { computeField, steer } from '../src/flowfield.js';
 import {
@@ -63,6 +63,7 @@ function syntheticMap() {
     elev: new Uint8Array(size).fill(1),
     res: new Float32Array(size),
     road: new Uint8Array(size),
+    terrainVersion: 0,
     roadRoutes: [],
     spawns: { west: [], east: [] },
     roadCenter: { x: Math.floor(MAP.w / 2), y: Math.floor(MAP.h / 2) },
@@ -243,6 +244,49 @@ check('slow terrain really costs more to cross than open ground', () => {
   const open = openSum / openN;
   const marsh = marshSum / marshN;
   return marsh > open ? null : `marsh (${marsh.toFixed(2)}) is not costlier than open ground (${open.toFixed(2)})`;
+});
+
+check('configured movement identities match D67 exactly', () => {
+  if (ENEMIES.swarm.speed !== 3.8) return `Swarm speed is ${ENEMIES.swarm.speed}`;
+  if (ENEMIES.runner.speed !== 5.8) return `Runner speed is ${ENEMIES.runner.speed}`;
+  if (ENEMIES.heavy.speed !== 1.7) return `Heavy speed is ${ENEMIES.heavy.speed}`;
+  if (PLAYER.speed !== 5.3) return `player speed changed to ${PLAYER.speed}`;
+  return ENEMIES.runner.speed > PLAYER.speed && PLAYER.speed > ENEMIES.swarm.speed
+    && ENEMIES.swarm.speed > ENEMIES.heavy.speed
+    ? null : 'expected Runner > player > Swarm > Heavy';
+});
+
+function approachEngagement(type, speed) {
+  const g = createGame(`D67-${type}-${speed}`, 'gunner');
+  const map = syntheticMap();
+  g.map = map;
+  g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
+  const t = g.towers[0];
+  t.x = 52.5; t.y = 26.5; t.hp = t.maxHp = 1e9; t.shotCd = 1e9; t.field = null;
+  g.player.x = t.x; g.player.y = t.y;
+  g.shelter = { towerId: t.id, progress: PLAYER.shelterTime, required: PLAYER.shelterTime };
+  g.occupiedTowerId = t.id;
+  const e = addRealEnemy(g, t.x + TOWER.weapon.range - 0.01, t.y, type, t.id, speed);
+  let engagement = 0;
+  for (let step = 0; step < 1000 && !e.sieging; step++) {
+    if (Math.hypot(e.x - t.x, e.y - t.y) <= TOWER.weapon.range
+        && hasLineOfSight(map, t.x, t.y, e.x, e.y)) engagement += 0.02;
+    update(g, 0.02);
+  }
+  return engagement;
+}
+
+check('D67 slower configured enemies spend longer in a W0 engagement', () => {
+  const old = { swarm: 4.9, runner: 6.2, heavy: 1.7 };
+  for (const type of ['swarm', 'runner']) {
+    const before = approachEngagement(type, old[type]);
+    const after = approachEngagement(type, ENEMIES[type].speed);
+    if (!(after > before + 0.01)) return `${type}: ${before.toFixed(2)}s -> ${after.toFixed(2)}s`;
+  }
+  const heavyBefore = approachEngagement('heavy', old.heavy);
+  const heavyAfter = approachEngagement('heavy', ENEMIES.heavy.speed);
+  return Math.abs(heavyAfter - heavyBefore) <= 0.021
+    ? null : `unchanged Heavy engagement moved ${heavyBefore.toFixed(2)}s -> ${heavyAfter.toFixed(2)}s`;
 });
 
 // --- D20-D22: road network and two movement cost modes ---------------------
@@ -1170,6 +1214,184 @@ function addRealEnemy(g, x, y, type, targetId, speed = ENEMIES[type].speed) {
   return e;
 }
 
+function forestTowerFixture() {
+  const g = createGame('D69-FOREST-FIXTURE', 'gunner');
+  const map = syntheticMap();
+  map.kind.fill(T.FOREST);
+  g.map = map;
+  g.towers = [];
+  g.nextTowerId = 1;
+  g.materials = 99999;
+  g.phase = 'prep';
+  g.phaseLeft = 999;
+  const x = Math.floor(MAP.w / 2) + 0.5;
+  const y = Math.floor(MAP.h / 2) + 0.5;
+  g.player.x = x;
+  g.player.y = y;
+  const built = tryBuild(g, x, y);
+  if (!built.ok) return null;
+  const tower = g.towers[0];
+  tower.built = true;
+  tower.progress = 1;
+  tower.hp = tower.maxHp = 1e9;
+  g.shelter = { towerId: tower.id, progress: PLAYER.shelterTime, required: PLAYER.shelterTime };
+  g.occupiedTowerId = tower.id;
+  return { g, map, tower };
+}
+
+check('D69 forest clearing gives every sampled siege position LOS and fire', () => {
+  const fixture = forestTowerFixture();
+  if (!fixture) return 'could not place a tower on the all-forest fixture';
+  const { g, map, tower } = fixture;
+  for (const type of Object.keys(ENEMIES)) {
+    const reach = TOWER.radius + ENEMY.attackRange + ENEMIES[type].radius;
+    for (const distance of [reach, reach - 0.35]) {
+      for (let sample = 0; sample < 32; sample++) {
+        const angle = sample * Math.PI * 2 / 32;
+        const x = tower.x + Math.cos(angle) * distance;
+        const y = tower.y + Math.sin(angle) * distance;
+        if (!hasLineOfSight(map, tower.x, tower.y, x, y)) {
+          return `${type} blocked at ${distance.toFixed(2)}, angle ${sample}`;
+        }
+        g.enemies = [];
+        const enemy = addRealEnemy(g, x, y, type, tower.id, 0);
+        tower.targetId = enemy.id;
+        tower.retargetIn = 99;
+        tower.shotCd = 0;
+        const hp = enemy.hp;
+        update(g, 0.02);
+        if (!(enemy.hp < hp)) return `${type} was visible but not fired on at angle ${sample}`;
+      }
+    }
+  }
+  return null;
+});
+
+check('D69 distant forest still blocks LOS and tower fire', () => {
+  const fixture = forestTowerFixture();
+  if (!fixture) return 'could not place the forest tower';
+  const { g, map, tower } = fixture;
+  const enemy = addRealEnemy(g, tower.x + 6, tower.y, 'heavy', tower.id, 0);
+  if (hasLineOfSight(map, tower.x, tower.y, enemy.x, enemy.y)) return 'forest beyond the ring did not block LOS';
+  tower.targetId = enemy.id;
+  tower.retargetIn = 99;
+  tower.shotCd = 0;
+  const hp = enemy.hp;
+  update(g, 0.25);
+  return enemy.hp === hp ? null : 'tower fired through distant forest';
+});
+
+check('D69 preserves the High-over-Normal-forest D3 rule', () => {
+  const map = syntheticMap();
+  const x = 30.5;
+  const y = 20.5;
+  for (let ox = 0; ox <= 6; ox++) {
+    map.kind[idx(30 + ox, 20)] = T.FOREST;
+    map.elev[idx(30 + ox, 20)] = ox === 0 ? 2 : 1;
+  }
+  const before = hasLineOfSight(map, x, y, x + 6, y);
+  clearTowerForest(map, x, y);
+  const after = hasLineOfSight(map, x, y, x + 6, y);
+  return before && after ? null : `High tower LOS changed ${before} -> ${after}`;
+});
+
+check('D69 clearing changes only in-radius Forest kind cells', () => {
+  const map = syntheticMap();
+  const x = 40.5;
+  const y = 20.5;
+  for (let ty = 16; ty <= 24; ty++) for (let tx = 36; tx <= 44; tx++) {
+    const i = idx(tx, ty);
+    map.kind[i] = (tx + ty) % 6;
+    map.elev[i] = (tx + 2 * ty) % 3;
+    map.res[i] = (tx * 17 + ty) / 1000;
+    map.road[i] = (tx + ty) % 2;
+  }
+  const before = {
+    kind: map.kind.slice(), elev: map.elev.slice(), res: map.res.slice(), road: map.road.slice(),
+  };
+  const changed = clearTowerForest(map, x, y);
+  let expectedChanged = 0;
+  for (let i = 0; i < map.kind.length; i++) {
+    const tx = i % MAP.w;
+    const ty = (i / MAP.w) | 0;
+    const shouldClear = before.kind[i] === T.FOREST
+      && Math.hypot(tx + 0.5 - x, ty + 0.5 - y) <= TOWER.forestClearRadius + 1e-9;
+    if (shouldClear) expectedChanged++;
+    const expectedKind = shouldClear ? T.PLAIN : before.kind[i];
+    if (map.kind[i] !== expectedKind) return `kind changed incorrectly at ${tx},${ty}`;
+    if (map.elev[i] !== before.elev[i] || map.res[i] !== before.res[i] || map.road[i] !== before.road[i]) {
+      return `non-kind layer changed at ${tx},${ty}`;
+    }
+  }
+  if (changed !== expectedChanged || map.terrainVersion !== 1) {
+    return `changed ${changed}/${expectedChanged}, terrainVersion ${map.terrainVersion}`;
+  }
+  return null;
+});
+
+check('D69 open-ground placement is a terrain no-op', () => {
+  const map = syntheticMap();
+  const before = map.kind.slice();
+  const changed = clearTowerForest(map, 20.5, 20.5);
+  if (changed !== 0 || map.terrainVersion !== 0) return `changed ${changed}, version ${map.terrainVersion}`;
+  return map.kind.every((kind, i) => kind === before[i]) ? null : 'open terrain changed';
+});
+
+check('D69 placement invalidates movement and visibility caches', () => {
+  const g = createGame('D69-CACHES', 'gunner');
+  const map = syntheticMap();
+  const x = 52.5;
+  const y = 26.5;
+  map.kind[idx(54, 26)] = T.FOREST;
+  g.map = map;
+  const oldTower = g.towers[0];
+  oldTower.x = 30.5;
+  oldTower.y = 26.5;
+  oldTower.field = computeField(map, [idx(30, 26)], 'lane');
+  g.player.x = x;
+  g.player.y = y;
+  g.playerField = computeField(map, [idx(52, 26)], 'direct');
+  g.playerLaneField = computeField(map, [idx(52, 26)], 'lane');
+  g.playerFieldAt = g.playerLaneFieldAt = 10;
+  recomputeVisibility(g, true);
+  if (isTileVisible(g, 57, 26)) return 'visibility precondition was not forest-blocked';
+  const beforeField = computeField(map, [idx(52, 26)], 'direct')[idx(54, 26)];
+  g.materials = 99999;
+  const built = tryBuild(g, x, y);
+  if (!built.ok) return `placement failed: ${built.reasons.join(', ')}`;
+  const afterField = computeField(map, [idx(52, 26)], 'direct')[idx(54, 26)];
+  if (g.towers.some((tower) => tower.field !== null)) return 'a tower flow field stayed cached';
+  if (g.playerField !== null || g.playerLaneField !== null
+      || g.playerFieldAt !== -99 || g.playerLaneFieldAt !== -99) return 'a player flow field stayed cached';
+  if (!(afterField < beforeField)) return `movement field did not reflect Forest -> Plain (${beforeField} -> ${afterField})`;
+  if (!isTileVisible(g, 57, 26)) return 'visibility cache did not rebuild through the clearing';
+  return map.terrainVersion === 1 ? null : 'terrain version did not advance';
+});
+
+check('D69 reproduces and fixes a real-seed forest siege LOS failure', () => {
+  for (const map of maps) {
+    for (let ty = 3; ty < MAP.h - 3; ty++) for (let tx = 3; tx < MAP.w - 3; tx++) {
+      if (map.kind[idx(tx, ty)] !== T.FOREST || !isTerrainBuildable(map, tx + 0.5, ty + 0.5)) continue;
+      const towerX = tx + 0.5;
+      const towerY = ty + 0.5;
+      const reach = TOWER.radius + ENEMY.attackRange + ENEMIES.heavy.radius - 0.35;
+      for (let sample = 0; sample < 32; sample++) {
+        const angle = sample * Math.PI * 2 / 32;
+        const enemyX = towerX + Math.cos(angle) * reach;
+        const enemyY = towerY + Math.sin(angle) * reach;
+        if (!inBounds(Math.floor(enemyX), Math.floor(enemyY))
+            || hasLineOfSight(map, towerX, towerY, enemyX, enemyY)) continue;
+        const clone = { ...map, kind: map.kind.slice(), terrainVersion: 0 };
+        clearTowerForest(clone, towerX, towerY);
+        if (!hasLineOfSight(clone, towerX, towerY, enemyX, enemyY)) continue;
+        console.log(`D69 real repro: ${map.seed} tower ${tx},${ty}, Heavy ring angle ${sample}/32 false -> true`);
+        return null;
+      }
+    }
+  }
+  return 'found no real generated forest-tower siege reproduction';
+});
+
 function embeddedRecoveryFixture(type = 'swarm') {
   const g = createGame(`STUCK-EMBEDDED-${type}`, 'gunner');
   g.phaseLeft = 999; g.materials = 0;
@@ -1380,12 +1602,45 @@ check('richness bars and labels use the configured numeric thresholds', () => {
   return c.richness.key === richnessTierForRate(c.income).key ? null : 'build preview tier contradicts its income';
 });
 
-check('the central starting area is never a rich extraction site', () => {
+check('D68 start income is calibrated Moderate and every map retains a remote Rich site', () => {
+  const rows = [];
   for (const m of maps) {
     const income = resourceScoreAt(m, m.start.x + 0.5, m.start.y + 0.5, TOWER.extraction.radius)
       * TOWER.extraction.baseRate;
-    if (richnessTierForRate(income).key === 'rich') return `${m.seed}: start produces ${income.toFixed(2)}/s`;
+    if (income < 0.8 - 1e-6 || income > 1.0 + 1e-6) {
+      return `${m.seed}: start produces ${income.toFixed(3)}/s`;
+    }
+    if (richnessTierForRate(income).key !== 'moderate') {
+      return `${m.seed}: start tier is ${richnessTierForRate(income).key}`;
+    }
+    const marker = m.deposits.find((d) => d.start);
+    if (!marker || marker.richness !== 'moderate') return `${m.seed}: start-region marker is not Moderate`;
+    if (marker.markerX !== m.start.x || marker.markerY !== m.start.y
+        || Math.abs(marker.income - income) > 1e-6) {
+      return `${m.seed}: start marker does not describe the calibrated tower site`;
+    }
+
+    let rich = 0;
+    let best = 0;
+    for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) {
+      if (Math.hypot(x - m.start.x, y - m.start.y) < 12) continue;
+      if (!isTerrainBuildable(m, x + 0.5, y + 0.5)) continue;
+      const siteIncome = resourceScoreAt(m, x + 0.5, y + 0.5, TOWER.extraction.radius)
+        * TOWER.extraction.baseRate;
+      if (siteIncome >= RICHNESS.moderateMax) rich++;
+      best = Math.max(best, siteIncome);
+    }
+    if (!rich) return `${m.seed}: no buildable Rich site at least 12 tiles from start`;
+    let roadTiles = 0;
+    for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) {
+      if (m.road[idx(x, y)]
+          && Math.hypot(x + 0.5 - (m.start.x + 0.5), y + 0.5 - (m.start.y + 0.5)) <= TOWER.weapon.range) {
+        roadTiles++;
+      }
+    }
+    rows.push(`${m.seed}:${income.toFixed(2)}/${rich}/${(best / income).toFixed(2)}x/${roadTiles}r`);
   }
+  console.log(`D68 start/rich-count/best-ratio/W0-road: ${rows.join('; ')}`);
   return null;
 });
 

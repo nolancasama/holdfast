@@ -47,7 +47,12 @@ $('again-btn').onclick = () => {
 function startRun(seed, archetype) {
   game = createGame(seed, archetype);
   const terrain = buildTerrainLayer(game.map);
-  layers = { terrain, terrainDim: buildTerrainDimLayer(terrain), terrainView: null };
+  layers = {
+    terrain,
+    terrainDim: buildTerrainDimLayer(terrain),
+    terrainView: null,
+    terrainVersion: game.map.terrainVersion || 0,
+  };
   endShown = false;
   lastBuildPlayerTile = '';
   $('select-overlay').hidden = true;
@@ -323,6 +328,16 @@ function frame(now) {
 
   update(game, dt);
   audio.playEvents(drainAudioEvents(game), game.player, game.paused);
+
+  if (layers.terrainVersion !== (game.map.terrainVersion || 0)) {
+    const terrain = buildTerrainLayer(game.map);
+    layers = {
+      terrain,
+      terrainDim: buildTerrainDimLayer(terrain),
+      terrainView: null,
+      terrainVersion: game.map.terrainVersion || 0,
+    };
+  }
 
   refreshBuildCheck();
   draw(ctx, game, layers, view);

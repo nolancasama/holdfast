@@ -895,3 +895,78 @@ despawn on CHARLIE wave 6 while the player was moving. The enemy was on passable
 terrain with a finite field; the apparent lack of progress came from comparing
 successive fields to different player positions. After keying the metric, all
 eight dense seeds completed waves 3–8 with zero despawns.
+
+## 2026-09-19 — Pacing, a worthwhile home, and forest self-defence
+
+Playtest problems: combat resolves too fast to enjoy watching; the dominant play
+is to abandon the start tower for one rich outpost; forest towers can be sieged
+by enemies they cannot shoot. Not in this pass: depletion, Extraction Threat,
+new tower types, changes to extraction-upgrade percentages or upgrade costs.
+
+### D67 — Slower enemies, but Runners stay faster than the player
+**Date:** 2026-09-19
+**Decision:** Swarm 4.9 -> 3.8, Runner 6.2 -> 5.8, Heavy stays 1.7. Player speed
+(5.3), tower damage and weapon upgrades are unchanged. No HP or wave changes in
+the implementation pass; they wait for measurements.
+**Why:** more time under fire makes a working defence visible. Runner 5.0 was
+proposed but rejected: it would be slower than the player, so nothing but D31
+interception could catch a moving exposed player, which dissolves the "outside
+is lethal" loop (D53). 5.8 keeps Runners the exposure punisher, ~1.5x Swarm.
+**Expectation:** a Swarm crosses a 15-tile firing diameter in ~4s at 3.8, so the
+5-8s engagement target comes from road geometry (hairpins, horseshoes), not
+from straight approaches. Exposed-player danger and dash survival are
+re-measured and reported, not retuned, in this pass.
+
+### D68 — The start tower is a solid Moderate site
+**Date:** 2026-09-19
+**Decision:** after generation, calibrate the start deposit per map so the start
+tower's base extraction (before occupancy/archetype) lands in 0.8-1.0 Materials/s
+(target ~0.9), inside the Moderate tier (0.62-1.18) and never Rich. Richer
+seams stay beyond the existing start exclusion/buffer, and every map must still
+offer genuine Rich sites farther out.
+**Why:** a ~0.58/s home made "rush one rich outpost and neglect home" the
+automatic play. Home should be worth keeping while the rich site stays tempting.
+**Rejected:** changing extraction-upgrade scaling (+55%/level) or adding
+Extraction Threat/depletion now; test the economy under the new conditions first.
+The start tower's tactical relevance is measured (road tiles in range per seed),
+not enforced by a road-generator change.
+
+### D69 — Forest towers get a small cleared ring at placement
+**Date:** 2026-09-19
+**Decision:** when a tower is placed (construction start, and the generated start
+tower), forest tiles within the minimum radius that gives LOS from the tower to
+every siege position are converted to plain. Elevation, deposits, roads, marsh,
+water and cliffs are untouched. The radius is derived from siege geometry
+(tower radius 0.95 + attack range 1.5 + enemy radius, up to ~3.1 tiles for
+Heavies; LOS ignores only the endpoint tiles), expected ~2.2 tiles (5x5 minus
+corners), not the 1-1.5 first proposed, which leaves Heavies hidden at range 2.
+Caches that depend on terrain (flow fields, terrain render layers, visibility)
+are refreshed.
+**Why:** a besieged tower that cannot return fire is a bug, and the clearing
+explains itself visually. Forest beyond the ring still blocks long sightlines
+and fog vision; there is no special "towers ignore forest" rule. A few nearby
+tiles may become visible through the normal LOS rule; no extra reveal is added.
+
+### D70 — The calibrated start marker belongs to the tower site
+**Date:** 2026-09-19
+**Decision:** the start deposit keeps its seeded, jittered kernel, but its map
+marker is anchored to the generated start-tower tile and reports extraction at
+that tile. Other deposit markers remain at their kernel centroids.
+**Why:** D68 calibrates the home tower, not the random kernel centre. On LIMA and
+PAPA the raised, overlapping kernel made the old jittered centroid a genuinely
+Rich preview while the marker was labelled with the tower's Moderate 0.90/s.
+Anchoring this one marker to the site it describes keeps the bars, exact preview
+and starting-tower panel consistent without moving the deposit or any remote
+seam.
+
+### D71 — Strategy-comparison bots dropped
+**Date:** 2026-09-19
+**Decision:** the planned "part 2" (Gunner and Prospector bots comparing home
+investment against a rich-outpost rush) will not be built. The D67–D70 pass
+ships on its own measurements, and no HP/wave balance pass is queued from it.
+**Why:** the user's call after part 1 landed. The start-income calibration and
+the remote Rich-site counts already answer the economic question well enough
+for a prototype, and the remaining questions are about feel, answered by hand
+play.
+**Rejected:** a measurement-only Codex order for the bots, followed by HP/wave
+changes drawn from its results.
