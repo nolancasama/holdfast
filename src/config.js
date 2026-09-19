@@ -248,14 +248,17 @@ export const ENEMIES = {
   swarm: {
     name: 'Swarm', color: '#c98bd8', radius: 0.34,
     hp: 30, speed: 3.8, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
+    breachFrac: 0.04,        // D73: of the occupied tower's max hp, once, on contact
   },
   runner: {
     name: 'Runner', color: '#78e08f', radius: 0.30,
     hp: 46, speed: 5.8, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
+    breachFrac: 0.06,
   },
   heavy: {
     name: 'Heavy', color: '#e8833a', radius: 0.62,
     hp: 270, speed: 1.7, towerDps: 34, playerHit: 55, cost: 22, unlockWave: 3,
+    breachFrac: 0.18,
   },
 };
 
@@ -269,6 +272,16 @@ export const ENEMY = {
   // pursuer cuts the corner - without a leash, an aura or a speed buff.
   pursuitLeadTime: 1.15,     // seconds of lead, capped by time-to-intercept
   pursuitLeadRange: 12,      // only lead when close enough to actually cut in
+};
+
+// D73: the occupied tower is the endpoint. An enemy that touches it breaches
+// once - burst damage, then it is gone - instead of sieging it over time.
+export const BREACH = {
+  contactGap: 0.25,          // contact = tower radius + enemy radius + this
+  floaterMerge: 0.5,         // seconds: close breaches share one BREACH floater
+  messageInterval: 3.0,      // seconds between log lines per tower
+  shake: 0.35,               // seconds of tower jitter per breach
+  ring: { life: 0.45, radius: 2.4, heavyRadius: 3.6 },
 };
 
 export const STUCK = {
@@ -307,7 +320,8 @@ export const WAVE = {
   heavyBiasPerWave: 0.30,    // later waves lean on Heavies rather than more Swarms
 };
 
-export const START_MATERIALS = 220;
+// D72: the start tower plus two immediate builds (145 + 190), 15 left over.
+export const START_MATERIALS = 350;
 
 // Readability floors for the fixed whole-map view. World-space rings still use
 // the fitted tile scale; only the important entities and their labels/bars floor.
@@ -374,13 +388,14 @@ export const AUDIO = {
   farDistance: 42,
   rateLimits: {
     towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
-    heavyTowerHit: 0.22, towerUnderAttack: 2.5, collapsing: 0.75, repair: 0.16, default: 0.08,
+    heavyTowerHit: 0.22, breach: 0.12, heavyBreach: 0.2, towerUnderAttack: 2.5, collapsing: 0.75, repair: 0.16, default: 0.08,
   },
   limiter: { threshold: -12, ratio: 16 },
   envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
   cues: {
     towerFire: [260, .10, 'square'], enemyHit: [430, .045, 'sine'], enemyDeath: [330, .14, 'triangle'],
-    towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'], towerDestroy: [56, .72, 'triangle'],
+    towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'],
+    breach: [64, .42, 'sawtooth'], heavyBreach: [38, .75, 'sawtooth'], towerDestroy: [56, .72, 'triangle'],
     collapsing: [92, .70, 'sawtooth'], playerDamage: [880, .11, 'square'], exposed: [720, .16, 'sawtooth'],
     towerEntry: [145, .18, 'triangle'], constructionStart: [180, .13, 'square'], constructionComplete: [620, .24, 'triangle'],
     repair: [760, .06, 'sine'], upgradeStart: [180, .13, 'square'], upgrade: [720, .18, 'triangle'],

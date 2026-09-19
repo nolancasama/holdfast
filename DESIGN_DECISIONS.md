@@ -970,3 +970,49 @@ for a prototype, and the remaining questions are about feel, answered by hand
 play.
 **Rejected:** a measurement-only Codex order for the bots, followed by HP/wave
 changes drawn from its results.
+
+### D72 — A three-tower opening
+**Date:** 2026-09-19
+**Decision:** `START_MATERIALS` 220 -> 350. With the free start tower counted,
+the first two builds cost 145 and 190 (335), leaving 15; the third (235) must
+wait for income. Tower, extraction and upgrade costs are unchanged.
+**Why:** one tower plus one build gave no defensive chain to plan. Three towers
+at the outset let the player lay out outer tower -> inner tower -> occupied
+endpoint before the first wave, which the D73 breach endpoint is built around.
+**Rejected:** cheaper towers (changes the whole late-game sink); compensating
+enemy buffs in the same pass (the opening and breach are tested in isolation
+first).
+
+### D73 — The occupied tower is a breach endpoint, not a siege target
+**Date:** 2026-09-19
+**Decision:** an enemy whose target is the occupied tower at the moment it
+touches it - `dist <= TOWER.radius + enemy radius + BREACH.contactGap (0.25)`,
+i.e. Swarm 1.54, Runner 1.50, Heavy 1.82 - breaches once: the tower loses
+`breachFrac x maxHp x towerStats.damageTaken` (Swarm 4%, Runner 6%, Heavy 18%;
+21/31/94 of 520 on an unarmoured occupant) and the enemy is removed. It is
+never sieged over time. A breach is a leak, not a kill: no kill credit, no drop,
+no death cue; `stats.breaches`, `breachesByType` and `breachDamage` record it.
+Feedback is a wall-point explosion and shockwave (larger for a Heavy), tower
+flash and shake, a distinct full-volume `breach`/`heavyBreach` cue, and one
+merged `BREACH -N` floater for breaches within 0.5s. A lethal breach calls the
+ordinary `destroyTower`, so collapse damage, tower-loss stats and the D64
+defeat rules apply unchanged; later enemies in the same frame lose their target
+as usual and do not breach. No player HP is taken directly.
+D53 is untouched: the stale-target check still runs first at the old siege
+reach, so an enemy walking at a tower the player has left re-targets instead
+of breaching it. A besieger already committed to an unoccupied tower keeps its
+sticky DPS siege; if the player shelters in that tower again, the besieger
+closes to contact and breaches (siegedId kept, so leaving again leaves it
+committed).
+**Why:** a traditional TD endpoint: every leak is a discrete, legible event
+("one got through"), a Heavy that survives the chain is a serious hit, and the
+occupied tower keeps firing right up to contact so last-second kills are
+possible. Contact is deliberately tighter than the old siege reach (3.07 for a
+Heavy): towers do not block movement, and breaching at attack range would make
+enemies explode ~1.5 tiles off the wall and pre-empt last-second kills.
+**Known consequence:** under D53 a siege could only *begin* at the occupied
+tower. With that replaced by breach, no new siege starts in normal play; the
+sticky-siege path is preserved but effectively dormant, so unoccupied towers
+are now practically never damaged and tower loss comes from breaches.
+**Rejected:** breaching at the old siege reach; direct player damage on
+breach; removing the siege code outright.

@@ -4,7 +4,7 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
-  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK,
+  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK, BREACH, START_MATERIALS,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, inBounds, isPassable, hasLineOfSight, kindAt, elevAt,
@@ -20,7 +20,8 @@ import {
   setPaused, collectDrop, grantEquipment, depositRichness, resourceScoreAt,
   emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState, upgradeState,
-  upgradeRateMult, towerAlarmState, recomputeVisibility, stuckState, endState,
+  upgradeRateMult, towerAlarmState, recomputeVisibility, stuckState, endState, towerCost,
+  breachContact,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -268,7 +269,8 @@ function approachEngagement(type, speed) {
   g.occupiedTowerId = t.id;
   const e = addRealEnemy(g, t.x + TOWER.weapon.range - 0.01, t.y, type, t.id, speed);
   let engagement = 0;
-  for (let step = 0; step < 1000 && !e.sieging; step++) {
+  // D73: the occupied tower is breached at contact rather than sieged.
+  for (let step = 0; step < 1000 && !e.sieging && g.enemies.includes(e); step++) {
     if (Math.hypot(e.x - t.x, e.y - t.y) <= TOWER.weapon.range
         && hasLineOfSight(map, t.x, t.y, e.x, e.y)) engagement += 0.02;
     update(g, 0.02);
@@ -982,10 +984,12 @@ check('a sieging enemy does not abandon its target when the player leaves', () =
   placed.progress = 1;
   placed.hp = placed.maxHp;
 
-  g.player.x = a.x;
-  g.player.y = a.y;
-  for (let i = 0; i < 60; i++) update(g, 1 / 60);
-  if (g.occupiedTowerId !== a.id) return 'player did not occupy the first tower';
+  // D73: the occupied tower is breached, never sieged, so the commitment under
+  // test is one made while A stands unoccupied and the player is elsewhere.
+  const away = walkableNear(g, a.x, a.y, PLAYER.presenceRadius + 6);
+  if (!away) return 'no walkable spot away from the towers';
+  g.player.x = away.x;
+  g.player.y = away.y;
 
   // An enemy that has arrived and started chewing on tower A.
   const e = {
@@ -1094,12 +1098,17 @@ check('D53-A: an enemy already sieging the old tower stays on it after the playe
   if (!f) return 'could not build the fixture';
   const { g, a, b } = f;
   a.hp = a.maxHp = 1e9;
-  if (!occupy(g, a)) return 'player did not occupy A';
+  // D73: an occupied tower is breached, not sieged, so the besieger is one
+  // already committed to A while it stands unoccupied.
+  const away = walkableNear(g, a.x, a.y, PLAYER.presenceRadius + 6);
+  if (!away) return 'no walkable spot away from A';
+  g.player.x = away.x; g.player.y = away.y;
   const spot = walkableNear(g, a.x, a.y, TOWER.radius + 1.2, false);
   if (!spot) return 'no siege position beside A';
   const e = testEnemy(g, spot, a.id);
+  e.sieging = true; e.siegedId = a.id;
   update(g, 1 / 60);
-  if (!e.sieging) return 'enemy did not begin sieging A';
+  if (!e.sieging) return 'enemy did not keep sieging A';
   if (!occupy(g, b)) return 'player did not occupy B';
   runFor(g, 1);
   // Separation can shove a besieger off the wall; that must not end the commitment.
@@ -1492,9 +1501,14 @@ check('a sieging enemy standing still for ten seconds is never detected', () => 
   g.phaseLeft = 999;
   const t = g.towers[0];
   t.hp = t.maxHp = 1e9; t.shotCd = 1e9;
-  if (!occupy(g, t)) return 'could not occupy tower';
+  // D73: only an unoccupied tower can be sieged; the player stands clear.
+  const away = walkableNear(g, t.x, t.y, PLAYER.presenceRadius + 6);
+  if (!away) return 'no walkable spot away from the tower';
+  g.player.x = away.x; g.player.y = away.y;
   const e = addRealEnemy(g, t.x + TOWER.radius + ENEMY.attackRange, t.y, 'heavy', t.id, 0);
+  e.sieging = true; e.siegedId = t.id;
   runFor(g, 10);
+  if (g.occupiedTowerId !== null) return 'player ended up occupying the tower';
   return e.sieging && stuckState(g).detections === 0 ? null : 'intentional siege was treated as stuck';
 });
 
@@ -2176,6 +2190,250 @@ check('shelter grants occupancy only after the transition delay', () => {
   return null;
 });
 
+// --- D72: a three-tower opening ---------------------------------------------
+
+/** Legal build sites on a real map, far enough apart to use in sequence. */
+function openingSites(g, count) {
+  const saved = g.materials;
+  g.materials = 1e9;
+  const picked = [];
+  for (let y = 3; y < MAP.h - 3 && picked.length < count; y++) {
+    for (let x = 3; x < MAP.w - 3 && picked.length < count; x++) {
+      const site = { x: x + 0.5, y: y + 0.5 };
+      if (!canPlaceAt(g, site.x, site.y).ok) continue;
+      if (picked.some((p) => Math.hypot(p.x - site.x, p.y - site.y) < TOWER.minSpacing + 1)) continue;
+      picked.push(site);
+    }
+  }
+  g.materials = saved;
+  return picked;
+}
+
+check('D72-A: a new game starts with exactly 350 Materials', () => {
+  const g = createGame('D72-A', 'gunner');
+  if (START_MATERIALS !== 350) return `START_MATERIALS is ${START_MATERIALS}`;
+  return g.materials === 350 ? null : `new game has ${g.materials} Materials`;
+});
+
+check('D72-B/C: two towers are affordable at once, a third is not', () => {
+  const g = createGame('D72-B', 'gunner');
+  if (g.towers.length !== 1) return `expected only the start tower, found ${g.towers.length}`;
+  const sites = openingSites(g, 3);
+  if (sites.length < 3) return 'could not find three legal sites';
+  const steps = [[145, 205], [190, 15]];
+  for (let n = 0; n < 2; n++) {
+    const [cost, left] = steps[n];
+    if (towerCost(g) !== cost) return `build ${n + 1} costs ${towerCost(g)}, expected ${cost}`;
+    const r = buildAt(g, sites[n].x, sites[n].y);
+    if (!r.ok) return `build ${n + 1} refused: ${r.reason}`;
+    if (Math.abs(g.materials - left) > 1e-9) return `after build ${n + 1}: ${g.materials} left, expected ${left}`;
+  }
+  if (towerCost(g) !== 235) return `third build costs ${towerCost(g)}, expected 235`;
+  const r = buildAt(g, sites[2].x, sites[2].y);
+  if (r.ok) return 'third tower was affordable from the starting Materials';
+  return g.towers.length === 3 && g.materials === 15 ? null : 'refused build changed towers or Materials';
+});
+
+// --- D73: the occupied tower is breached, not sieged -----------------------
+
+/** One occupied tower on open ground; its gun is silenced unless `fire`. */
+function breachFixture(seed, { fire = false } = {}) {
+  const g = createGame(seed, 'gunner');
+  g.map = syntheticMap();
+  g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
+  const t = g.towers[0];
+  t.x = 52.5; t.y = 26.5; t.field = null;
+  t.shotCd = fire ? 0 : 1e9;
+  shelterAt(g, t);
+  return { g, t };
+}
+
+function shelterAt(g, t) {
+  g.player.x = t.x; g.player.y = t.y;
+  g.shelter = { towerId: t.id, progress: PLAYER.shelterTime, required: PLAYER.shelterTime };
+  g.occupiedTowerId = t.id;
+}
+
+/** A real enemy of `type`, siege damage included, on the given bearing. */
+function breachEnemy(g, t, type, distance, angle = 0, speed = ENEMIES[type].speed) {
+  const e = addRealEnemy(g, t.x + Math.cos(angle) * distance, t.y + Math.sin(angle) * distance, type, t.id, speed);
+  e.def = { ...ENEMIES[type], speed };
+  return e;
+}
+
+const expectedBreach = (g, t, type) => ENEMIES[type].breachFrac * t.maxHp * towerStats(g, t).damageTaken;
+
+check('D73 breach fractions are 4% / 6% / 18% of max tower hp', () => {
+  const got = ['swarm', 'runner', 'heavy'].map((k) => ENEMIES[k].breachFrac).join('/');
+  return got === '0.04/0.06/0.18' ? null : `breach fractions are ${got}`;
+});
+
+for (const [label, type] of [['A', 'swarm'], ['B', 'runner'], ['C', 'heavy']]) {
+  check(`BREACH-${label}: a ${type} reaching the occupied tower breaches once and is removed`, () => {
+    const { g, t } = breachFixture(`BREACH-${label}`);
+    const e = breachEnemy(g, t, type, 5);
+    const hp0 = t.hp;
+    const before = { kills: g.stats.kills, drops: g.drops.length };
+    drainAudioEvents(g);
+    let lastAlive = Infinity;
+    for (let i = 0; i < 600 && g.enemies.includes(e); i++) {
+      lastAlive = Math.hypot(e.x - t.x, e.y - t.y);
+      update(g, 1 / 60);
+      if (g.enemies.includes(e) && t.hp !== hp0) return 'tower lost hp before contact';
+    }
+    if (g.enemies.includes(e)) return 'enemy never reached the tower';
+    if (e.sieging) return 'enemy began a siege of the occupied tower';
+    if (lastAlive > breachContact(e) + 1e-9) return `breached ${lastAlive.toFixed(2)} tiles out, contact is ${breachContact(e).toFixed(2)}`;
+    const lost = hp0 - t.hp;
+    const want = expectedBreach(g, t, type);
+    if (Math.abs(lost - want) > 1e-6) return `tower lost ${lost.toFixed(2)}, expected ${want.toFixed(2)}`;
+    const hp1 = t.hp;
+    runFor(g, 3);
+    if (t.hp !== hp1) return 'tower kept losing hp after the breach';
+    if (g.stats.kills !== before.kills || g.drops.length !== before.drops) return 'breach counted as a kill or dropped loot';
+    if (g.stats.breaches !== 1 || g.stats.breachesByType[type] !== 1) return 'breach stats not recorded';
+    const audio = drainAudioEvents(g).map((a) => a.type);
+    if (audio.includes('enemyDeath')) return 'breach played the enemy-death cue';
+    return audio.includes(type === 'heavy' ? 'heavyBreach' : 'breach') ? null : 'no breach audio event';
+  });
+}
+
+check('BREACH-D: an enemy killed just before contact does not breach', () => {
+  const trial = (fire) => {
+    const { g, t } = breachFixture(`BREACH-D-${fire}`, { fire });
+    t.retargetIn = 0;
+    const e = breachEnemy(g, t, 'swarm', breachContact({ def: ENEMIES.swarm }) + 0.05, Math.PI);
+    e.hp = 1;
+    const hp0 = t.hp;
+    runFor(g, 1);
+    return { g, t, e, hp0 };
+  };
+  const control = trial(false);
+  if (control.g.stats.breaches !== 1) return 'harness: the same approach does not breach without tower fire';
+  const { g, t, e, hp0 } = trial(true);
+  if (g.enemies.includes(e)) return 'tower did not kill the enemy';
+  if (g.stats.kills !== 1) return `kills is ${g.stats.kills}`;
+  return g.stats.breaches === 0 && t.hp === hp0 ? null : 'killed enemy still breached';
+});
+
+check('BREACH-E: a breached enemy can never apply damage again', () => {
+  const { g, t } = breachFixture('BREACH-E');
+  const e = breachEnemy(g, t, 'heavy', 1.0);
+  update(g, 1 / 60);
+  if (g.enemies.includes(e) || g.stats.breaches !== 1) return 'enemy did not breach';
+  const hp1 = t.hp;
+  g.enemies.push(e); // a stale reference re-entering the list
+  runFor(g, 1);
+  return t.hp === hp1 && g.stats.breaches === 1 ? null : 'a breached enemy damaged the tower twice';
+});
+
+check('BREACH-F: sticky siege of an unoccupied tower is unchanged', () => {
+  const { g, t } = breachFixture('BREACH-F');
+  g.player.x = t.x + 12; g.player.y = t.y;
+  g.shelter = { towerId: null, progress: 0, required: PLAYER.shelterTime };
+  g.occupiedTowerId = null;
+  const e = breachEnemy(g, t, 'heavy', TOWER.radius + ENEMY.attackRange + ENEMIES.heavy.radius - 0.35, 0, 0);
+  e.sieging = true; e.siegedId = t.id; e.retargetIn = 0;
+  const hp0 = t.hp;
+  runFor(g, 3);
+  if (g.occupiedTowerId !== null) return 'player occupied the tower';
+  const lost = hp0 - t.hp;
+  const want = ENEMIES.heavy.towerDps * 3;
+  if (Math.abs(lost - want) > want * 0.03) return `siege dealt ${lost.toFixed(1)} over 3s, expected ~${want}`;
+  if (!g.enemies.includes(e) || !e.sieging || e.targetId !== t.id) return 'besieger lost its commitment';
+  if (g.stats.breaches !== 0) return 'siege of an unoccupied tower was treated as a breach';
+  // Once the player shelters there again it is the endpoint: one breach, no DPS.
+  shelterAt(g, t);
+  e.def = { ...e.def, speed: ENEMIES.heavy.speed };
+  const hp1 = t.hp;
+  runFor(g, 3);
+  if (g.enemies.includes(e)) return 'besieger of a re-occupied tower never breached';
+  const burst = hp1 - t.hp;
+  const wantBurst = expectedBreach(g, t, 'heavy');
+  return Math.abs(burst - wantBurst) < 1e-6 ? null : `re-occupied tower lost ${burst.toFixed(1)}, expected ${wantBurst.toFixed(1)}`;
+});
+
+check('BREACH-G: leaving the targeted tower before contact means no breach there', () => {
+  const f = aggroFixture('BREACH-G');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b } = f;
+  for (const t of g.towers) t.shotCd = 1e9;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = walkableNear(g, a.x, a.y, breachContact({ def: ENEMIES.swarm }) + 0.8, false);
+  if (!spot) return 'no approach position beside A';
+  const e = testEnemy(g, spot, a.id, 0);
+  e.type = 'swarm'; e.def = { ...ENEMIES.swarm, speed: 0 };
+  if (!occupy(g, b)) return 'player did not occupy B';
+  const hp0 = a.hp;
+  e.def.speed = ENEMIES.swarm.speed;
+  e.retargetIn = 99;
+  runFor(g, 3);
+  if (a.hp !== hp0) return `abandoned A took ${(hp0 - a.hp).toFixed(1)} damage`;
+  if (!g.enemies.includes(e)) return 'enemy vanished at the abandoned tower';
+  return e.targetId !== a.id ? null : 'enemy still targets the abandoned tower';
+});
+
+check('BREACH-H: a cluster at contact each breaches once with its own damage', () => {
+  const { g, t } = breachFixture('BREACH-H');
+  const types = ['swarm', 'swarm', 'runner', 'heavy'];
+  const enemies = types.map((type, n) => breachEnemy(g, t, type,
+    breachContact({ def: ENEMIES[type] }) - 0.05, (n / types.length) * Math.PI * 2, 0));
+  const hp0 = t.hp;
+  update(g, 1 / 60);
+  if (enemies.some((e) => g.enemies.includes(e))) return 'not every clustered enemy breached';
+  const want = types.reduce((sum, type) => sum + expectedBreach(g, t, type), 0);
+  if (Math.abs(hp0 - t.hp - want) > 1e-6) return `cluster dealt ${(hp0 - t.hp).toFixed(2)}, expected ${want.toFixed(2)}`;
+  const by = g.stats.breachesByType;
+  if (g.stats.breaches !== 4 || by.swarm !== 2 || by.runner !== 1 || by.heavy !== 1) return 'breach counts wrong';
+  const floaters = g.floaters.filter((f) => f.breachTowerId === t.id);
+  if (floaters.length !== 1) return `cluster produced ${floaters.length} BREACH floaters`;
+  const hp1 = t.hp;
+  runFor(g, 2);
+  return t.hp === hp1 ? null : 'a clustered enemy damaged the tower again';
+});
+
+check('BREACH-I: a breach that destroys the last tower uses the normal collapse and defeat', () => {
+  const survive = breachFixture('BREACH-I');
+  const trio = [0, 1, 2].map((n) => breachEnemy(survive.g, survive.t, 'heavy', 1.0, n * 2, 0));
+  survive.t.hp = 10;
+  update(survive.g, 1 / 60);
+  const g = survive.g;
+  if (g.towers.length !== 0 || g.stats.towersLost !== 1) return 'tower was not destroyed';
+  if (g.stats.breaches !== 1) return `${g.stats.breaches} breaches against one destroyed tower`;
+  if (trio.filter((e) => g.enemies.includes(e)).length !== 2) return 'enemies after the collapse were removed';
+  const crushed = PLAYER.maxHp * TOWER.collapseDamageFrac;
+  if (Math.abs(g.player.hp - (PLAYER.maxHp - crushed)) > 1e-6) return 'collapse damage did not reach the player';
+  const end = endState(g);
+  if (end.status !== 'lost' || end.lossCause !== 'towers') return `end state ${JSON.stringify(end)}`;
+
+  const fatal = breachFixture('BREACH-I-DEATH');
+  breachEnemy(fatal.g, fatal.t, 'heavy', 1.0, 0, 0);
+  fatal.t.hp = 10;
+  fatal.g.player.hp = 5;
+  update(fatal.g, 1 / 60);
+  const death = endState(fatal.g);
+  return death.status === 'lost' && death.lossCause === 'died' ? null : `player-death priority lost: ${JSON.stringify(death)}`;
+});
+
+check('BREACH-J: a breach gives no kill, no drop and no Materials', () => {
+  const { g, t } = breachFixture('BREACH-J');
+  const savedChance = DROP.chance;
+  DROP.chance = 1;
+  try {
+    const e = breachEnemy(g, t, 'runner', 1.0, 0, 0);
+    t.resourceScore = 0;
+    const before = { kills: g.stats.kills, drops: g.drops.length, materials: g.materials };
+    update(g, 1 / 60);
+    if (g.enemies.includes(e)) return 'enemy did not breach';
+    if (g.stats.kills !== before.kills) return 'breach counted as a kill';
+    if (g.drops.length !== before.drops) return 'breach spawned a drop';
+    if (g.materials > before.materials + 1e-9) return 'breach granted Materials';
+    return g.stats.breaches === 1 && g.stats.breachDamage > 0 ? null : 'breach stats not recorded';
+  } finally {
+    DROP.chance = savedChance;
+  }
+});
+
 // --- D63 dense-wave instrumentation -----------------------------------------
 
 check('dense waves 3-8 report stuck counters without last-resort despawns', () => {
@@ -2218,6 +2476,9 @@ check('dense waves 3-8 report stuck counters without last-resort despawns', () =
             g.input = { mx: 0, my: 0, melee: false, repair: false };
           }
           update(g, 1 / 10);
+          // D73: breach damage is a fraction of max hp, so a huge maxHp alone
+          // no longer makes this diagnostic's tower unkillable.
+          t.hp = t.maxHp;
           measuredFrames++;
         }
         measuredMs += performance.now() - started;

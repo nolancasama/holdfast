@@ -1,6 +1,6 @@
 // Canvas drawing. Simple shapes only — readability over polish (plan §1).
 
-import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, richnessTierForRate } from './config.js';
+import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, richnessTierForRate } from './config.js';
 import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
 import { isHunting, towerStats } from './game.js';
 
@@ -283,8 +283,10 @@ function drawTowerRings(ctx, g) {
 
 function drawTowers(ctx, g, view) {
   for (const t of g.towers) {
-    const cx = t.x * TP;
-    const cy = t.y * TP;
+    // D73: a breach jolts the tower for a moment.
+    const jolt = t.shake > 0 ? localPx(view, 3.5) * (t.shake / BREACH.shake) : 0;
+    const cx = t.x * TP + (jolt ? (Math.random() - 0.5) * 2 * jolt : 0);
+    const cy = t.y * TP + (jolt ? (Math.random() - 0.5) * 2 * jolt : 0);
     const r = Math.max(TOWER.radius * TP, localPx(view, RENDER.towerMinRadiusPx));
     const frac = t.hp / t.maxHp;
     const collapsing = t.built && frac < TOWER.collapsingAt;
@@ -624,6 +626,17 @@ function drawFx(ctx, g, view) {
     ctx.beginPath();
     ctx.moveTo(tr.x0 * TP, tr.y0 * TP);
     ctx.lineTo(tr.x1 * TP, tr.y1 * TP);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  for (const w of g.shockwaves || []) {
+    if (!g.debug.showFog && !pointVisible(g, w.x, w.y)) continue;
+    const k = w.t / w.life;
+    ctx.globalAlpha = Math.max(0, 1 - k) * 0.9;
+    ctx.strokeStyle = w.color;
+    ctx.lineWidth = localPx(view, 2 + 4 * (1 - k));
+    ctx.beginPath();
+    ctx.arc(w.x * TP, w.y * TP, Math.max(1, w.radius * TP * (0.25 + 0.75 * Math.sqrt(k))), 0, Math.PI * 2);
     ctx.stroke();
   }
   ctx.globalAlpha = 1;

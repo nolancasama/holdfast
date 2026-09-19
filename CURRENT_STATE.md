@@ -1,8 +1,50 @@
 # Current State
 
-Last updated: 2026-09-19 (pacing/economy/forest pass accepted and committed)
+Last updated: 2026-09-19 (D72/D73 opening + breach pass, committed and pushed)
 
 ## Codex / Delegated Work — none in flight
+
+Codex was out of quota (usage limit until 2026-09-22 11:00 UTC); the router
+assigned D72/D73 to Claude, which implemented it directly.
+
+## D72–D73 three-tower opening and occupied-tower breach — COMMITTED AND PUSHED
+
+`START_MATERIALS` is 350 (start tower + builds at 145 and 190, 15 left; a third
+at 235 is refused). An enemy targeting the occupied tower at the moment it
+reaches contact (`TOWER.radius + enemy radius + BREACH.contactGap 0.25`: Swarm
+1.54, Runner 1.50, Heavy 1.82) breaches once for `breachFrac x maxHp x
+damageTaken` (4% / 6% / 18%, i.e. 21 / 31 / 94 on 520) and is removed with no
+kill, drop or death cue. `stats.breaches`, `breachesByType`, `breachDamage`
+record leaks. FX: wall-point burst + shockwave ring (`g.shockwaves`), tower
+flash and `t.shake`, `breach`/`heavyBreach` cues, one merged `BREACH -N`
+floater per 0.5s drawn above the OCCUPIED label, rate-limited log line. Lethal
+breaches use `destroyTower`. Sticky siege of unoccupied towers is unchanged
+but, as D73 records, effectively dormant in normal play. Files: `src/config.js`,
+`src/game.js`, `src/render.js`, `src/audio.js`, `test/run-tests.js`,
+`DESIGN_DECISIONS.md`. `npm test`: **119 passed, 0 failed** (13 new; 5 old
+tests migrated off siege-on-the-occupied-tower setups). The new tests were
+mutation-checked (no breach branch, no once-guard, kill credit each turn the
+relevant tests red).
+
+Browser runs (1600x900, no page errors), passive Gunner sitting in the start
+tower holding repair, W0 towers only, two builds on the west road (~16 and ~10
+tiles) - old siege code + 350 vs this pass:
+
+| seed | waves reached, siege / breach | gross occupied-tower damage, siege / breach | breaches S/R/H |
+|---|---|---|---|
+| ALPHA | 6 / 6 | 752 / 1926 | 25/23/8 |
+| CHARLIE | 4 / 4 | 694 / 1338 | 24/22/2 |
+| KILO | 6 / 7 | 749 / 2047 | 26/31/6 |
+| R7KD2P | 6 / 7 | 926 / 2913 | 25/31/16 |
+
+Siege cost ~0-10 hp in waves 1-4 (low-DPS besiegers died under occupied fire);
+breaches cost from wave 1 (0-17 per wave early, 13-25 in waves 5-7), so repair
+spending rises and wave 1 from an uncovered side can leak most of its Swarms.
+Every run ended `died`: breach destroys the tower with the player inside, so
+the D6 collapse (85 hp) always lands. No retune was made.
+
+**Next steps:** user hand-play of the three-tower opening and breach feel;
+pushed to `master` at the user's request before hand-play acceptance.
 
 ## D67–D70 pacing/economy/forest pass — REVIEWED, ACCEPTED AND COMMITTED
 
@@ -131,7 +173,8 @@ of the entire tower network.
   tower stays committed to it; enemies only heading for a tower the player leaves
   drop it within 0.9s and never start a siege there, and new spawns never pick
   it. Hunters within 12 tiles pursue directly (D31 interception); farther ones
-  travel toward the player on the road-discounted lane field.
+  travel toward the player on the road-discounted lane field. D73: the occupied
+  tower is breached at contact, never sieged, so no new siege begins in play.
   `dangerState().hunters` retains the full near-hunter count, while HUD/canvas
   displays use `visibleHunters` only. Runner 5.8 remains faster than the 5.3
   player; Swarm 3.8 is substantially slower, and Heavy remains 1.7. Ordinary
@@ -197,7 +240,7 @@ of the entire tower network.
 
 ## Automated verification
 
-`npm test` runs 106 checks. It covers 20 deterministic seeds,
+`npm test` runs 119 checks. It covers 20 deterministic seeds,
 terrain validation, road connectivity and legality, seed variation, lane/direct
 field behavior, road placement refusal, ford use and generated route character,
 road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
@@ -213,8 +256,9 @@ waves 3-8 dense diagnostics on eight seeds, all tower-loss/death priority cases,
 and terminal-state freezing. D67-D69 add exact speed/order and increased
 isolated-engagement checks, 20-seed start-income/remote-Rich assertions, and
 all-angle forest siege/fire, distant blocking, elevation, layer-invariant,
-open-ground and cache-invalidation tests plus a real-seed reproduction. Final
-result: **106 passed, 0 failed**. The
+open-ground and cache-invalidation tests plus a real-seed reproduction. D72-D73
+add the 350 opening (A-C) and breach A-J. Final result: **119 passed, 0
+failed**. The
 wall-clock road-analysis budget (400ms) remains load-sensitive; no road code
 changed.
 `npm run road-report` prints per-seed features,

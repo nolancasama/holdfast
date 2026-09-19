@@ -3,7 +3,7 @@
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY, AGGRO,
   WAVE, START_MATERIALS, DROP, ELEVATION_NAMES, richnessTierForRate, AUDIO,
-  BUILD, VISION, STUCK,
+  BUILD, VISION, STUCK, BREACH,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -42,7 +42,7 @@ export function createGame(seedString, archetypeKey) {
     },
     effects: {}, equipment: [],
     towers: [], enemies: [], drops: [],
-    tracers: [], particles: [], floaters: [],
+    tracers: [], particles: [], floaters: [], shockwaves: [],
     nextTowerId: 1, nextEnemyId: 1,
     selected: null, buildMode: false,
     cursor: { x: map.start.x, y: map.start.y },
@@ -53,6 +53,7 @@ export function createGame(seedString, archetypeKey) {
     log: [], audioEvents: [],
     stats: {
       kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0,
+      breaches: 0, breachesByType: { swarm: 0, runner: 0, heavy: 0 }, breachDamage: 0,
       stuckDetections: 0, stuckRecoveries: 0, stuckDespawns: 0,
     },
     debug: { showPaths: false, showFog: false, spawnPaused: false, open: false, stuckEpisodes: [] },
@@ -438,6 +439,65 @@ function destroyTower(g, t) {
   }
 }
 
+/** D73: the distance at which an enemy touches the occupied tower and breaches. */
+export function breachContact(e) {
+  return TOWER.radius + e.def.radius + BREACH.contactGap;
+}
+
+/**
+ * D73: an enemy that reaches the occupied tower hits it once and is gone. It is
+ * a leak, not a kill: no kill credit, no drop, no death cue. A lethal breach
+ * goes through the ordinary destroyTower path.
+ */
+function breachTower(g, e, t) {
+  e.breached = true;
+  g.enemies = g.enemies.filter((o) => o !== e);
+
+  const dmg = (e.def.breachFrac ?? 0) * t.maxHp * towerStats(g, t).damageTaken;
+  const before = t.hp / t.maxHp;
+  t.hp -= dmg;
+  t.flash = 1;
+  t.shake = BREACH.shake;
+  g.stats.breaches++;
+  g.stats.breachesByType[e.type] = (g.stats.breachesByType[e.type] || 0) + 1;
+  g.stats.breachDamage += dmg;
+
+  // Impact where the enemy meets the wall, on its own bearing.
+  const a = Math.atan2(e.y - t.y, e.x - t.x);
+  const ix = t.x + Math.cos(a) * TOWER.radius;
+  const iy = t.y + Math.sin(a) * TOWER.radius;
+  const heavy = e.type === 'heavy';
+  burst(g, ix, iy, e.def.color, heavy ? 22 : 12, heavy ? 7 : 5);
+  burst(g, ix, iy, '#ffb347', heavy ? 18 : 9, heavy ? 6 : 4.5);
+  burst(g, ix, iy, '#ffffff', heavy ? 8 : 4, 3);
+  g.shockwaves.push({ x: ix, y: iy, t: 0, life: BREACH.ring.life,
+    radius: heavy ? BREACH.ring.heavyRadius : BREACH.ring.radius, color: heavy ? '#ff7a2e' : '#ffb347' });
+  emitAudioEvent(g, heavy ? 'heavyBreach' : 'breach', { x: ix, y: iy, enemyType: e.type });
+
+  // Close breaches share one floater so a cluster reads as one number.
+  const merge = g.floaters.find((f) => f.breachTowerId === t.id && g.time - f.breachAt < BREACH.floaterMerge);
+  if (merge) {
+    merge.breachDamage += dmg;
+    merge.breachAt = g.time;
+    merge.t = 0;
+    merge.text = `BREACH -${Math.round(merge.breachDamage)}`;
+  } else {
+    // Above the OCCUPIED label, which sits just over the tower's hp bar.
+    floater(g, t.x, t.y - 2.9, `BREACH -${Math.round(dmg)}`, '#ff5a3c');
+    Object.assign(g.floaters[g.floaters.length - 1], { breachTowerId: t.id, breachAt: g.time, breachDamage: dmg });
+  }
+  if (!Number.isFinite(t.breachSaidAt) || g.time - t.breachSaidAt >= BREACH.messageInterval) {
+    t.breachSaidAt = g.time;
+    say(g, `Breach! ${e.def.name || 'An enemy'} got through to tower #${t.id}.`);
+  }
+
+  if (before >= TOWER.collapsingAt && t.hp / t.maxHp < TOWER.collapsingAt) {
+    say(g, 'A tower is COLLAPSING.');
+    emitAudioEvent(g, 'collapsing', t);
+  }
+  if (t.hp <= 0) destroyTower(g, t);
+}
+
 // ---------------------------------------------------------------------------
 // Effects / feedback
 // ---------------------------------------------------------------------------
@@ -798,6 +858,7 @@ function updateEnemies(g, dt) {
   const p = g.player;
 
   for (const e of [...g.enemies]) {
+    if (e.breached) continue;
     e.flash = Math.max(0, e.flash - dt * 4);
     e.hitCd = Math.max(0, e.hitCd - dt);
     e.retargetIn -= dt;
@@ -844,7 +905,17 @@ function updateEnemies(g, dt) {
     let motionFieldKey = null;
     let reach = 0;
 
-    if (resolved) {
+    if (resolved && resolved.id === g.occupiedTowerId) {
+      // D73: the occupied tower is the endpoint. Keep closing (and taking fire)
+      // until actual contact, then breach once. It is never sieged over time;
+      // siegedId is kept so a sticky besieger stays committed if the player leaves.
+      e.sieging = false;
+      reach = breachContact(e);
+      if (dist(e, resolved) <= reach) { breachTower(g, e, resolved); continue; }
+      motionField = towerField(g, resolved);
+      motionFieldKey = `tower:${resolved.id}`;
+      aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, resolved, motionField);
+    } else if (resolved) {
       reach = TOWER.radius + ENEMY.attackRange + e.def.radius;
       const d = dist(e, resolved);
       if (d <= reach) {
@@ -1437,7 +1508,7 @@ function updateRepair(g, dt) {
 // ---------------------------------------------------------------------------
 
 function updateFx(g, dt) {
-  for (const a of [g.tracers, g.particles, g.floaters]) {
+  for (const a of [g.tracers, g.particles, g.floaters, g.shockwaves]) {
     for (let i = a.length - 1; i >= 0; i--) {
       a[i].t += dt;
       if (a[i].t >= a[i].life) a.splice(i, 1);
@@ -1450,6 +1521,7 @@ function updateFx(g, dt) {
     p.vy *= 1 - 2.2 * dt;
   }
   for (const f of g.floaters) f.y -= 1.1 * dt;
+  for (const t of g.towers) if (t.shake > 0) t.shake = Math.max(0, t.shake - dt);
 }
 
 export function setPaused(g, paused = !g.paused) {
