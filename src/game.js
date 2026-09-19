@@ -417,7 +417,13 @@ function destroyTower(g, t) {
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
-  for (const e of g.enemies) if (e.targetId === t.id) { e.targetId = null; e.sieging = false; e.siegedId = null; }
+  for (const e of g.enemies) {
+    if (e.targetId !== t.id) continue;
+    // D76: a structure hunter moves on to the nearest surviving tower by path
+    // cost; everyone else re-reads the situation on the next update.
+    setTarget(e, null);
+    if (isStructureHunter(e)) setTarget(e, nearestReachableTower(g, e)?.id ?? null);
+  }
 
   for (let i = 0; i < 46; i++) {
     const a = Math.random() * Math.PI * 2;
@@ -439,15 +445,16 @@ function destroyTower(g, t) {
   }
 }
 
-/** D73: the distance at which an enemy touches the occupied tower and breaches. */
+/** D73: the distance at which an enemy touches its target tower and breaches. */
 export function breachContact(e) {
   return TOWER.radius + e.def.radius + BREACH.contactGap;
 }
 
 /**
- * D73: an enemy that reaches the occupied tower hits it once and is gone. It is
- * a leak, not a kill: no kill credit, no drop, no death cue. A lethal breach
- * goes through the ordinary destroyTower path.
+ * D73/D76: an enemy that reaches its target tower - occupied, abandoned or
+ * unfinished - hits it once and is gone. It is a leak, not a kill: no kill
+ * credit, no drop, no death cue. A lethal breach goes through the ordinary
+ * destroyTower path.
  */
 function breachTower(g, e, t) {
   e.breached = true;
@@ -458,6 +465,13 @@ function breachTower(g, e, t) {
   t.hp -= dmg;
   t.flash = 1;
   t.shake = BREACH.shake;
+  // An abandoned tower is usually breached out of sight; raise the alarm the
+  // old siege raised so the player knows what they left behind is falling.
+  if (!isPointVisible(g, e.x, e.y)) {
+    if (!Number.isFinite(t.unseenHitAt) || g.time - t.unseenHitAt >= 5) say(g, `Tower #${t.id} UNDER ATTACK.`);
+    t.unseenHitAt = g.time;
+    emitAudioEvent(g, 'towerUnderAttack', t);
+  }
   g.stats.breaches++;
   g.stats.breachesByType[e.type] = (g.stats.breachesByType[e.type] || 0) + 1;
   g.stats.breachDamage += dmg;
@@ -779,38 +793,89 @@ export function spawnGroupAt(g, x, y, typeKey, count) {
   }
 }
 
-/** D5: an enemy that has physically attacked a tower stays committed to it. */
+/** D76: Swarm and Heavy hunt the tower network; the Runner hunts the player. */
+export function isStructureHunter(e) {
+  return ENEMIES[e.type]?.role === 'structures';
+}
+
+/**
+ * D5/D76: a structure hunter is committed to whatever tower it has selected,
+ * from the moment it selects it. Any other enemy is committed only if it was
+ * already sieging when the D73/D76 breach replaced siege (legacy state).
+ */
 function committedTo(e, t) {
-  return !!t && (e.sieging || e.siegedId === t.id);
+  return !!t && (isStructureHunter(e) || e.sieging || e.siegedId === t.id);
+}
+
+/** D76: path cost from the enemy to the tower on that tower's own lane field. */
+function towerPathCost(g, e, t) {
+  return fieldValueAt(towerField(g, t), e.x, e.y);
+}
+
+/** D76: the tower (finished or not) with the lowest finite path cost, if any. */
+function nearestReachableTower(g, e, exclude = null) {
+  let best = null;
+  let bestCost = Infinity;
+  for (const t of g.towers) {
+    if (t === exclude) continue;
+    const cost = towerPathCost(g, e, t);
+    if (cost < bestCost) { bestCost = cost; best = t; }
+  }
+  return best;
 }
 
 /**
  * D53: a tower target is held only while the player occupies it or this enemy
- * has already begun sieging it. An unoccupied tower is never a strategic target.
+ * is committed to it. For a Runner an unoccupied tower is never a strategic target.
  */
 function staleTowerTarget(g, e, t) {
   return !!t && t.id !== g.occupiedTowerId && !committedTo(e, t);
 }
 
-/**
- * D5/D53: an enemy already sieging keeps its target until that tower dies.
- * Everyone else takes the one strategic target the current state offers - the
- * occupied tower, or the exposed player - on a personal staggered timer, so
- * aggro rolls over gradually rather than the map turning as one. Unoccupied
- * towers, including one the player has just left, are not candidates.
- */
-function retarget(g, e) {
-  const currentTower = g.towers.find((t) => t.id === e.targetId) || null;
-  if (committedTo(e, currentTower)) return;
-  const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
-  const best = occupied ? occupied.id : PLAYER_TARGET_ID;
-  if (best !== e.targetId) { e.targetId = best; e.sieging = false; e.siegedId = null; }
+function setTarget(e, id) {
+  if (id !== e.targetId) { e.targetId = id; e.sieging = false; e.siegedId = null; }
 }
 
 /**
- * D53: the player has just left a tower. Enemies still merely heading for it
- * lose it as a target soon - each on a short random delay, so they peel away
- * rather than turn in unison - while enemies already sieging it stay.
+ * D76: a structure hunter keeps its tower until that tower is gone or its path
+ * is. Choosing afresh, it takes the occupied tower when it can reach it, and
+ * otherwise the nearest tower by path cost. With no reachable tower at all it
+ * falls back to the player so it never stands idle holding the wave open.
+ */
+function retargetStructureHunter(g, e) {
+  const current = g.towers.find((t) => t.id === e.targetId) || null;
+  if (current && Number.isFinite(towerPathCost(g, e, current))) return;
+  let next = null;
+  if (!current) {
+    const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
+    if (occupied && Number.isFinite(towerPathCost(g, e, occupied))) next = occupied;
+  }
+  next ||= nearestReachableTower(g, e, current);
+  // An unreachable reading with nowhere better to go keeps the commitment;
+  // stuck recovery owns getting it back onto the field.
+  if (!next && current) return;
+  setTarget(e, next ? next.id : PLAYER_TARGET_ID);
+}
+
+/**
+ * D5/D53/D76: a structure hunter holds its tower (see above). A Runner already
+ * committed keeps its target until that tower dies; otherwise it takes the one
+ * strategic target the current state offers - the occupied tower, or the
+ * exposed player - on a personal staggered timer, so aggro rolls over
+ * gradually rather than the map turning as one.
+ */
+function retarget(g, e) {
+  if (isStructureHunter(e)) { retargetStructureHunter(g, e); return; }
+  const currentTower = g.towers.find((t) => t.id === e.targetId) || null;
+  if (committedTo(e, currentTower)) return;
+  const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
+  setTarget(e, occupied ? occupied.id : PLAYER_TARGET_ID);
+}
+
+/**
+ * D53/D76: the player has just left a tower. Runners still merely heading for
+ * it lose it as a target soon - each on a short random delay, so they peel away
+ * rather than turn in unison. Structure hunters are committed and stay.
  */
 function releaseTowerAggro(g, towerId) {
   for (const e of g.enemies) {
@@ -913,58 +978,17 @@ function updateEnemies(g, dt) {
     let motionFieldKey = null;
     let reach = 0;
 
-    if (resolved && resolved.id === g.occupiedTowerId) {
-      // D73: the occupied tower is the endpoint. Keep closing (and taking fire)
-      // until actual contact, then breach once. It is never sieged over time;
-      // siegedId is kept so a sticky besieger stays committed if the player leaves.
+    if (resolved) {
+      // D73/D76: every tower an enemy still holds as a target - occupied,
+      // abandoned or unfinished - is an endpoint. Keep closing (and taking
+      // fire) until actual contact, then breach once. Nothing sieges over
+      // time any more; a legacy besieger closes in and breaches like the rest.
       e.sieging = false;
       reach = breachContact(e);
       if (dist(e, resolved) <= reach) { breachTower(g, e, resolved); continue; }
       motionField = towerField(g, resolved);
       motionFieldKey = `tower:${resolved.id}`;
       aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, resolved, motionField);
-    } else if (resolved) {
-      reach = TOWER.radius + ENEMY.attackRange + e.def.radius;
-      const d = dist(e, resolved);
-      if (d <= reach) {
-        e.siegedId = resolved.id;
-        if (!e.sieging) {
-          e.sieging = true;
-          // §10: spread around the perimeter rather than piling on one point.
-          e.siegeAngle = Math.atan2(e.y - resolved.y, e.x - resolved.x) + (Math.random() - 0.5) * 0.7;
-        }
-        const s = towerStats(g, resolved);
-        const dealt = e.def.towerDps * dt * s.damageTaken;
-        const before = resolved.hp / resolved.maxHp;
-        resolved.hp -= dealt;
-        emitAudioEvent(g, e.type === 'heavy' ? 'heavyTowerHit' : 'towerHit', { ...resolved, enemyType: e.type });
-        if (!isPointVisible(g, e.x, e.y)) {
-          const previousHitAt = resolved.unseenHitAt;
-          if (!Number.isFinite(previousHitAt) || g.time - previousHitAt >= 5) {
-            say(g, `Tower #${resolved.id} UNDER ATTACK.`);
-          }
-          resolved.unseenHitAt = g.time;
-          emitAudioEvent(g, 'towerUnderAttack', resolved);
-        }
-        resolved.flash = 1;
-        if (before >= TOWER.collapsingAt && resolved.hp / resolved.maxHp < TOWER.collapsingAt) {
-          say(g, 'A tower is COLLAPSING.');
-          emitAudioEvent(g, 'collapsing', resolved);
-        }
-        if (resolved.hp <= 0) destroyTower(g, resolved);
-
-        // Settle onto the perimeter slot instead of walking into the wall.
-        const want = { x: resolved.x + Math.cos(e.siegeAngle) * (reach - 0.35),
-                       y: resolved.y + Math.sin(e.siegeAngle) * (reach - 0.35) };
-        aim = { x: want.x - e.x, y: want.y - e.y };
-        const l = Math.hypot(aim.x, aim.y);
-        aim = l > 0.08 ? { x: aim.x / l, y: aim.y / l } : null;
-      } else {
-        e.sieging = false;
-        motionField = towerField(g, resolved);
-        motionFieldKey = `tower:${resolved.id}`;
-        aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, resolved, motionField);
-      }
     } else if (directPursuit) {
       motionField = playerField(g);
       motionFieldKey = `player:direct:${playerGoalKey}`;

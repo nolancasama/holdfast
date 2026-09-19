@@ -253,21 +253,25 @@ export const ARCHETYPES = {
 };
 
 // --- enemies ----------------------------------------------------------------
+// D76: towerDps is unused since every tower contact became a breach; kept for reference.
 export const ENEMIES = {
   swarm: {
     name: 'Swarm', color: '#c98bd8', radius: 0.34,
     hp: 30, speed: 3.8, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
-    breachFrac: 0.04,        // D73: of the occupied tower's max hp, once, on contact
+    breachFrac: 0.06,        // D73/D76: of the target tower's max hp, once, on contact
+    role: 'structures',      // D76: commits to a tower and ignores the player's retreat
   },
   runner: {
     name: 'Runner', color: '#78e08f', radius: 0.30,
     hp: 46, speed: 5.8, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
-    breachFrac: 0.06,
+    breachFrac: 0.09,
+    role: 'player',          // D76: hunts the exposed player, drops an abandoned tower
   },
   heavy: {
     name: 'Heavy', color: '#e8833a', radius: 0.62,
     hp: 270, speed: 1.7, towerDps: 34, playerHit: 55, cost: 22, unlockWave: 3,
-    breachFrac: 0.18,
+    breachFrac: 0.25,
+    role: 'structures',
   },
 };
 
@@ -306,7 +310,7 @@ export const AGGRO = {
   // D53: towers have no baseline aggro; the occupied tower or the exposed
   // player is the one strategic target, so score weights are gone.
   directPursuitRange: 12,    // beyond this, hunters travel toward the player by road
-  releaseDelayMax: 0.9,      // non-sieging enemies drop a just-abandoned tower within this
+  releaseDelayMax: 0.9,      // D76: Runners drop a just-abandoned tower within this
   retargetMin: 2.0,
   retargetMax: 4.0,
 };

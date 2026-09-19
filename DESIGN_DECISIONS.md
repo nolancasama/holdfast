@@ -1064,3 +1064,40 @@ which was previously faster than the player everywhere. Off-road the D67
 ordering is unchanged.
 **Rejected:** giving enemies the bonus; compensating with a higher Extraction
 rate multiplier.
+
+### D76 — Runners hunt the player; Swarms and Heavies hunt the tower network
+**Date:** 2026-09-19
+**Decision:** enemies carry a role (`ENEMIES[type].role`). The Runner
+(`'player'`) keeps D53 exactly: it targets the occupied tower or the exposed
+player, and on leaving a tower it drops that tower within
+`AGGRO.releaseDelayMax` on a personal stagger, then hunts with the existing
+direct/road pursuit and intercept. Swarm and Heavy (`'structures'`) are
+committed to the tower they select from the moment they select it, and nothing
+the player does moves them. They keep it until it is destroyed or its lane
+field reads Infinity from where they stand, and then only if another tower is
+reachable. Choosing afresh (spawn, or after the player target lapses), they
+take the occupied tower if reachable, otherwise the nearest tower by lane-field
+path cost. When their target is destroyed they take the nearest surviving tower
+by path cost, never "the occupied one". Unfinished towers are valid targets.
+If no tower is reachable they fall back to the player rather than stand idle
+holding the wave open.
+Every tower contact is now the D73 breach, whether the tower is occupied,
+abandoned or unfinished. The continuous siege branch is removed, so no enemy
+deals `towerDps` any more (the values stay in config, unused). A pre-D76
+enemy left in `sieging`/`siegedId` state is still committed and closes in to
+one breach. The stale-target check still runs first at the old siege reach,
+so a Runner that has lost its reason never breaches an abandoned tower. Breach
+fractions rise to Swarm 6%, Runner 9%, Heavy 25% (31/47/130 on 520 unmitigated),
+still multiplied by the occupant's `damageTaken` (Engineer 0.75). An abandoned
+tower has no occupant and takes the full fraction. A breach whose attacker is
+hidden raises the tower alarm (`unseenHitAt`, `towerUnderAttack`, "Tower #N UNDER
+ATTACK."), the job the siege branch used to do.
+**Why:** retreat becomes a real trade: "I can save myself, but what I leave
+behind may be destroyed." Slow enemies no longer trail uselessly after a
+player they cannot catch, so kiting is answered by the network falling and the
+D64 no-towers defeat, not by speed buffs.
+**Rejected:** raising Swarm/Heavy siege DPS (6->10, 34->50), since breach
+replaces prolonged siege; re-choosing the closest tower every retarget
+(zigzag); Euclidean replacement (ranks towers behind cliffs); per-enemy A*;
+keeping the dormant siege path alongside breach (it risked siege DPS and a
+breach from one arrival).

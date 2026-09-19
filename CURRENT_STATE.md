@@ -1,11 +1,46 @@
 # Current State
 
-Last updated: 2026-09-19 (D74/D75 economy + road pass, committed and pushed)
+Last updated: 2026-09-19 (D76 enemy roles + committed tower targets, committed and pushed)
 
 ## Codex / Delegated Work — none in flight
 
 Codex was out of quota (usage limit until 2026-09-22 11:00 UTC); the router
 assigned D72/D73 to Claude, which implemented it directly.
+
+## D76 enemy roles, tower commitment, breach everywhere — COMMITTED AND PUSHED, AWAITING HAND-PLAY
+
+Implemented by Claude directly (router: Codex usage-limited until 2026-09-22,
+other workers quarantined). Files: `src/config.js`, `src/game.js`,
+`test/run-tests.js`, `DESIGN_DECISIONS.md` (D76), this file. `npm test`:
+**135 passed, 0 failed**. 11 old tests migrated (D53 release tests now use
+Runners; siege tests became breach-migration tests), new D76-A..O plus
+BREACH-F/G rewrites. Eight source mutations (no role, no reachability check,
+Euclidean nearest, no replacement on destroy, breach only when occupied, no
+unseen alarm, siege DPS alongside breach, no mitigation) each turned the
+relevant tests red; source restored byte-identical.
+
+- Runner (`role: 'player'`) is unchanged D53. Swarm/Heavy (`'structures'`) are
+  committed to their selected tower; new selection prefers the reachable
+  occupied tower, else nearest by lane-field cost; replacement after
+  destruction is nearest by path cost; unfinished towers count; no reachable
+  tower -> player fallback. Continuous siege removed; every tower contact is
+  a breach (6/9/25%, x occupant damageTaken). An unseen breach raises the
+  tower alarm.
+- Browser (ALPHA, CHARLIE, KILO, R7KD2P; 1600x900; no page/console errors),
+  two builds 11/22 tiles away from the wave-1 side, shelter in A for waves 1-2,
+  retreat A->B->C on wave 3: Runners released A within ~2s and followed the
+  player; Swarm/Heavy stayed on A, breached the abandoned A and moved to the
+  path-nearest survivor when it fell (max one target change each; Runners 2-3,
+  by role). Open-ground kiting bot: mortal, died in wave 2-3 on every seed
+  (Runners closed to 0 tiles). Invulnerable, Runners hold the wave open forever
+  (harness artifact). Invulnerable with Runners removed once they are the only
+  enemies ("player outruns them"), never sheltering: all three towers lost by
+  wave 4-5, `lost/'towers'` on every seed, 42-47 breaches, 0 player hits.
+- Wave 1 now costs an unoccupied start tower 7-8 Swarm breaches (~250 hp) when
+  the player is out, since those Swarms pick the nearest tower.
+
+**Next steps:** user hand-play of D76 (retreat feel, whether 6/9/25% breach
+plus network pressure is too harsh). Pushed at the user's request before hand-play.
 
 ## D74–D75 rare Rich jackpots, road speed, fixed extraction footprint — COMMITTED AND PUSHED
 
@@ -197,11 +232,11 @@ of the entire tower network.
 - Shelter takes 0.7 seconds of continuous presence in a built tower. Occupancy
   bonuses and melee immunity begin only when that timer completes; leaving
   immediately resets shelter.
-- D53 aggro: towers have no baseline aggro. The one strategic target is the
-  occupied tower, or the exposed player. An enemy that has physically attacked a
-  tower stays committed to it; enemies only heading for a tower the player leaves
-  drop it within 0.9s and never start a siege there, and new spawns never pick
-  it. Hunters within 12 tiles pursue directly (D31 interception); farther ones
+- D53/D76 aggro: Runners take the occupied tower or the exposed player, drop a
+  tower the player leaves within 0.9s and never breach it. Swarm/Heavy commit
+  to the tower they select (occupied if reachable, else nearest by path) until
+  it dies or becomes unreachable, then take the nearest by path; every tower
+  contact is a breach, and nothing sieges. Hunters within 12 tiles pursue directly (D31 interception); farther ones
   travel toward the player on the road-discounted lane field. D73: the occupied
   tower is breached at contact, never sieged, so no new siege begins in play.
   `dangerState().hunters` retains the full near-hunter count, while HUD/canvas
@@ -290,7 +325,8 @@ all-angle forest siege/fire, distant blocking, elevation, layer-invariant,
 open-ground and cache-invalidation tests plus a real-seed reproduction. D72-D73
 add the 350 opening (A-C) and breach A-J; D74-D75 add road speed (A-D),
 extraction footprint/upgrade function (E-G) and canonical jackpot rarity.
-Final result: **127 passed, 0 failed**. The
+D76 adds role/commitment/replacement/breach tests (D76-A..O).
+Final result: **135 passed, 0 failed**. The
 wall-clock road-analysis budget (400ms) remains load-sensitive; no road code
 changed.
 `npm run road-report` prints per-seed features,

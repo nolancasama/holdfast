@@ -4,7 +4,7 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
-  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK, BREACH, START_MATERIALS, GEN,
+  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK, BREACH, START_MATERIALS, GEN, AGGRO,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, inBounds, isPassable, hasLineOfSight, kindAt, elevAt,
@@ -969,7 +969,7 @@ check('defeat freezes waves, spawns, extraction, construction and upgrades', () 
 
 // --- D5: aggro commitment ----------------------------------------------------
 
-check('a sieging enemy does not abandon its target when the player leaves', () => {
+check('a legacy besieger stays on its tower when the player moves, then breaches it once', () => {
   const g = createGame('AGGRO', 'gunner');
   g.materials = 9999;
   const a = g.towers[0];
@@ -991,28 +991,37 @@ check('a sieging enemy does not abandon its target when the player leaves', () =
   g.player.x = away.x;
   g.player.y = away.y;
 
-  // An enemy that has arrived and started chewing on tower A.
+  // D76: siege is gone. A Runner left in the pre-D76 sieging state (the only
+  // enemy whose commitment still depends on it) closes in and breaches A.
   const e = {
-    id: 999, type: 'swarm', def: { ...g.map && {}, radius: 0.34, hp: 30, speed: 2.2,
-      towerDps: 6, playerHit: 8, color: '#fff' },
-    side: 'west', x: a.x + 1.4, y: a.y, hp: 1e6, maxHp: 1e6,
-    targetId: a.id, sieging: true, siegeAngle: 0, retargetIn: 0, hitCd: 99, flash: 0,
+    id: 999, type: 'runner', def: { ...ENEMIES.runner, speed: 0 },
+    side: 'west', x: a.x + TOWER.radius + ENEMY.attackRange, y: a.y, hp: 1e6, maxHp: 1e6,
+    targetId: a.id, sieging: true, siegedId: a.id, siegeAngle: 0, retargetIn: 0, hitCd: 99, flash: 0,
   };
   g.enemies.push(e);
+  a.shotCd = placed.shotCd = 1e9;
+  const hpA = a.hp;
+  const hpB = placed.hp;
   update(g, 0.05);
-  if (!e.sieging) return 'enemy did not settle into a siege';
 
-  // Player abandons A for B; the sieging enemy must stay on A.
+  // Player abandons A for B; the committed enemy must stay on A.
   g.player.x = placed.x;
   g.player.y = placed.y;
+  // (A zero-speed enemy is still moved in by the 1.5s stuck nudge, so it may
+  // already have breached A inside this window; either way it never leaves A.)
   for (let i = 0; i < 400; i++) update(g, 1 / 60); // ~6.7s, well past the retarget timer
   if (g.occupiedTowerId !== placed.id) return 'player did not occupy the second tower';
-  if (!g.towers.some((t) => t.id === a.id)) return null; // tower A died; nothing left to commit to
-  if (e.targetId !== a.id) return 'sieging enemy instantly switched to the newly occupied tower';
-  return null;
+  if (e.targetId !== a.id) return `committed enemy switched to ${e.targetId}`;
+  e.def.speed = ENEMIES.runner.speed;
+  for (let i = 0; i < 180; i++) update(g, 1 / 60);
+  if (g.enemies.includes(e)) return 'legacy besieger never reached A';
+  if (placed.hp !== hpB) return 'legacy besieger damaged B';
+  const want = ENEMIES.runner.breachFrac * a.maxHp;
+  return Math.abs(hpA - a.hp - want) < 1e-6 && g.stats.breaches === 1
+    ? null : `A lost ${(hpA - a.hp).toFixed(2)}, expected one breach of ${want.toFixed(2)}`;
 });
 
-check('an enemy that is not yet sieging does eventually re-prioritise', () => {
+check('a Runner not yet committed does eventually re-prioritise', () => {
   const g = createGame('AGGRO2', 'gunner');
   g.materials = 9999;
   const a = g.towers[0];
@@ -1025,7 +1034,7 @@ check('an enemy that is not yet sieging does eventually re-prioritise', () => {
   b.built = true; b.progress = 1; b.hp = b.maxHp;
 
   const e = {
-    id: 998, type: 'swarm', def: { radius: 0.34, hp: 30, speed: 0, towerDps: 0, playerHit: 0, color: '#fff' },
+    id: 998, type: 'runner', def: { radius: 0.30, hp: 46, speed: 0, towerDps: 0, playerHit: 0, color: '#fff' },
     side: 'west', x: (a.x + b.x) / 2, y: a.y, hp: 1e6, maxHp: 1e6,
     targetId: a.id, sieging: false, siegeAngle: 0, retargetIn: 0.1, hitCd: 99, flash: 0,
   };
@@ -1073,9 +1082,10 @@ function walkableNear(g, x, y, r, clearOfTowers = true) {
   return null;
 }
 
-function testEnemy(g, at, targetId, speed = 0) {
+/** D76: the type string carries the role (Swarm/Heavy structures, Runner player). */
+function testEnemy(g, at, targetId, speed = 0, type = 'swarm') {
   const e = {
-    id: g.nextEnemyId++, type: 'swarm', side: 'debug',
+    id: g.nextEnemyId++, type, side: 'debug',
     def: { radius: 0.34, hp: 1e6, speed, towerDps: 0, playerHit: 0, color: '#fff' },
     x: at.x, y: at.y, hp: 1e6, maxHp: 1e6,
     targetId, sieging: false, siegeAngle: 0, retargetIn: 99, hitCd: 99, flash: 0,
@@ -1093,33 +1103,30 @@ function occupy(g, t) {
 
 const runFor = (g, seconds) => { for (let i = 0; i < seconds * 60; i++) update(g, 1 / 60); };
 
-check('D53-A: an enemy already sieging the old tower stays on it after the player moves', () => {
+check('D53-A: a legacy-committed Runner stays on the old tower after the player moves', () => {
   const f = aggroFixture('AGGRO-A');
   if (!f) return 'could not build the fixture';
   const { g, a, b } = f;
   a.hp = a.maxHp = 1e9;
-  // D73: an occupied tower is breached, not sieged, so the besieger is one
-  // already committed to A while it stands unoccupied.
   const away = walkableNear(g, a.x, a.y, PLAYER.presenceRadius + 6);
   if (!away) return 'no walkable spot away from A';
   g.player.x = away.x; g.player.y = away.y;
   const spot = walkableNear(g, a.x, a.y, TOWER.radius + 1.2, false);
-  if (!spot) return 'no siege position beside A';
-  const e = testEnemy(g, spot, a.id);
-  e.sieging = true; e.siegedId = a.id;
+  if (!spot) return 'no position beside A';
+  const e = testEnemy(g, spot, a.id, 0, 'runner');
+  e.siegedId = a.id;
   update(g, 1 / 60);
-  if (!e.sieging) return 'enemy did not keep sieging A';
+  if (e.targetId !== a.id) return 'committed Runner dropped A immediately';
   if (!occupy(g, b)) return 'player did not occupy B';
   runFor(g, 1);
-  // Separation can shove a besieger off the wall; that must not end the commitment.
   const out = walkableNear(g, a.x, a.y, TOWER.radius + 3.5, false);
-  if (out) { e.x = out.x; e.y = out.y; e.def.speed = 2; }
+  if (out) { e.x = out.x; e.y = out.y; }
   e.retargetIn = 0;
   runFor(g, 6);
-  return e.targetId === a.id ? null : `sieging enemy left A for ${e.targetId}`;
+  return e.targetId === a.id ? null : `committed Runner left A for ${e.targetId}`;
 });
 
-check('D53-B: an enemy only heading for the old tower drops it and never sieges it', () => {
+check('D53-B: a Runner only heading for the old tower drops it and never breaches it', () => {
   const f = aggroFixture('AGGRO-B');
   if (!f) return 'could not build the fixture';
   const { g, a, b } = f;
@@ -1127,28 +1134,24 @@ check('D53-B: an enemy only heading for the old tower drops it and never sieges 
   const spot = walkableNear(g, a.x, a.y, 6);
   if (!spot) return 'no approach position near A';
   // A long personal timer: only releasing the abandoned tower can make it re-read.
-  const waiting = testEnemy(g, spot, a.id);
-  const walker = testEnemy(g, { x: spot.x, y: spot.y }, a.id, 2.2);
+  const waiting = testEnemy(g, spot, a.id, 0, 'runner');
+  const walker = testEnemy(g, { x: spot.x, y: spot.y }, a.id, 2.2, 'runner');
   if (!occupy(g, b)) return 'player did not occupy B';
-  let siegedA = false;
-  for (let i = 0; i < 6 * 60; i++) {
-    update(g, 1 / 60);
-    if (walker.targetId === a.id && walker.sieging) siegedA = true;
-  }
-  if (siegedA) return 'an enemy that had not begun sieging went on to besiege the abandoned tower';
-  if (waiting.targetId !== b.id) return `waiting enemy kept ${waiting.targetId} (hysteresis/loyalty), expected B ${b.id}`;
-  if (walker.targetId !== b.id) return `walking enemy targets ${walker.targetId}, expected B ${b.id}`;
+  runFor(g, 6);
+  if (g.stats.breaches !== 0) return 'a Runner that had lost its reason breached the abandoned tower';
+  if (waiting.targetId !== b.id) return `waiting Runner kept ${waiting.targetId} (hysteresis/loyalty), expected B ${b.id}`;
+  if (walker.targetId !== b.id) return `walking Runner targets ${walker.targetId}, expected B ${b.id}`;
   return null;
 });
 
-check('D53-C: a nearby enemy bound for the old tower turns on the exposed player', () => {
+check('D53-C: a nearby Runner bound for the old tower turns on the exposed player', () => {
   const f = aggroFixture('AGGRO-C');
   if (!f) return 'could not build the fixture';
   const { g, a } = f;
   if (!occupy(g, a)) return 'player did not occupy A';
   const spot = walkableNear(g, a.x, a.y, 7);
   if (!spot) return 'no approach position near A';
-  const e = testEnemy(g, spot, a.id);
+  const e = testEnemy(g, spot, a.id, 0, 'runner');
   const stand = walkableNear(g, spot.x, spot.y, 3);
   if (!stand) return 'no exposed standing spot';
   g.player.x = stand.x;
@@ -1176,14 +1179,14 @@ check('D53-D: enemies spawned after a transfer never choose the previously occup
   return null;
 });
 
-check('D53-E: a never-occupied tower is not a strategic target, sheltered or exposed', () => {
+check('D53-E: a never-occupied tower is not a Runner target, sheltered or exposed', () => {
   const f = aggroFixture('AGGRO-E');
   if (!f) return 'could not build the fixture';
   const { g, a, c } = f;
   if (!occupy(g, a)) return 'player did not occupy A';
   const spot = walkableNear(g, c.x, c.y, TOWER.radius + 3);
   if (!spot) return 'no position beside C';
-  const sheltered = testEnemy(g, spot, null);
+  const sheltered = testEnemy(g, spot, null, 0, 'runner');
   sheltered.retargetIn = 0;
   runFor(g, 3);
   if (sheltered.targetId !== a.id) return `enemy beside C chose ${sheltered.targetId}, expected occupied A ${a.id}`;
@@ -1192,7 +1195,7 @@ check('D53-E: a never-occupied tower is not a strategic target, sheltered or exp
   if (!out) return 'no exposed spot near A';
   g.player.x = out.x;
   g.player.y = out.y;
-  const exposed = testEnemy(g, spot, null);
+  const exposed = testEnemy(g, spot, null, 0, 'runner');
   exposed.retargetIn = 0;
   runFor(g, 3);
   if (g.occupiedTowerId !== null) return 'player is not exposed';
@@ -1496,20 +1499,22 @@ check('an unreachable enemy is silently despawned after repeated stuck confirmat
   return stuckState(g).despawns === 1 ? null : 'despawn counter did not increment';
 });
 
-check('a sieging enemy standing still for ten seconds is never detected', () => {
+check('D76: a legacy besieger at the old siege slot closes in and breaches, never flagged stuck', () => {
   const g = createGame('STUCK-SIEGE', 'gunner');
   g.phaseLeft = 999;
   const t = g.towers[0];
   t.hp = t.maxHp = 1e9; t.shotCd = 1e9;
-  // D73: only an unoccupied tower can be sieged; the player stands clear.
   const away = walkableNear(g, t.x, t.y, PLAYER.presenceRadius + 6);
   if (!away) return 'no walkable spot away from the tower';
   g.player.x = away.x; g.player.y = away.y;
-  const e = addRealEnemy(g, t.x + TOWER.radius + ENEMY.attackRange, t.y, 'heavy', t.id, 0);
+  const e = addRealEnemy(g, t.x + TOWER.radius + ENEMY.attackRange, t.y, 'heavy', t.id);
+  e.def = { ...ENEMIES.heavy };
   e.sieging = true; e.siegedId = t.id;
   runFor(g, 10);
   if (g.occupiedTowerId !== null) return 'player ended up occupying the tower';
-  return e.sieging && stuckState(g).detections === 0 ? null : 'intentional siege was treated as stuck';
+  if (g.enemies.includes(e)) return 'legacy besieger never breached';
+  if (stuckState(g).detections !== 0) return 'closing on the tower was treated as stuck';
+  return Math.abs(1e9 - t.hp - ENEMIES.heavy.breachFrac * 1e9) < 1e-3 ? null : 'damage was not exactly one breach';
 });
 
 check('a twelve-enemy narrow-pass crowd for two seconds is not detected', () => {
@@ -1972,17 +1977,18 @@ check('pausing freezes an upgrade already in progress', () => {
   return t.upgrade.progress > before ? null : 'upgrade did not resume';
 });
 
-check('tower alarm fires for unseen damage but not visible damage', () => {
+check('tower alarm fires for an unseen breach but not a visible one', () => {
   const fixture = (visible) => {
     const g = createGame(`ALARM-${visible}`, 'gunner');
     g.map = syntheticMap(); g.phaseLeft = 999;
     const t = g.towers[0];
-    t.x = 10.5; t.y = 10.5; t.field = null; t.hp = t.maxHp = 1e6;
+    t.x = 10.5; t.y = 10.5; t.field = null; t.hp = t.maxHp = 1e6; t.shotCd = 1e9;
     g.player.x = 90.5; g.player.y = 40.5;
+    // D76: an abandoned tower is breached, not sieged. The attacker starts
+    // hidden behind forest, already at contact.
     if (!visible) g.map.kind[idx(11, 10)] = T.FOREST;
-    const e = testEnemy(g, { x: visible ? 11.5 : 13.1, y: 10.5 }, t.id);
-    e.sieging = true; e.siegedId = t.id;
-    e.def = { ...e.def, towerDps: 10 };
+    const e = testEnemy(g, { x: visible ? 11.5 : 12.0, y: 10.5 }, t.id, 0);
+    e.def = { ...ENEMIES.swarm, speed: 0 };
     recomputeVisibility(g, true);
     const seen = isPointVisible(g, e.x, e.y);
     update(g, 0.1);
@@ -1990,9 +1996,11 @@ check('tower alarm fires for unseen damage but not visible damage', () => {
   };
   const hidden = fixture(false);
   if (hidden.seen) return 'hidden-attacker precondition was visible';
+  if (hidden.g.stats.breaches !== 1) return 'hidden attacker did not breach';
   if (!hidden.active) return 'unseen hit did not activate tower alarm';
   const shown = fixture(true);
   if (!shown.seen) return 'visible-attacker precondition was hidden';
+  if (shown.g.stats.breaches !== 1) return 'visible attacker did not breach';
   return shown.active ? 'visible hit activated unseen tower alarm' : null;
 });
 
@@ -2237,8 +2245,8 @@ check('D72-B/C: two towers are affordable at once, a third is not', () => {
 // --- D73: the occupied tower is breached, not sieged -----------------------
 
 /** One occupied tower on open ground; its gun is silenced unless `fire`. */
-function breachFixture(seed, { fire = false } = {}) {
-  const g = createGame(seed, 'gunner');
+function breachFixture(seed, { fire = false, arch = 'gunner' } = {}) {
+  const g = createGame(seed, arch);
   g.map = syntheticMap();
   g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
   const t = g.towers[0];
@@ -2263,9 +2271,9 @@ function breachEnemy(g, t, type, distance, angle = 0, speed = ENEMIES[type].spee
 
 const expectedBreach = (g, t, type) => ENEMIES[type].breachFrac * t.maxHp * towerStats(g, t).damageTaken;
 
-check('D73 breach fractions are 4% / 6% / 18% of max tower hp', () => {
+check('D76 breach fractions are 6% / 9% / 25% of max tower hp', () => {
   const got = ['swarm', 'runner', 'heavy'].map((k) => ENEMIES[k].breachFrac).join('/');
-  return got === '0.04/0.06/0.18' ? null : `breach fractions are ${got}`;
+  return got === '0.06/0.09/0.25' ? null : `breach fractions are ${got}`;
 });
 
 for (const [label, type] of [['A', 'swarm'], ['B', 'runner'], ['C', 'heavy']]) {
@@ -2327,50 +2335,70 @@ check('BREACH-E: a breached enemy can never apply damage again', () => {
   return t.hp === hp1 && g.stats.breaches === 1 ? null : 'a breached enemy damaged the tower twice';
 });
 
-check('BREACH-F: sticky siege of an unoccupied tower is unchanged', () => {
-  const { g, t } = breachFixture('BREACH-F');
+/** Leave the breach fixture's tower unoccupied, player standing well clear. */
+function abandon(g, t) {
   g.player.x = t.x + 12; g.player.y = t.y;
   g.shelter = { towerId: null, progress: 0, required: PLAYER.shelterTime };
   g.occupiedTowerId = null;
-  const e = breachEnemy(g, t, 'heavy', TOWER.radius + ENEMY.attackRange + ENEMIES.heavy.radius - 0.35, 0, 0);
-  e.sieging = true; e.siegedId = t.id; e.retargetIn = 0;
-  const hp0 = t.hp;
-  runFor(g, 3);
-  if (g.occupiedTowerId !== null) return 'player occupied the tower';
-  const lost = hp0 - t.hp;
-  const want = ENEMIES.heavy.towerDps * 3;
-  if (Math.abs(lost - want) > want * 0.03) return `siege dealt ${lost.toFixed(1)} over 3s, expected ~${want}`;
-  if (!g.enemies.includes(e) || !e.sieging || e.targetId !== t.id) return 'besieger lost its commitment';
-  if (g.stats.breaches !== 0) return 'siege of an unoccupied tower was treated as a breach';
-  // Once the player shelters there again it is the endpoint: one breach, no DPS.
-  shelterAt(g, t);
-  e.def = { ...e.def, speed: ENEMIES.heavy.speed };
-  const hp1 = t.hp;
-  runFor(g, 3);
-  if (g.enemies.includes(e)) return 'besieger of a re-occupied tower never breached';
-  const burst = hp1 - t.hp;
-  const wantBurst = expectedBreach(g, t, 'heavy');
-  return Math.abs(burst - wantBurst) < 1e-6 ? null : `re-occupied tower lost ${burst.toFixed(1)}, expected ${wantBurst.toFixed(1)}`;
+}
+
+check('BREACH-F / D76-M: arriving at an abandoned tower deals one breach, never siege DPS too', () => {
+  for (const legacy of [true, false]) {
+    for (const type of ['swarm', 'heavy']) {
+      const { g, t } = breachFixture(`BREACH-F-${type}-${legacy}`);
+      abandon(g, t);
+      // From outside the old siege reach, so a siege could only begin on the way in.
+      const e = breachEnemy(g, t, type, TOWER.radius + ENEMY.attackRange + ENEMIES[type].radius + 1.5);
+      if (legacy) { e.sieging = true; e.siegedId = t.id; }
+      e.retargetIn = 0;
+      const hp0 = t.hp;
+      let drops = 0;
+      let prev = t.hp;
+      for (let i = 0; i < 600 && g.enemies.includes(e); i++) {
+        update(g, 1 / 60);
+        if (t.hp !== prev) drops++;
+        prev = t.hp;
+      }
+      const tag = `${type}${legacy ? ' (legacy besieger)' : ''}`;
+      if (g.occupiedTowerId !== null) return `${tag}: player occupied the tower`;
+      if (g.enemies.includes(e)) return `${tag} never breached the abandoned tower`;
+      if (drops !== 1) return `${tag}: tower hp changed on ${drops} frames, expected exactly one`;
+      const want = expectedBreach(g, t, type);
+      if (Math.abs(hp0 - t.hp - want) > 1e-6) return `${tag}: lost ${(hp0 - t.hp).toFixed(2)}, expected ${want.toFixed(2)}`;
+      if (g.stats.breaches !== 1) return `${tag}: ${g.stats.breaches} breaches recorded`;
+    }
+  }
+  return null;
 });
 
-check('BREACH-G: leaving the targeted tower before contact means no breach there', () => {
-  const f = aggroFixture('BREACH-G');
-  if (!f) return 'could not build the fixture';
-  const { g, a, b } = f;
-  for (const t of g.towers) t.shotCd = 1e9;
-  if (!occupy(g, a)) return 'player did not occupy A';
-  const spot = walkableNear(g, a.x, a.y, breachContact({ def: ENEMIES.swarm }) + 0.8, false);
-  if (!spot) return 'no approach position beside A';
-  const e = testEnemy(g, spot, a.id, 0);
-  e.type = 'swarm'; e.def = { ...ENEMIES.swarm, speed: 0 };
-  if (!occupy(g, b)) return 'player did not occupy B';
-  const hp0 = a.hp;
-  e.def.speed = ENEMIES.swarm.speed;
-  e.retargetIn = 99;
-  runFor(g, 3);
-  if (a.hp !== hp0) return `abandoned A took ${(hp0 - a.hp).toFixed(1)} damage`;
-  if (!g.enemies.includes(e)) return 'enemy vanished at the abandoned tower';
-  return e.targetId !== a.id ? null : 'enemy still targets the abandoned tower';
+check('BREACH-G: leaving the targeted tower before contact spares it from a Runner, not a Swarm', () => {
+  const trial = (type) => {
+    const f = aggroFixture(`BREACH-G-${type}`);
+    if (!f) return 'could not build the fixture';
+    const { g, a, b } = f;
+    for (const t of g.towers) t.shotCd = 1e9;
+    if (!occupy(g, a)) return 'player did not occupy A';
+    const spot = walkableNear(g, a.x, a.y, breachContact({ def: ENEMIES[type] }) + 0.8, false);
+    if (!spot) return 'no approach position beside A';
+    const e = testEnemy(g, spot, a.id, 0, type);
+    e.def = { ...ENEMIES[type], speed: 0 };
+    if (!occupy(g, b)) return 'player did not occupy B';
+    const hp0 = a.hp;
+    e.def.speed = ENEMIES[type].speed;
+    e.retargetIn = 99;
+    runFor(g, 3);
+    return { g, a, e, lost: hp0 - a.hp };
+  };
+  const runner = trial('runner');
+  if (typeof runner === 'string') return runner;
+  if (runner.lost !== 0) return `abandoned A took ${runner.lost.toFixed(1)} damage from a Runner`;
+  if (!runner.g.enemies.includes(runner.e)) return 'Runner vanished at the abandoned tower';
+  if (runner.e.targetId === runner.a.id) return 'Runner still targets the abandoned tower';
+  const swarm = trial('swarm');
+  if (typeof swarm === 'string') return swarm;
+  if (swarm.g.enemies.includes(swarm.e)) return 'Swarm did not reach the abandoned tower';
+  const want = ENEMIES.swarm.breachFrac * swarm.a.maxHp;
+  return Math.abs(swarm.lost - want) < 1e-6 ? null : `Swarm breach of abandoned A dealt ${swarm.lost.toFixed(2)}, expected ${want.toFixed(2)}`;
 });
 
 check('BREACH-H: a cluster at contact each breaches once with its own damage', () => {
@@ -2432,6 +2460,241 @@ check('BREACH-J: a breach gives no kill, no drop and no Materials', () => {
   } finally {
     DROP.chance = savedChance;
   }
+});
+
+// --- D76: Runners hunt the player, Swarms and Heavies hunt the network -------
+
+/** Path cost from (x, y) to tower t on a fresh lane field, as the game measures it. */
+function laneCost(g, t, x, y) {
+  const field = computeField(g.map, [idx(Math.floor(t.x), Math.floor(t.y))], 'lane');
+  return field[idx(Math.floor(x), Math.floor(y))];
+}
+
+/** A walkable spot about `r` from tower t with a finite lane path to it. */
+function reachableNear(g, t, r) {
+  for (let k = 0; k < 32; k++) {
+    const ang = (k / 32) * Math.PI * 2;
+    const x = t.x + Math.cos(ang) * r;
+    const y = t.y + Math.sin(ang) * r;
+    if (!isPassable(g.map, Math.floor(x), Math.floor(y))) continue;
+    if (g.towers.some((o) => Math.hypot(o.x - x, o.y - y) <= PLAYER.presenceRadius + 1.5)) continue;
+    if (Number.isFinite(laneCost(g, t, x, y))) return { x, y };
+  }
+  return null;
+}
+
+/** A second tower object for a synthetic-map fixture, cloned from the start tower. */
+function extraTower(g, x, y, built = true) {
+  const t = { ...g.towers[0], id: g.nextTowerId++, x, y, field: null, upgrade: null, shotCd: 1e9,
+    built, progress: built ? 1 : 0, hp: TOWER.maxHp * (built ? 1 : TOWER.buildHpFraction), maxHp: TOWER.maxHp };
+  return t;
+}
+
+/** Empty synthetic map, no towers, player parked far from everything and exposed. */
+function openFieldFixture(seed) {
+  const g = createGame(seed, 'gunner');
+  g.map = syntheticMap();
+  g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
+  g.player.x = 95.5; g.player.y = 48.5;
+  g.shelter = { towerId: null, progress: 0, required: PLAYER.shelterTime };
+  g.occupiedTowerId = null;
+  return g;
+}
+
+check('D76-A/B/C/N: leaving A - Swarm and Heavy keep A and breach it, Runners peel off on a stagger', () => {
+  const f = aggroFixture('D76-ABC');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b, c } = f;
+  for (const t of g.towers) t.shotCd = 1e9;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  const spot = reachableNear(g, a, 7);
+  if (!spot) return 'no reachable approach to A';
+  const swarm = addRealEnemy(g, spot.x, spot.y, 'swarm', a.id);
+  const heavy = addRealEnemy(g, spot.x, spot.y, 'heavy', a.id);
+  const runners = [0, 1, 2, 3, 4, 5].map(() => addRealEnemy(g, spot.x, spot.y, 'runner', a.id, 0));
+  swarm.retargetIn = heavy.retargetIn = 0; // they re-read at once and must still keep A
+  const out = walkableNear(g, a.x, a.y, PLAYER.presenceRadius + 4);
+  if (!out) return 'no exposed spot near A';
+  const hpA = a.hp; const hpB = b.hp; const hpC = c.hp;
+  const before = { kills: g.stats.kills, drops: g.drops.length };
+  g.player.x = out.x; g.player.y = out.y;
+  const released = new Map();
+  for (let i = 1; i <= 8 * 60; i++) {
+    update(g, 1 / 60);
+    if (i === 1 && g.occupiedTowerId !== null) return 'player is not exposed';
+    for (const e of [swarm, heavy]) {
+      if (g.enemies.includes(e) && e.targetId !== a.id) return `${e.type} left A for ${e.targetId}`;
+    }
+    for (const r of runners) if (!released.has(r) && r.targetId === PLAYER_TARGET_ID) released.set(r, i / 60);
+  }
+  if (released.size !== runners.length) return `${runners.length - released.size} Runners never released A`;
+  const times = [...released.values()];
+  if (Math.max(...times) > AGGRO.releaseDelayMax + 2 / 60) return `a Runner released A after ${Math.max(...times).toFixed(2)}s`;
+  if (new Set(times).size < 2) return 'every Runner released A on the same frame';
+  if (g.enemies.includes(swarm) || g.enemies.includes(heavy)) return 'Swarm or Heavy never reached A';
+  const by = g.stats.breachesByType;
+  if (by.swarm !== 1 || by.heavy !== 1 || g.stats.breaches !== 2) return `breaches ${JSON.stringify(by)}`;
+  const want = (ENEMIES.swarm.breachFrac + ENEMIES.heavy.breachFrac) * a.maxHp;
+  if (Math.abs(hpA - a.hp - want) > 1e-6) return `abandoned A lost ${(hpA - a.hp).toFixed(2)}, expected ${want.toFixed(2)}`;
+  if (b.hp !== hpB || c.hp !== hpC) return 'another tower took damage';
+  return g.stats.kills === before.kills && g.drops.length === before.drops ? null : 'a breach counted as a kill or dropped loot';
+});
+
+check('D76-D: reaching B pulls the Runner, not the Swarm or Heavy committed to A', () => {
+  const f = aggroFixture('D76-D');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b } = f;
+  for (const t of g.towers) t.shotCd = 1e9;
+  if (!occupy(g, a)) return 'player did not occupy A';
+  // Far enough out that the zero-speed stuck nudge cannot carry them to A.
+  const spot = reachableNear(g, a, 16);
+  if (!spot) return 'no reachable spot 16 tiles from A';
+  const swarm = addRealEnemy(g, spot.x, spot.y, 'swarm', a.id, 0);
+  const heavy = addRealEnemy(g, spot.x, spot.y, 'heavy', a.id, 0);
+  const runner = addRealEnemy(g, spot.x, spot.y, 'runner', a.id, 0);
+  if (!occupy(g, b)) return 'player did not occupy B';
+  for (const e of [swarm, heavy, runner]) e.retargetIn = 0;
+  runFor(g, 6);
+  if (g.occupiedTowerId !== b.id) return 'player left B';
+  if (swarm.targetId !== a.id) return `Swarm moved from A to ${swarm.targetId}`;
+  if (heavy.targetId !== a.id) return `Heavy moved from A to ${heavy.targetId}`;
+  return runner.targetId === b.id ? null : `Runner targets ${runner.targetId}, expected B ${b.id}`;
+});
+
+check('D76-E: a target destroyed en route hands Swarm and Heavy the nearest tower by path', () => {
+  const f = aggroFixture('D76-E');
+  if (!f) return 'could not build the fixture';
+  const { g, a, b, c } = f;
+  for (const t of g.towers) t.shotCd = 1e9;
+  if (!occupy(g, b)) return 'player did not occupy B';
+  const spot = reachableNear(g, a, 6);
+  if (!spot) return 'no reachable spot near A';
+  const swarm = addRealEnemy(g, spot.x, spot.y, 'swarm', a.id, 0);
+  const heavy = addRealEnemy(g, spot.x, spot.y, 'heavy', a.id, 0);
+  const at = walkableNear(g, a.x, a.y, breachContact({ def: ENEMIES.heavy }) - 0.1, false);
+  if (!at) return 'no contact position at A';
+  addRealEnemy(g, at.x, at.y, 'heavy', a.id, 0);
+  a.hp = 1;
+  update(g, 1 / 60);
+  if (g.towers.includes(a)) return 'A was not destroyed';
+  const cost = (t) => laneCost(g, t, spot.x, spot.y);
+  const nearest = cost(b) <= cost(c) ? b : c;
+  if (!Number.isFinite(cost(nearest))) return 'harness: neither B nor C is reachable';
+  for (const e of [swarm, heavy]) {
+    if (e.targetId !== nearest.id) return `${e.type} chose ${e.targetId}, path-nearest is ${nearest.id}`;
+  }
+  swarm.retargetIn = heavy.retargetIn = 0;
+  runFor(g, 3);
+  return swarm.targetId === nearest.id && heavy.targetId === nearest.id ? null : 'replacement target flipped';
+});
+
+check('D76-F: tower choice follows path cost, not straight-line distance', () => {
+  for (const type of ['swarm', 'heavy']) {
+    // A cliff wall with one opening at the east edge: `near` is 4 tiles north
+    // of the enemy in a straight line but ~140 tiles away on foot.
+    const g = openFieldFixture(`D76-F-${type}`);
+    for (let x = 0; x < MAP.w - 4; x++) g.map.kind[idx(x, 22)] = T.CLIFF;
+    const near = extraTower(g, 30.5, 18.5);
+    const far = extraTower(g, 30.5, 34.5);
+    g.towers = [near, far];
+    const e = addRealEnemy(g, 30.5, 23.5, type, null, 0);
+    if (!(laneCost(g, near, e.x, e.y) > laneCost(g, far, e.x, e.y))) return 'harness: near is not the longer path';
+    update(g, 1 / 60);
+    if (e.targetId !== far.id) return `${type} chose ${e.targetId} (near ${near.id}, far ${far.id})`;
+
+    // Close the opening: a committed target that becomes unreachable is dropped.
+    for (let x = MAP.w - 4; x < MAP.w; x++) g.map.kind[idx(x, 22)] = T.CLIFF;
+    g.map.terrainVersion++;
+    near.field = far.field = null;
+    const stuckOnNear = addRealEnemy(g, 30.5, 23.5, type, near.id, 0);
+    stuckOnNear.retargetIn = 0;
+    update(g, 1 / 60);
+    if (stuckOnNear.targetId !== far.id) return `${type} kept unreachable tower ${stuckOnNear.targetId}`;
+
+    // Nothing reachable at all: fall back to the player rather than stand idle.
+    g.towers = [near];
+    const lost = addRealEnemy(g, 30.5, 23.5, type, null, 0);
+    update(g, 1 / 60);
+    if (lost.targetId !== PLAYER_TARGET_ID) return `${type} with no reachable tower targets ${lost.targetId}`;
+  }
+  return null;
+});
+
+check('D76-G: an unfinished tower is a structure target and a breach damages it', () => {
+  const g = openFieldFixture('D76-G');
+  const built = extraTower(g, 80.5, 26.5);
+  const site = extraTower(g, 30.5, 26.5, false);
+  g.towers = [built, site];
+  const e = addRealEnemy(g, 24.5, 26.5, 'swarm', null);
+  update(g, 1 / 60);
+  if (e.targetId !== site.id) return `Swarm chose ${e.targetId}, expected the unfinished site ${site.id}`;
+  let lost = 0;
+  let prev = site.hp;
+  for (let i = 0; i < 600 && g.enemies.includes(e); i++) {
+    update(g, 1 / 60);
+    if (site.hp < prev) lost += prev - site.hp;
+    prev = site.hp;
+  }
+  if (g.enemies.includes(e)) return 'Swarm never reached the site';
+  if (site.built) return 'harness: the site finished before contact';
+  // Construction keeps adding a sliver of hp each frame, including the breach frame.
+  const want = ENEMIES.swarm.breachFrac * site.maxHp * towerStats(g, site).damageTaken;
+  return Math.abs(lost - want) < 1 && g.stats.breaches === 1 ? null : `site lost ${lost.toFixed(2)}, expected ~${want.toFixed(2)}`;
+});
+
+check('D76-K: occupant mitigation still scales breach damage; an abandoned tower takes it all', () => {
+  const { g, t } = breachFixture('D76-K', { arch: 'engineer' });
+  const mult = towerStats(g, t).damageTaken;
+  if (!(mult < 1)) return `harness: Engineer occupancy damageTaken is ${mult}`;
+  breachEnemy(g, t, 'heavy', 4);
+  const hp0 = t.hp;
+  runFor(g, 4);
+  if (g.stats.breaches !== 1) return 'Heavy did not breach the occupied tower';
+  const lost = hp0 - t.hp;
+  const base = ENEMIES.heavy.breachFrac * t.maxHp;
+  if (Math.abs(lost - base * mult) > 1e-6) return `occupied tower lost ${lost.toFixed(2)}, expected ${(base * mult).toFixed(2)}`;
+  if (!(lost < base)) return 'mitigation did not reduce the breach';
+
+  const open = breachFixture('D76-K-OPEN', { arch: 'engineer' });
+  abandon(open.g, open.t);
+  breachEnemy(open.g, open.t, 'heavy', 4);
+  const hp1 = open.t.hp;
+  runFor(open.g, 4);
+  const lostOpen = hp1 - open.t.hp;
+  return Math.abs(lostOpen - base) < 1e-6 ? null : `abandoned tower lost ${lostOpen.toFixed(2)}, expected ${base.toFixed(2)}`;
+});
+
+check('D76-L: an enemy killed just short of an abandoned tower is a kill, not a breach', () => {
+  const trial = (fire) => {
+    const { g, t } = breachFixture(`D76-L-${fire}`, { fire });
+    abandon(g, t);
+    const e = breachEnemy(g, t, 'swarm', breachContact({ def: ENEMIES.swarm }) + 0.05, Math.PI);
+    e.hp = 1;
+    const hp0 = t.hp;
+    runFor(g, 1);
+    return { g, t, e, hp0 };
+  };
+  const control = trial(false);
+  if (control.g.stats.breaches !== 1) return 'harness: the same approach does not breach without tower fire';
+  const { g, t, e, hp0 } = trial(true);
+  if (g.enemies.includes(e)) return 'tower did not kill the enemy';
+  if (g.stats.kills !== 1) return `kills is ${g.stats.kills}`;
+  return g.stats.breaches === 0 && t.hp === hp0 ? null : 'killed enemy still breached';
+});
+
+check('D76-O: breaching the last, abandoned tower runs destroyTower and the towers defeat', () => {
+  const { g, t } = breachFixture('D76-O');
+  abandon(g, t);
+  const hp = g.player.hp;
+  breachEnemy(g, t, 'heavy', 1.0, 0, 0);
+  t.hp = 10;
+  drainAudioEvents(g);
+  update(g, 1 / 60);
+  if (g.towers.length !== 0 || g.stats.towersLost !== 1) return 'tower was not destroyed';
+  if (!drainAudioEvents(g).some((a) => a.type === 'towerDestroy')) return 'destroyTower cue missing';
+  if (g.player.hp !== hp) return 'a player clear of the collapse was hurt';
+  const end = endState(g);
+  return end.status === 'lost' && end.lossCause === 'towers' ? null : `end state ${JSON.stringify(end)}`;
 });
 
 // --- D75: roads carry the player, not enemies --------------------------------
