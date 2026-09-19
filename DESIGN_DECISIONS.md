@@ -1016,3 +1016,51 @@ sticky-siege path is preserved but effectively dormant, so unoccupied towers
 are now practically never damaged and tower loss comes from breaches.
 **Rejected:** breaching at the old siege reach; direct player damage on
 breach; removing the siege code outright.
+
+### D74 — Rich ground is a handful of authored jackpots
+**Date:** 2026-09-19
+**Decision:** resource generation now has two layers. Background seams (still
+26-38, radius 4-9) keep the Poor/Moderate economy, with peaks lowered from
+0.45-1.55 to 0.30-0.80, and they combine by `max` instead of `+`, so
+overlapping seams can no longer stack into Rich. Rich comes only from 3-5
+jackpots (`GEN.deposits.rich`). They are sited first on buildable tiles whose
+5x5 neighbourhood is at least 60% buildable, at least 18 tiles from the start and
+22 from each other, chosen from 30 candidates by the existing awkwardness score
+(far from start and roads) plus jitter. Seam centres keep 13 tiles clear of a
+jackpot, so the jackpot's own falloff is its Moderate halo. Once every seam is
+down, each jackpot's peak is solved with the D68 binary search, which is now
+shared as `solveKernelPeak`, so its centre site earns 1.6-2.2 Materials/s base.
+The start tower is still solved last at 0.90/s (Moderate). Deposits are placed
+after terrain, roads and features, so the map geometry is byte-identical.
+**Why:** the old additive seams made Rich a carpet: 258-817 buildable remote
+Rich sites per map, 7-18 regions, the largest a single 445-site blob, best
+income 2.05-3.48/s. "Find 3-bar land, build, max Extraction" was automatic.
+Measured on 44 seeds (`node tools/economy-report.js`), there are now 3-5
+distinct Rich places on every map (43/44 at 3-5 two-tile clusters; the
+exceptions are one core split by terrain), 99-223 Rich sites, a largest
+cluster of 37-57, best income 1.84-2.19/s (2.04-2.44x start) and 421-923
+Moderate sites. 3-bar markers dropped from 16-27 per map to 3-4.
+**Rejected:** raising `RICHNESS.moderateMax` (relabels dominant income without
+changing it); fewer additive seams alone (overlaps still carpet); a narrower
+jackpot kernel (the 4.5-tile extraction disc blurs any kernel, so core size
+tracks the income target and background level, not the kernel radius).
+
+### D75 — Roads carry the player; Extraction upgrades are efficiency only
+**Date:** 2026-09-19
+**Decision:** the player moves at `PLAYER.roadSpeedMult` (1.25) on any road tile,
+multiplied with terrain cost, boots and the speed effect (`playerSpeed(g)`).
+Speed follows the tile under the player's centre, so it changes in one frame
+with no position snap. Enemy movement is unchanged. Extraction upgrades keep
+the 4.5-tile footprint at E0-E3: `extractRadiusPerLevel` is removed,
+`towerStats.extractRadius` is constant, and completing an upgrade no longer
+resamples `resourceScore`. Only the x1.00/1.55/2.10/2.65 rate rises. Upgrades
+still keep the old level working until 100%, and D73 breach values are unchanged.
+**Why:** roads become the fast way to rotate between towers, which makes
+road-connected sites valuable and supports leaving damaged positions. The
+growing extraction circle let E3 vacuum up ever more of a rich region, which
+made one premium outpost the automatic answer.
+**Consequence:** on road the player (6.63 tiles/s) outruns a Runner (5.8),
+which was previously faster than the player everywhere. Off-road the D67
+ordering is unchanged.
+**Rejected:** giving enemies the bonus; compensating with a higher Extraction
+rate multiplier.

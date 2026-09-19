@@ -1,11 +1,39 @@
 # Current State
 
-Last updated: 2026-09-19 (D72/D73 opening + breach pass, committed and pushed)
+Last updated: 2026-09-19 (D74/D75 economy + road pass, committed and pushed)
 
 ## Codex / Delegated Work — none in flight
 
 Codex was out of quota (usage limit until 2026-09-22 11:00 UTC); the router
 assigned D72/D73 to Claude, which implemented it directly.
+
+## D74–D75 rare Rich jackpots, road speed, fixed extraction footprint — COMMITTED AND PUSHED
+
+Committed on top of `0e9deaf` and pushed at the user's request before hand-play acceptance.
+Files: `src/config.js`, `src/game.js`, `src/terrain.js`,
+`test/run-tests.js`, new `tools/economy-report.js`, `DESIGN_DECISIONS.md`,
+this file. `npm test`: **127 passed, 0 failed** (8 new; the new tests were
+mutation-checked: an enemy road bonus, radius growth, no player road bonus and the old
+seam peaks each turned the relevant test red).
+
+- D74: Rich comes only from 3-5 solved jackpots; seams combine by max. 44-seed
+  `node tools/economy-report.js` before -> after: Rich sites 258/540/817 ->
+  99/145/223; two-tile regions 7/11/18 -> 3/4/6 (distinct 6-tile places 3/4/5,
+  44/44 in 3-5); largest cluster 76/151/445 -> 37/48/57; best income
+  2.05/3.00/3.48 -> 1.84/2.11/2.19 (x2.28/3.33/3.86 -> x2.04/2.35/2.44 start);
+  Moderate sites 437/700/965 -> 421/644/923; start 0.900 everywhere; generation
+  median ~0.56-0.65s (noise). Rich markers per map 16-27 -> 3-4.
+- D75: player x1.25 on road tiles via `playerSpeed(g)`; E0-E3 keep a 4.5
+  footprint and `resourceScore`, only the rate multiplier rises.
+- Browser (ALPHA, CHARLIE, KILO, R7KD2P; no page/console errors): real-key
+  road vs parallel open ground 1.25-1.28x; the frame the player leaves the road,
+  speed drops from 6.625 to 5.3 with a max per-frame step of 0.11 tiles; wave-1
+  Swarms p90/max 3.8 on road and plain alike; KILO jackpot preview Rich 1.985,
+  E0->E3 income x1.00/1.55/2.10/2.65 with radius 4.5 and identical score, old
+  income held during each timer; unoccupied tower fired W0 shots during its
+  weapon upgrade; Heavy breach still 93.6.
+
+**Next steps:** user playtest of D72-D75 together.
 
 ## D72–D73 three-tower opening and occupied-tower breach — COMMITTED AND PUSHED
 
@@ -150,7 +178,8 @@ of the entire tower network.
   starting tower is kept beside the central junction and generation verifies
   its footprint is road-free. Unfinished construction continues unassisted when
   the player leaves, with the existing presence multiplier when nearby.
-- Weapon and extraction upgrades are timed jobs with
+- Weapon and extraction upgrades are timed jobs (D75: Extraction raises the
+  rate only; the 4.5-tile footprint never grows) with
   `{which,toLevel,progress,duration}` state and 15/25/40 second base durations
   for levels 1/2/3. A tower keeps its old combat and extraction stats while the
   job runs. Only an Engineer occupying that exact tower accelerates it (x3.6:
@@ -219,6 +248,8 @@ of the entire tower network.
 - Walkable elevation is now Low / Normal / High, with a stronger shading ramp,
   quiet contour boundaries and build-preview sight explanations. Height still
   changes line of sight only; it provides no range or damage bonus.
+- D74: background seams (max-combined) give Poor/Moderate ground; Rich exists
+  only at 3-5 separated, solved jackpots (1.6-2.2/s at their centre).
 - Deposit regions carry an extraction figure and a shared Poor /
   Moderate / Rich classification. One to three gold bars render once per region
   at legible map scales, and the preview shows bars, tier and exact
@@ -240,7 +271,7 @@ of the entire tower network.
 
 ## Automated verification
 
-`npm test` runs 119 checks. It covers 20 deterministic seeds,
+`npm test` runs 127 checks. It covers 20 deterministic seeds,
 terrain validation, road connectivity and legality, seed variation, lane/direct
 field behavior, road placement refusal, ford use and generated route character,
 road exposure and knots, D55 readability (synthetic clean/tangled shapes and all
@@ -257,8 +288,9 @@ and terminal-state freezing. D67-D69 add exact speed/order and increased
 isolated-engagement checks, 20-seed start-income/remote-Rich assertions, and
 all-angle forest siege/fire, distant blocking, elevation, layer-invariant,
 open-ground and cache-invalidation tests plus a real-seed reproduction. D72-D73
-add the 350 opening (A-C) and breach A-J. Final result: **119 passed, 0
-failed**. The
+add the 350 opening (A-C) and breach A-J; D74-D75 add road speed (A-D),
+extraction footprint/upgrade function (E-G) and canonical jackpot rarity.
+Final result: **127 passed, 0 failed**. The
 wall-clock road-analysis budget (400ms) remains load-sensitive; no road code
 changed.
 `npm run road-report` prints per-seed features,

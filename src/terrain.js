@@ -253,24 +253,93 @@ function clearArea(map, cx, cy, r, kind = T.PLAIN, elev = 1) {
   }
 }
 
+/** Tiles inside a deposit kernel, with its (1 - d/r)^1.4 falloff weight. */
+function kernelCells(cx, cy, radius) {
+  const cells = [];
+  for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
+    for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
+      if (!inBounds(x, y)) continue;
+      const distance = Math.hypot(x - cx, y - cy);
+      if (distance > radius) continue;
+      cells.push({ i: idx(x, y), kernel: (1 - distance / radius) ** 1.4 });
+    }
+  }
+  return cells;
+}
+
+/** Fraction of the 5x5 tile centres around (x, y) where a tower could stand. */
+function openFraction(map, x, y) {
+  let open = 0;
+  for (let oy = -2; oy <= 2; oy++) {
+    for (let ox = -2; ox <= 2; ox++) {
+      if (inBounds(x + ox, y + oy) && isTerrainBuildable(map, x + ox + 0.5, y + oy + 0.5)) open++;
+    }
+  }
+  return open / 25;
+}
+
+/**
+ * D68/D74: add a deposit kernel on top of the current map, with the peak found
+ * by a monotone binary search so a tower at tile (siteX, siteY) earns exactly
+ * `target` base Materials/s, including overlap and the per-tile 1.8 cap.
+ */
+function solveKernelPeak(map, deposit, siteX, siteY, target) {
+  const cells = kernelCells(deposit.x, deposit.y, deposit.r);
+  const slot = new Map(cells.map((cell, n) => [cell.i, n]));
+  const base = cells.map((cell) => map.res[cell.i]);
+  const radius = TOWER.extraction.radius;
+  const incomeAt = (peak) => {
+    let sum = 0;
+    for (let y = Math.floor(siteY + 0.5 - radius); y <= Math.ceil(siteY + 0.5 + radius); y++) {
+      for (let x = Math.floor(siteX + 0.5 - radius); x <= Math.ceil(siteX + 0.5 + radius); x++) {
+        if (!inBounds(x, y) || Math.hypot(x - siteX, y - siteY) > radius) continue;
+        const n = slot.get(idx(x, y));
+        sum += n === undefined ? map.res[idx(x, y)] : Math.min(1.8, base[n] + peak * cells[n].kernel);
+      }
+    }
+    return (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
+  };
+  let lo = 0;
+  let hi = 1;
+  while (incomeAt(hi) < target && hi < 16) hi *= 2;
+  for (let pass = 0; pass < 32; pass++) {
+    const mid = (lo + hi) * 0.5;
+    if (incomeAt(mid) < target) lo = mid;
+    else hi = mid;
+  }
+  const peak = (lo + hi) * 0.5;
+  cells.forEach((cell, n) => { map.res[cell.i] = Math.min(1.8, base[n] + peak * cell.kernel); });
+  return peak;
+}
+
 /** D9: resource richness is placed as discrete deposits so the player can see it. */
 function placeDeposits(map, rng, start) {
   const deposits = [];
+  // D74: seams combine by max, so overlapping background seams never stack.
   const add = (cx, cy, radius, peak, apply = true) => {
     const deposit = { x: cx, y: cy, r: radius, peak };
     deposits.push(deposit);
     if (!apply) return deposit;
-    for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
-      for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
-        if (!inBounds(x, y)) continue;
-        const d = Math.hypot(x - cx, y - cy);
-        if (d > radius) continue;
-        const i = idx(x, y);
-        const fall = peak * (1 - d / radius) ** 1.4;
-        map.res[i] = Math.min(1.8, map.res[i] + fall);
-      }
+    for (const cell of kernelCells(cx, cy, radius)) {
+      map.res[cell.i] = Math.max(map.res[cell.i], Math.min(1.8, peak * cell.kernel));
     }
     return deposit;
+  };
+  // Rich seams skew away from the safe centre and obvious road chokepoints.
+  // This creates economic temptation without manufacturing a defensible site.
+  const awkwardness = (x, y) => {
+    const fromStart = Math.hypot(x - start.x, y - start.y);
+    const centreDistance = Math.min(1, fromStart / (MAP.w * GEN.deposits.distanceMapFraction));
+    let nearestRoad = GEN.deposits.roadDistanceNormalizer;
+    for (let oy = -GEN.deposits.roadSearchRadius; oy <= GEN.deposits.roadSearchRadius; oy++) {
+      for (let ox = -GEN.deposits.roadSearchRadius; ox <= GEN.deposits.roadSearchRadius; ox++) {
+        const nx = x + ox;
+        const ny = y + oy;
+        if (inBounds(nx, ny) && map.road[idx(nx, ny)]) nearestRoad = Math.min(nearestRoad, Math.hypot(ox, oy));
+      }
+    }
+    return Math.min(1, centreDistance * GEN.deposits.distanceWeight
+      + (nearestRoad / GEN.deposits.roadDistanceNormalizer) * GEN.deposits.roadDistanceWeight);
   };
 
   const n = randInt(rng, GEN.deposits.min, GEN.deposits.max);
@@ -285,30 +354,45 @@ function placeDeposits(map, rng, start) {
   );
   startDeposit.start = true;
 
+  // D74: Rich is authored, not emergent. A few separated jackpots are sited
+  // first on open, buildable, awkward ground; seams keep clear of them so each
+  // jackpot's own falloff is its Moderate halo and its Rich core stays small.
+  // Their peaks are solved for centre income once every seam is down.
+  const rich = GEN.deposits.rich;
+  const jackpotCount = randInt(rng, rich.min, rich.max);
+  const jackpots = [];
+  for (let k = 0; k < jackpotCount; k++) {
+    let best = null;
+    for (let c = 0; c < rich.candidates; c++) {
+      const x = randInt(rng, 4, MAP.w - 5);
+      const y = randInt(rng, 3, MAP.h - 4);
+      const jitter = rng();
+      if (Math.hypot(x - start.x, y - start.y) < rich.minFromStart) continue;
+      if (jackpots.some((j) => Math.hypot(x - j.x, y - j.y) < rich.minSeparation)) continue;
+      if (!isTerrainBuildable(map, x + 0.5, y + 0.5) || openFraction(map, x, y) < rich.openNeighbourhood) continue;
+      const score = awkwardness(x, y) * GEN.deposits.awkwardnessWeight + jitter * GEN.deposits.randomWeight;
+      if (!best || score > best.score) best = { x, y, score };
+    }
+    if (!best) break;
+    const jackpot = add(best.x, best.y, rich.radius, 0, false);
+    jackpot.rich = true;
+    jackpot.target = rich.targetMin + (rich.targetMax - rich.targetMin) * rng();
+    jackpots.push(jackpot);
+  }
+
   let placed = 0;
   let tries = 0;
   while (placed < n && tries++ < n * 40) {
     const x = randInt(rng, 4, MAP.w - 5);
     const y = randInt(rng, 3, MAP.h - 4);
     if (!isPassable(map, x, y)) continue;
+    if (jackpots.some((j) => Math.hypot(x - j.x, y - j.y) < rich.seamClearance)) continue;
     // Keep the safe starting area mediocre; richer authored seams begin where
     // expansion exposes the player to real travel and defence tradeoffs.
     const fromStart = Math.hypot(x - start.x, y - start.y);
     if (fromStart < GEN.deposits.startExclusionRadius
         || (fromStart < GEN.deposits.startBufferRadius && rng() < GEN.deposits.startBufferRejectChance)) continue;
-    const centreDistance = Math.min(1, fromStart / (MAP.w * GEN.deposits.distanceMapFraction));
-    let nearestRoad = GEN.deposits.roadDistanceNormalizer;
-    for (let oy = -GEN.deposits.roadSearchRadius; oy <= GEN.deposits.roadSearchRadius; oy++) {
-      for (let ox = -GEN.deposits.roadSearchRadius; ox <= GEN.deposits.roadSearchRadius; ox++) {
-        const nx = x + ox;
-        const ny = y + oy;
-        if (inBounds(nx, ny) && map.road[idx(nx, ny)]) nearestRoad = Math.min(nearestRoad, Math.hypot(ox, oy));
-      }
-    }
-    // Rich seams skew away from the safe centre and obvious road chokepoints.
-    // This creates economic temptation without manufacturing a defensible site.
-    const awkward = Math.min(1, centreDistance * GEN.deposits.distanceWeight
-      + (nearestRoad / GEN.deposits.roadDistanceNormalizer) * GEN.deposits.roadDistanceWeight);
+    const awkward = awkwardness(x, y);
     const peakSpan = GEN.deposits.peakMax - GEN.deposits.peakMin;
     const peak = GEN.deposits.peakMin + peakSpan * Math.min(1,
       awkward * GEN.deposits.awkwardnessWeight + rng() * GEN.deposits.randomWeight);
@@ -322,45 +406,14 @@ function placeDeposits(map, rng, start) {
     if (PASSABLE[map.kind[i]]) map.res[i] = Math.min(1.8, map.res[i] + GEN.ambientResource);
   }
 
+  for (const jackpot of jackpots) {
+    jackpot.peak = solveKernelPeak(map, jackpot, jackpot.x, jackpot.y, jackpot.target);
+  }
+
   // D68: deterministically solve the deferred start blob against the actual
   // generated tower site. The monotone binary search accounts for overlap with
   // remote seams and the per-tile 1.8 cap without moving any rich seam closer.
-  const startCells = [];
-  for (let y = Math.floor(startDeposit.y - startDeposit.r); y <= Math.ceil(startDeposit.y + startDeposit.r); y++) {
-    for (let x = Math.floor(startDeposit.x - startDeposit.r); x <= Math.ceil(startDeposit.x + startDeposit.r); x++) {
-      if (!inBounds(x, y)) continue;
-      const distance = Math.hypot(x - startDeposit.x, y - startDeposit.y);
-      if (distance > startDeposit.r) continue;
-      startCells.push({ i: idx(x, y), kernel: (1 - distance / startDeposit.r) ** 1.4 });
-    }
-  }
-  const base = new Float32Array(startCells.length);
-  for (let n = 0; n < startCells.length; n++) base[n] = map.res[startCells[n].i];
-  const incomeAtStart = (peak) => {
-    let sum = 0;
-    const radius = TOWER.extraction.radius;
-    for (let y = Math.floor(start.y + 0.5 - radius); y <= Math.ceil(start.y + 0.5 + radius); y++) {
-      for (let x = Math.floor(start.x + 0.5 - radius); x <= Math.ceil(start.x + 0.5 + radius); x++) {
-        if (!inBounds(x, y) || Math.hypot(x - start.x, y - start.y) > radius) continue;
-        const cell = startCells.findIndex((entry) => entry.i === idx(x, y));
-        sum += cell < 0 ? map.res[idx(x, y)] : Math.min(1.8, base[cell] + peak * startCells[cell].kernel);
-      }
-    }
-    return (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
-  };
-  let lo = 0;
-  let hi = 1;
-  while (incomeAtStart(hi) < GEN.deposits.startIncomeTarget && hi < 16) hi *= 2;
-  for (let pass = 0; pass < 32; pass++) {
-    const mid = (lo + hi) * 0.5;
-    if (incomeAtStart(mid) < GEN.deposits.startIncomeTarget) lo = mid;
-    else hi = mid;
-  }
-  startDeposit.peak = (lo + hi) * 0.5;
-  for (let n = 0; n < startCells.length; n++) {
-    const cell = startCells[n];
-    map.res[cell.i] = Math.min(1.8, base[n] + startDeposit.peak * cell.kernel);
-  }
+  startDeposit.peak = solveKernelPeak(map, startDeposit, start.x, start.y, GEN.deposits.startIncomeTarget);
   // The start marker represents the calibrated extraction site, not the
   // jittered kernel centre (whose local preview can differ from the tower).
   startDeposit.markerX = start.x;

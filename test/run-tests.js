@@ -4,7 +4,7 @@
 
 import {
   MAP, T, VALID, PLAYER, TOWER, WAVE, PASSABLE, DROP, RICHNESS, richnessTierForRate, AUDIO,
-  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK, BREACH, START_MATERIALS,
+  EXPOSURE, READABILITY, VISION, BUILD, ENEMIES, ENEMY, STUCK, BREACH, START_MATERIALS, GEN,
 } from '../src/config.js';
 import {
   generateMap, validateMap, idx, inBounds, isPassable, hasLineOfSight, kindAt, elevAt,
@@ -21,7 +21,7 @@ import {
   emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState, upgradeState,
   upgradeRateMult, towerAlarmState, recomputeVisibility, stuckState, endState, towerCost,
-  breachContact,
+  breachContact, playerSpeed,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -2432,6 +2432,199 @@ check('BREACH-J: a breach gives no kill, no drop and no Materials', () => {
   } finally {
     DROP.chance = savedChance;
   }
+});
+
+// --- D75: roads carry the player, not enemies --------------------------------
+
+/** Open synthetic ground with a straight east-west road along row 26. */
+function roadFixture(seed) {
+  const g = createGame(seed, 'gunner');
+  g.map = syntheticMap();
+  for (let x = 0; x < MAP.w; x++) g.map.road[idx(x, 26)] = 1;
+  g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
+  g.towers[0].x = 90.5; g.towers[0].y = 40.5; g.towers[0].field = null;
+  return g;
+}
+
+/** Tiles covered in one second of eastward input from (x, y). */
+function walkEast(g, x, y, seconds = 1) {
+  g.player.x = x; g.player.y = y;
+  g.input = { mx: 1, my: 0, melee: false, repair: false };
+  const steps = [];
+  for (let i = 0; i < seconds * 60; i++) {
+    const before = g.player.x;
+    update(g, 1 / 60);
+    steps.push(g.player.x - before);
+  }
+  g.input = { mx: 0, my: 0, melee: false, repair: false };
+  return { distance: g.player.x - x, steps, dy: g.player.y - y };
+}
+
+check('D75-A: open-ground player speed is unchanged', () => {
+  const g = roadFixture('D75-A');
+  const { distance } = walkEast(g, 20.5, 20.5);
+  if (PLAYER.roadSpeedMult !== 1.25) return `road multiplier is ${PLAYER.roadSpeedMult}`;
+  return Math.abs(distance - PLAYER.speed) < 1e-6 ? null : `open ground covered ${distance.toFixed(3)}, expected ${PLAYER.speed}`;
+});
+
+check('D75-B: the player runs 1.25x faster on a road, entering and leaving smoothly', () => {
+  const g = roadFixture('D75-B');
+  const { distance } = walkEast(g, 20.5, 26.5);
+  const want = PLAYER.speed * PLAYER.roadSpeedMult;
+  if (Math.abs(distance - want) > 1e-6) return `road covered ${distance.toFixed(3)}, expected ${want.toFixed(3)}`;
+  // Cross a road segment along row 20: the per-frame step only switches between
+  // the two rates - no snap, no lateral shove.
+  const h = roadFixture('D75-B2');
+  for (let x = 40; x < 50; x++) h.map.road[idx(x, 20)] = 1;
+  const walk = walkEast(h, 36.5, 20.5, 3);
+  const lo = PLAYER.speed / 60;
+  const hi = want / 60;
+  if (walk.steps.some((d) => Math.abs(d - lo) > 1e-9 && Math.abs(d - hi) > 1e-9)) return 'a frame moved at neither rate';
+  const fast = walk.steps.filter((d) => Math.abs(d - hi) < 1e-9).length;
+  if (fast < 60 || fast > 110) return `${fast} road-speed frames crossing a 10-tile road`;
+  if (Math.abs(walk.steps.at(-1) - lo) > 1e-9) return 'road speed persisted after leaving the road';
+  return walk.dy === 0 ? null : 'crossing the road moved the player sideways';
+});
+
+check('D75-C: road speed stacks multiplicatively with boots and the speed effect', () => {
+  const g = roadFixture('D75-C');
+  grantEquipment(g, 'boots');
+  g.effects.speed = 999;
+  const want = PLAYER.speed * DROP.equipment.boots.playerSpeed * DROP.temporary.speed.mult;
+  g.player.x = 20.5; g.player.y = 20.5;
+  if (Math.abs(playerSpeed(g) - want) > 1e-9) return `open ground ${playerSpeed(g)}, expected ${want}`;
+  const { distance } = walkEast(g, 20.5, 26.5);
+  return Math.abs(distance - want * PLAYER.roadSpeedMult) < 1e-6
+    ? null : `boosted road run covered ${distance.toFixed(3)}, expected ${(want * PLAYER.roadSpeedMult).toFixed(3)}`;
+});
+
+check('D75-D: enemies gain nothing from roads', () => {
+  const run = (row) => {
+    const g = roadFixture(`D75-D-${row}`);
+    const t = g.towers[0];
+    t.x = 80.5; t.y = row + 0.5; t.shotCd = 1e9; t.field = null;
+    shelterAt(g, t);
+    const e = breachEnemy(g, t, 'runner', 40, Math.PI);
+    let path = 0;
+    for (let i = 0; i < 60; i++) {
+      const [x0, y0] = [e.x, e.y];
+      update(g, 1 / 60);
+      path += Math.hypot(e.x - x0, e.y - y0);
+    }
+    return path;
+  };
+  const onRoad = run(26);
+  const offRoad = run(20);
+  if (Math.abs(offRoad - ENEMIES.runner.speed) > 0.05) return `harness: off-road Runner covered ${offRoad.toFixed(2)}`;
+  return Math.abs(onRoad - offRoad) < 1e-6 ? null : `Runner covered ${onRoad.toFixed(3)} on road vs ${offRoad.toFixed(3)} off it`;
+});
+
+// --- D75: extraction upgrades raise the rate, never the footprint ------------
+
+/** Run a real extraction upgrade to completion. */
+function completeExtraction(g, t) {
+  g.materials = 1e9;
+  if (!tryUpgrade(g, t, 'extraction')) return false;
+  update(g, t.upgrade.duration + 0.05);
+  return !t.upgrade;
+}
+
+check('D75-E: E0-E3 keep a 4.5 radius, the same cells and a rate-only income rise', () => {
+  const g = createGame('D75-E', 'gunner');
+  g.map = syntheticMap();
+  g.phaseLeft = 9999;
+  const t = g.towers[0];
+  t.x = 52.5; t.y = 26.5;
+  // A ramp of values so any change in the sampled cell set changes the score.
+  for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) g.map.res[idx(x, y)] = 0.01 * ((x * 7 + y * 13) % 29);
+  t.resourceScore = resourceScoreAt(g.map, t.x, t.y, TOWER.extraction.radius);
+  g.player.x = t.x + 12; g.player.y = t.y;
+  const score0 = t.resourceScore;
+  const base = towerStats(g, t).income;
+  for (let level = 0; level <= 3; level++) {
+    if (level > 0 && !completeExtraction(g, t)) return `E${level} upgrade did not complete`;
+    const s = towerStats(g, t);
+    if (t.eLevel !== level) return `expected E${level}, tower is E${t.eLevel}`;
+    if (s.extractRadius !== 4.5) return `E${level} reports radius ${s.extractRadius}`;
+    if (t.resourceScore !== score0) return `E${level} resampled a different footprint`;
+    const mult = 1 + TOWER.upgrade.extractRatePerLevel * level;
+    if (Math.abs(s.income - base * mult) > 1e-9) return `E${level} income x${(s.income / base).toFixed(3)}, expected x${mult}`;
+  }
+  return null;
+});
+
+check('D75-F: a deposit just outside 4.5 tiles contributes nothing at any Extraction level', () => {
+  const g = createGame('D75-F', 'gunner');
+  g.map = syntheticMap();
+  g.phaseLeft = 9999;
+  const t = g.towers[0];
+  t.x = 52.5; t.y = 26.5;
+  let ring = 0;
+  for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) {
+    const d = Math.hypot(x + 0.5 - t.x, y + 0.5 - t.y);
+    if (d > TOWER.extraction.radius && d <= TOWER.extraction.radius + 0.8) { g.map.res[idx(x, y)] = 1.8; ring++; }
+  }
+  if (ring < 20) return `harness: only ${ring} ring cells`;
+  // Known-good control: the same deposit is picked up by a slightly wider circle.
+  if (!(resourceScoreAt(g.map, t.x, t.y, TOWER.extraction.radius + 0.8) > 0)) return 'harness: ring not detectable';
+  t.resourceScore = resourceScoreAt(g.map, t.x, t.y, TOWER.extraction.radius);
+  g.player.x = t.x + 12; g.player.y = t.y;
+  for (let level = 0; level <= 3; level++) {
+    if (level > 0 && !completeExtraction(g, t)) return `E${level} upgrade did not complete`;
+    if (t.resourceScore !== 0 || towerStats(g, t).income !== 0) return `E${level} extracts from outside 4.5 tiles`;
+  }
+  return null;
+});
+
+check('D75-G: a tower keeps firing and producing at its old levels through both upgrades', () => {
+  for (const which of ['weapon', 'extraction']) {
+    const g = createGame(`D75-G-${which}`, 'gunner');
+    g.map = syntheticMap(); g.materials = 99999; g.phaseLeft = 999; g.pendingSpawns = [];
+    const t = g.towers[0];
+    t.x = 30.5; t.y = 20.5; t.field = null; t.resourceScore = 1;
+    g.player.x = 5.5; g.player.y = 5.5;
+    const old = towerStats(g, t);
+    const e = testEnemy(g, { x: t.x + 3, y: t.y }, null);
+    if (!tryUpgrade(g, t, which)) return `${which} upgrade refused`;
+    const hp0 = e.hp;
+    const m0 = g.materials;
+    runFor(g, 2);
+    if (!t.upgrade) return `${which} upgrade finished too early for this check`;
+    const shots = Math.round((hp0 - e.hp) / old.damage);
+    if (shots < 2 || Math.abs((hp0 - e.hp) - shots * old.damage) > 1e-6) return `during ${which}: tower did not keep firing at the old damage`;
+    if (Math.abs((g.materials - m0) - old.income * 2) > 1e-6) return `during ${which}: income changed`;
+  }
+  return null;
+});
+
+// --- D74: Rich is a handful of jackpots, not a carpet -----------------------
+
+check('D74 canonical maps have 3-5 separated Rich jackpots and no Rich ground elsewhere', () => {
+  const rich = GEN.deposits.rich;
+  const rows = [];
+  for (const m of maps) {
+    const jackpots = m.deposits.filter((d) => d.rich);
+    if (jackpots.length < rich.min || jackpots.length > rich.max) return `${m.seed}: ${jackpots.length} jackpots`;
+    for (const [n, j] of jackpots.entries()) {
+      if (Math.hypot(j.x - m.start.x, j.y - m.start.y) < rich.minFromStart) return `${m.seed}: jackpot ${n} near start`;
+      if (jackpots.some((o, k) => k !== n && Math.hypot(o.x - j.x, o.y - j.y) < rich.minSeparation)) return `${m.seed}: jackpots too close`;
+      if (!isTerrainBuildable(m, j.x + 0.5, j.y + 0.5)) return `${m.seed}: jackpot ${n} centre is not buildable`;
+      const income = resourceScoreAt(m, j.x + 0.5, j.y + 0.5, TOWER.extraction.radius) * TOWER.extraction.baseRate;
+      if (income < rich.targetMin - 1e-6 || income > rich.targetMax + 1e-6) return `${m.seed}: jackpot ${n} earns ${income.toFixed(3)}`;
+    }
+    let sites = 0;
+    for (let y = 0; y < MAP.h; y++) for (let x = 0; x < MAP.w; x++) {
+      const px = x + 0.5;
+      const py = y + 0.5;
+      if (Math.hypot(px - (m.start.x + 0.5), py - (m.start.y + 0.5)) < 12 || !isTerrainBuildable(m, px, py)) continue;
+      if (resourceScoreAt(m, px, py, TOWER.extraction.radius) * TOWER.extraction.baseRate < RICHNESS.moderateMax) continue;
+      sites++;
+      if (!jackpots.some((j) => Math.hypot(j.x + 0.5 - px, j.y + 0.5 - py) < 9)) return `${m.seed}: stray Rich site at ${px},${py}`;
+    }
+    rows.push(`${m.seed}:${jackpots.length}/${sites}`);
+  }
+  console.log(`D74 jackpots/rich-sites: ${rows.join('; ')}`);
+  return null;
 });
 
 // --- D63 dense-wave instrumentation -----------------------------------------

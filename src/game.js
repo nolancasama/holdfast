@@ -353,7 +353,7 @@ export function towerStats(g, t) {
     damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost * barrel,
     fireRate: TOWER.weapon.fireRate * (1 + u.weaponRatePerLevel * t.wLevel) * m.fireRate,
     range: (TOWER.weapon.range + u.weaponRangePerLevel * t.wLevel) * module,
-    extractRadius: TOWER.extraction.radius + u.extractRadiusPerLevel * t.eLevel,
+    extractRadius: TOWER.extraction.radius, // D75: upgrades raise the rate, never the footprint
     income: t.resourceScore * TOWER.extraction.baseRate
             * (1 + u.extractRatePerLevel * t.eLevel) * m.extraction * extBoost * chip,
     damageTaken: m.damageTaken,
@@ -519,15 +519,27 @@ function burst(g, x, y, color, n = 8, speed = 4) {
 // Player
 // ---------------------------------------------------------------------------
 
+/**
+ * Player tiles/sec at the current position: terrain cost divides it, speed
+ * effects/equipment multiply it, and D75 road tiles add PLAYER.roadSpeedMult.
+ */
+export function playerSpeed(g) {
+  const p = g.player;
+  const tx = Math.floor(p.x);
+  const ty = Math.floor(p.y);
+  const speedBoost = (g.effects.speed ? DROP.temporary.speed.mult : 1)
+    * (hasEquipment(g, 'boots') ? DROP.equipment.boots.playerSpeed : 1);
+  const road = inBounds(tx, ty) && g.map.road[idx(tx, ty)] ? PLAYER.roadSpeedMult : 1;
+  const cost = moveCostAt(g.map, tx, ty);
+  return PLAYER.speed * speedBoost * road / (Number.isFinite(cost) ? cost : 1);
+}
+
 function updatePlayer(g, dt) {
   const p = g.player;
   p.meleeCd = Math.max(0, p.meleeCd - dt);
   p.hurtCd = Math.max(0, p.hurtCd - dt);
 
-  const speedBoost = (g.effects.speed ? DROP.temporary.speed.mult : 1)
-    * (hasEquipment(g, 'boots') ? DROP.equipment.boots.playerSpeed : 1);
-  const cost = moveCostAt(g.map, Math.floor(p.x), Math.floor(p.y));
-  const speed = PLAYER.speed * speedBoost / (Number.isFinite(cost) ? cost : 1);
+  const speed = playerSpeed(g);
 
   let { mx, my } = g.input;
   const len = Math.hypot(mx, my);
@@ -641,11 +653,7 @@ function updateTowers(g, dt) {
       if (t.upgrade.progress >= 1) {
         const { which, toLevel } = t.upgrade;
         if (which === 'weapon') t.wLevel = toLevel;
-        else {
-          t.eLevel = toLevel;
-          const radius = TOWER.extraction.radius + TOWER.upgrade.extractRadiusPerLevel * t.eLevel;
-          t.resourceScore = resourceScoreAt(g.map, t.x, t.y, radius);
-        }
+        else t.eLevel = toLevel; // D75: same footprint, same resourceScore; only the rate rises
         t.upgrade = null;
         const short = which === 'weapon' ? 'W' : 'E';
         say(g, `${which === 'weapon' ? 'Weapon' : 'Extraction'} upgrade complete.`);

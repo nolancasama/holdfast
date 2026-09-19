@@ -39,8 +39,17 @@ export const GEN = {
   river: { widthMin: 3, widthMax: 6, wander: 11 },
   fords: { min: 2, max: 4, heightMin: 4, heightMax: 7 },
   deposits: {
+    // D74: background seams are the Poor/Moderate economy. They combine by
+    // max, not sum, so overlapping seams cannot stack into a Rich carpet.
     min: 26, max: 38, radiusMin: 4, radiusMax: 9,
-    peakMin: 0.45, peakMax: 1.55, startIncomeTarget: 0.90,
+    peakMin: 0.30, peakMax: 0.80, startIncomeTarget: 0.90,
+    // D74: Rich comes only from a few separated jackpots, each solved so the
+    // best site at its centre earns `targetMin..targetMax` Materials/s base.
+    rich: {
+      min: 3, max: 5, radius: 4.5, targetMin: 1.6, targetMax: 2.2,
+      minSeparation: 22, minFromStart: 18, candidates: 30, openNeighbourhood: 0.6,
+      seamClearance: 13,     // seam centres keep this far from a jackpot
+    },
     startExclusionRadius: 12, startBufferRadius: 18, startBufferRejectChance: 0.70,
     roadSearchRadius: 7, roadDistanceNormalizer: 8,
     distanceWeight: 0.70, roadDistanceWeight: 0.30,
@@ -148,6 +157,7 @@ export const VALID = {
 export const PLAYER = {
   maxHp: 100,
   speed: 5.3,               // tiles/sec on open ground; terrain cost divides this
+  roadSpeedMult: 1.25,      // D75: roads are the player's transport network (not enemies')
   radius: 0.42,
   presenceRadius: 2.4,      // inside this, a tower is the Occupied Tower
   melee: { damage: 18, cooldown: 0.9, range: 1.2, arc: Math.PI * 0.8 },
@@ -196,8 +206,7 @@ export const TOWER = {
     weaponDamagePerLevel: 0.45,   // +45% damage per level
     weaponRatePerLevel: 0.18,
     weaponRangePerLevel: 0.8,     // +0.8 tiles per level
-    extractRatePerLevel: 0.55,
-    extractRadiusPerLevel: 0.7,
+    extractRatePerLevel: 0.55,  // D75: efficiency only; the 4.5-tile footprint never grows
   },
 
   repair: { hpPerSec: 11, costPerHp: 0.6, occupiedMult: 4.0 },
