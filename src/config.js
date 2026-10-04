@@ -190,9 +190,9 @@ export const VISION = {
 
 // --- towers -----------------------------------------------------------------
 export const TOWER = {
-  // D80: the next tower costs 30 more Stone per non-Keep tower already owned.
-  cost: { food: 30, stone: 55 },
-  costStonePerExisting: 30,
+  // D91: Stone only; the next tower costs more Stone per non-Keep tower owned.
+  cost: { stone: 60 },
+  costStonePerExisting: 25,
   maxHp: 520,
   radius: 0.95,
   minSpacing: 7.0,          // no stacking towers in one tiny area
@@ -206,7 +206,7 @@ export const TOWER = {
   // sqrt(5), the 5x5 neighbourhood minus its four corners.
   forestClearRadius: Math.sqrt(5),
 
-  weapon: { damage: 11, fireRate: 1.6, range: 7.5 },
+  weapon: { damage: 11, fireRate: 1.6, range: 7.5, minRange: 2.8 },
   upgrade: {
     maxLevel: 3,
     buildTime: [15, 25, 40],
@@ -228,34 +228,83 @@ export const TOWER = {
 export const KEEP = {
   maxHp: 2000,
   radius: 1.25,
+  minRange: 3.2,
 };
 
-// D80: one-tile, non-blocking economic buildings. Cost escalation for farms
-// is applied by the game from `costFoodPerExisting`.
+// D80: one-tile, non-blocking economic buildings. D91: costs are Stone only;
+// farm cost escalation is applied by the game from `costStonePerExisting`.
+// A Farm's `baseRate` is not a stockpile rate: it scales the Food support the
+// farm provides (supportPerFarm x rate / baseRate).
 export const BUILDINGS = {
   farm: {
-    type: 'farm', name: 'Farm', cost: { food: 40 }, costFoodPerExisting: 12,
+    type: 'farm', name: 'Farm', cost: { stone: 35 }, costStonePerExisting: 8, minSpacing: 3,
     buildTime: 8, maxHp: 160, baseRate: 0.55, resource: 'food',
   },
   quarry: {
-    type: 'quarry', name: 'Quarry', cost: { food: 50, stone: 15 },
+    type: 'quarry', name: 'Quarry', cost: { stone: 40 },
     buildTime: 10, maxHp: 220, baseRate: 0.45, resource: 'stone', siteRange: 1.5,
   },
   mine: {
-    type: 'mine', name: 'Gold Mine', cost: { food: 60, stone: 50 },
+    type: 'mine', name: 'Gold Mine', cost: { stone: 120 },
     buildTime: 12, maxHp: 260, baseRate: 0.18, resource: 'gold', siteRange: 1.5,
   },
 };
 
-export const START_RESOURCES = { food: 150, stone: 280, gold: 0 };
+export const START_RESOURCES = { stone: 340, gold: 0 };
+
+// D91: Food is support, not currency. Farms set how many soldiers the fortress
+// can feed; soldiers are assigned to towers and make them hit harder and faster.
+export const GARRISON = {
+  supportPerFarm: 3,        // x the farm's fertility multiplier, rounded
+  slots: { keep: 4, tower: 1, towerUpgraded: 2 },
+  upgradedFromLevel: 2,     // weapon level at which a tower gains its second slot
+  fireRatePerSoldier: 0.20,
+  damagePerSoldier: 0.15,
+  graceSeconds: 30,         // deficit grace before anyone stands down
+  standDownInterval: 8,     // then one soldier every this many seconds
+};
+
+// D92: wilderness nests guard valuable sites. One nest type, one defender.
+export const NEST = {
+  countMin: 5,
+  countMax: 8,
+  minFromKeep: 30,
+  minSeparation: 16,
+  siteOffsetMin: 3,
+  siteOffsetMax: 6,
+  normalGoldChance: 0.6,
+  stoneChance: 0.5,         // for rich stone, or normal stone in the middle/far bands
+  maxHp: 1400,
+  radius: 1.1,
+  territory: 9,
+  structureReach: 3,        // ferals attack player structures within territory + this
+  leash: 6,                 // ferals turn home beyond territory + this
+  spawnInterval: 4.5,
+  maxAlive: 6,
+  calmAfter: 25,
+  siegeCheckInterval: 0.5,
+  reward: { stone: 40, gold: 15 },
+  feralFadeSeconds: 3,
+};
+
+export const WILD = {
+  feral: {
+    name: 'Feral', color: '#b5d16b', radius: 0.36,
+    hp: 42, speed: 3.6, structDps: 7, playerAggroRange: 9,
+    playerHit: 26, cost: 0,
+  },
+};
 
 // D82: a blocker (wall segment or non-Keep tower footprint tile) costs
 // breakBias x the distance an enemy could walk in the time it takes to break it.
-export const WALL_PATH = { breakBias: 1.5 };
+export const WALL_PATH = { breakBias: 1.5, recomputeInterval: 0.5 };
 
 // D81: walls run tile by tile between two finished tower anchors.
 export const WALL = {
   maxLength: 13,            // tower centre to tower centre, tiles
+  maxDegree: { tower: 3, keep: 6 },
+  keepPreference: 0.85,
+  minLinkAngle: 50,
   costStonePerSegment: 6,
   segmentHp: 260,
   buildBase: 3.0,           // seconds; a link takes buildBase + buildPerTile x segments
@@ -291,12 +340,13 @@ export const ARCHETYPES = {
   prospector: {
     name: 'Steward',
     color: '#ffd166',
-    blurb: 'Builds farms, quarries and mines more cheaply and quickly.',
+    blurb: 'Builds farms, quarries and mines more cheaply and quickly, and feeds two extra soldiers.',
     occupancy: {},
     buildingCostMult: 0.75,
     buildingBuildMult: 1.6,
+    foodSupportBonus: 2,
     repairCostMult: 1.0,
-    detail: ['Economic building cost x0.75', 'Economic building construction x1.6', 'Standard weapon and repair bonus'],
+    detail: ['Economic building cost x0.75', 'Economic building construction x1.6', '+2 Food support', 'Standard weapon and repair bonus'],
   },
   gunner: {
     name: 'Gunner',
@@ -404,7 +454,7 @@ export const DROP = {
   pickupRadius: 0.9,
   effectDuration: 20,
   categoryWeights: { temporary: 0.70, supply: 0.22, equipment: 0.08 },
-  supplyCache: { name: 'Supply Cache', color: '#ffd166', min: 24, max: 42, resources: ['food', 'stone'] },
+  supplyCache: { name: 'Supply Cache', color: '#ffd166', min: 24, max: 42, resources: ['stone'] },
   equipmentCap: 4,
   temporary: {
     repair: { name: 'Repair Kit', color: '#5ecbff', instant: true, healFrac: 0.35, playerHeal: 25 },
@@ -445,6 +495,7 @@ export const AUDIO = {
     repair: [760, .06, 'sine'], upgradeStart: [180, .13, 'square'], upgrade: [720, .18, 'triangle'],
     towerUnderAttack: [105, .32, 'sawtooth'], waveWarning: [185, .40, 'sawtooth'],
     waveStart: [230, .32, 'sawtooth'], finalWave: [155, .48, 'sawtooth'], victory: [660, .38, 'triangle'], playerDeath: [110, .44, 'sawtooth'],
+    nestAgitated: [120, .38, 'sawtooth'], nestDestroyed: [42, 1.1, 'sawtooth'], supplyDeficit: [300, .30, 'square'],
   },
   dropFrequencies: { temporary: 620, supply: 310, equipment: 880 },
   // D47: positive confirmations RISE in pitch; everything else falls. A falling

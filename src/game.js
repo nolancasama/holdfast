@@ -3,7 +3,7 @@
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY,
   WAVE, START_RESOURCES, BUILDINGS, KEEP, WALL_PATH, DROP, ELEVATION_NAMES, AUDIO,
-  BUILD, VISION, STUCK, BREACH, WALL,
+  BUILD, VISION, STUCK, BREACH, WALL, GARRISON, NEST, WILD,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -45,7 +45,6 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     tracers: [], particles: [], floaters: [], shockwaves: [],
     nextTowerId: 1, nextBuildingId: 1, nextWallId: 1, nextEnemyId: 1,
     selected: null, selectedBuildingId: null, buildMode: false, buildType: 'tower',
-    wallMode: null,
     cursor: { x: map.start.x, y: map.start.y },
     occupiedTowerId: null,
     shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
@@ -54,9 +53,14 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     blockerGrid: new Array(MAP.w * MAP.h).fill(null),
     blockerVersion: 0,
     keepFields: Object.create(null),
+    keepFieldTypes: new Set(),
+    keepFieldsDirty: false,
+    keepFieldNextAt: 0,
+    towerConnectivityCache: Object.create(null),
     log: [], audioEvents: [],
     stats: {
-      kills: 0, towersLost: 0, resourcesEarned: { food: 0, stone: 0, gold: 0 }, wavesCleared: 0,
+      kills: 0, towersLost: 0, resourcesEarned: { stone: 0, gold: 0 }, wavesCleared: 0,
+      nestsDestroyed: 0, feralKills: 0, standDowns: 0,
       breaches: 0, breachesByType: { swarm: 0, runner: 0, heavy: 0 }, breachDamage: 0,
       keepFieldRecomputes: 0, wallsBuilt: 0, wallSegmentsLost: 0, wallSegmentsRebuilt: 0,
       stuckDetections: 0, stuckRecoveries: 0, stuckDespawns: 0,
@@ -68,11 +72,17 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
       version: 0,
     },
     fogCache: { map, playerTile: null, towerSignature: null, towerTiles: new Map() },
+    // D91: Food deficit state. `since` is the time the deficit began.
+    supply: { since: null, nextStandDownAt: null },
+    nests: [],
+    wildFields: new Map(),
   };
 
   const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true, true);
   start.hp = start.maxHp;
   g.keepId = start.id;
+  g.towerConnectivityCache[start.id] = 'keep';
+  for (const n of map.nests || []) addNest(g, n.x, n.y, n.guards);
   recomputeVisibility(g, true);
   say(g, `Seed ${seed} — survive ${WAVE.totalToSurvive} waves.`);
   return g;
@@ -214,15 +224,17 @@ export function coverageAt(map, x, y, range) {
   return total ? seen / total : 0;
 }
 
-/** D80: each resource keeps its identity; tower sprawl escalates Stone only. */
+/** D80/D91: each resource keeps its identity; tower sprawl escalates Stone only. */
 export function towerCost(g) {
   const count = g.towers.filter((t) => !t.keep).length;
   return {
-    food: TOWER.cost.food,
     stone: TOWER.cost.stone + TOWER.costStonePerExisting * count,
     gold: 0,
   };
 }
+
+// D91: Food is never spent, so only Stone and Gold are spendable resources.
+const SPEND_KEYS = ['stone', 'gold'];
 
 function normalizeBuildType(type) {
   return type === 'goldMine' || type === 'gold-mine' ? 'mine' : (type || 'tower');
@@ -236,22 +248,25 @@ function buildCost(g, type) {
   if (type === 'tower') return towerCost(g);
   const def = BUILDINGS[type];
   const cost = { ...def.cost };
-  if (type === 'farm') cost.food += def.costFoodPerExisting
-    * g.buildings.filter((b) => b.type === 'farm' && !b.destroyed).length;
+  if (def.costStonePerExisting) cost.stone = (cost.stone || 0) + def.costStonePerExisting
+    * g.buildings.filter((b) => b.type === type && !b.destroyed).length;
   const mult = stewardCostMult(g, type);
   return {
-    food: Math.ceil((cost.food || 0) * mult),
     stone: Math.ceil((cost.stone || 0) * mult),
     gold: Math.ceil((cost.gold || 0) * mult),
   };
 }
 
 function canAfford(g, cost) {
-  return ['food', 'stone', 'gold'].every((key) => g.res[key] >= (cost[key] || 0));
+  return SPEND_KEYS.every((key) => (g.res[key] || 0) >= (cost[key] || 0));
+}
+
+function spend(g, cost) {
+  for (const key of SPEND_KEYS) g.res[key] -= cost[key] || 0;
 }
 
 function costLabel(cost) {
-  return ['food', 'stone', 'gold'].filter((key) => cost[key])
+  return SPEND_KEYS.filter((key) => cost[key])
     .map((key) => `${cost[key]} ${key[0].toUpperCase()}${key.slice(1)}`).join(', ');
 }
 
@@ -290,7 +305,8 @@ function nearestOpenSite(g, type, x, y) {
 export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
   const type = normalizeBuildType(buildType);
   const reasons = [];
-  const cost = buildCost(g, type);
+  let cost = buildCost(g, type);
+  let autoWalls = null;
   let site = null;
   let rate = 0;
   let fertility = null;
@@ -303,6 +319,9 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
         break;
       }
     }
+    autoWalls = autoWallPlan(g, x, y);
+    cost = autoWalls.cost;
+    if (!autoWalls.ok) reasons.push(autoWalls.reason);
   } else if (!BUILDINGS[type]) {
     reasons.push('unknown building');
   } else if (!isPassable(g.map, Math.floor(x), Math.floor(y))) {
@@ -325,8 +344,14 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
     rate = site ? BUILDINGS[type].baseRate * site.mult : 0;
   }
 
+  // D92: a nest's footprint is solid; nothing is built on top of it.
+  const ownRadius = type === 'tower' ? TOWER.radius : 0.55;
+  if (g.nests.some((n) => !n.destroyed && Math.hypot(n.x - x, n.y - y) < n.radius + ownRadius + 0.6)) {
+    reasons.push('too close to the nest');
+  }
+
   const unique = [...new Set(reasons)];
-  if (!canAfford(g, cost)) unique.push(`need ${costLabel(cost)}`);
+  if (type !== 'tower' && !canAfford(g, cost)) unique.push(`need ${costLabel(cost)}`);
   const terrain = kindAt(g.map, Math.floor(x), Math.floor(y));
   const elev = elevAt(g.map, Math.floor(x), Math.floor(y));
   return {
@@ -337,6 +362,7 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
     rate,
     fertility,
     site,
+    autoWalls,
     coverage: type === 'tower' ? coverageAt(g.map, x, y, TOWER.weapon.range) : null,
     terrain,
     elev,
@@ -380,7 +406,8 @@ function placeTower(g, x, y, instant = false, keep = false) {
     progress: instant ? 1 : 0,
     wLevel: 0,
     upgrade: null,
-    shotCd: 0, targetId: null, retargetIn: 0,
+    garrison: 0,
+    shotCd: 0, targetId: null, nestTargetId: null, retargetIn: 0,
     flash: 0, smoke: 0,
     unseenHitAt: null,
   };
@@ -394,7 +421,10 @@ function placeTower(g, x, y, instant = false, keep = false) {
     g.playerFieldAt = -99;
     recomputeVisibility(g, true);
   }
-  if (!keep) registerTowerBlocker(g, t);
+  if (!keep) {
+    registerTowerBlocker(g, t);
+    g.towerConnectivityCache[t.id] = 'outpost';
+  }
   return t;
 }
 
@@ -420,9 +450,11 @@ export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
     return { ...check, ok: false, reason, reasons: [...check.reasons, reason] };
   }
   if (!check.ok) return check;
-  for (const key of ['food', 'stone', 'gold']) g.res[key] -= check.cost[key] || 0;
+  spend(g, check.cost);
   if (type === 'tower') {
     const t = placeTower(g, x, y, false);
+    const links = check.autoWalls.links.map((link) => createAutomaticWall(g, link, t));
+    if (links.length) recomputeTowerConnectivity(g);
     g.selected = t.id;
     g.selectedBuildingId = null;
   } else {
@@ -432,8 +464,9 @@ export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
   }
   say(g, 'Construction started.');
   emitAudioEvent(g, 'constructionStart', { x, y });
-  return { ...check, structure: type === 'tower'
-    ? g.towers[g.towers.length - 1] : g.buildings[g.buildings.length - 1] };
+  return { ...check, plan: check.autoWalls, links: type === 'tower'
+    ? g.walls.filter((w) => w.builderTowerId === g.towers[g.towers.length - 1]?.id) : [],
+  structure: type === 'tower' ? g.towers[g.towers.length - 1] : g.buildings[g.buildings.length - 1] };
 }
 
 export function occupancyMults(g) {
@@ -456,13 +489,260 @@ export function towerStats(g, t) {
   const dmgBoost = g.effects.damage ? DROP.temporary.damage.mult : 1;
   const barrel = hasEquipment(g, 'reinforcedBarrel') ? DROP.equipment.reinforcedBarrel.towerDamage : 1;
   const module = hasEquipment(g, 'targetingModule') ? DROP.equipment.targetingModule.towerRange : 1;
+  // D91: soldiers stack with the player's occupancy; they never touch min range.
+  const soldiers = t.garrison || 0;
   return {
     occupied,
-    damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost * barrel,
-    fireRate: TOWER.weapon.fireRate * (1 + u.weaponRatePerLevel * t.wLevel) * m.fireRate,
+    garrison: soldiers,
+    damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost * barrel
+      * (1 + GARRISON.damagePerSoldier * soldiers),
+    fireRate: TOWER.weapon.fireRate * (1 + u.weaponRatePerLevel * t.wLevel) * m.fireRate
+      * (1 + GARRISON.fireRatePerSoldier * soldiers),
     range: (TOWER.weapon.range + u.weaponRangePerLevel * t.wLevel) * module,
     damageTaken: m.damageTaken,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Garrison (D91): Food support feeds soldiers; soldiers strengthen towers.
+// ---------------------------------------------------------------------------
+
+export function garrisonSlots(t) {
+  if (t.keep) return GARRISON.slots.keep;
+  return t.wLevel >= GARRISON.upgradedFromLevel ? GARRISON.slots.towerUpgraded : GARRISON.slots.tower;
+}
+
+/** Soldiers a finished, standing farm feeds: richer soil feeds more. */
+export function farmSupport(b) {
+  return Math.round(GARRISON.supportPerFarm * (b.rate || 0) / BUILDINGS.farm.baseRate);
+}
+
+export function foodSupport(g) {
+  let support = g.arch.foodSupportBonus || 0;
+  for (const b of g.buildings) {
+    if (b.type === 'farm' && b.built && !b.destroyed) support += farmSupport(b);
+  }
+  return support;
+}
+
+export function garrisonAssigned(g) {
+  return g.towers.reduce((n, t) => n + (t.garrison || 0), 0);
+}
+
+export function garrisonState(g) {
+  const support = foodSupport(g);
+  const assigned = garrisonAssigned(g);
+  const deficit = assigned > support;
+  const since = g.supply.since;
+  const graceLeft = deficit && since !== null ? Math.max(0, GARRISON.graceSeconds - (g.time - since)) : null;
+  return { support, assigned, free: Math.max(0, support - assigned), deficit, graceLeft,
+    standingDown: deficit && graceLeft === 0 };
+}
+
+/** Instant assignment; remote is allowed (a command, not labour). */
+export function assignGarrison(g, towerOrId, delta) {
+  if (g.paused) return { ok: false, reason: 'paused' };
+  const id = typeof towerOrId === 'object' ? towerOrId?.id : towerOrId;
+  const t = g.towers.find((o) => o.id === id);
+  if (!t) return { ok: false, reason: 'no tower' };
+  if (delta > 0) {
+    if (!t.built) return { ok: false, reason: 'tower is still under construction' };
+    if ((t.garrison || 0) >= garrisonSlots(t)) return { ok: false, reason: 'no free garrison slot' };
+    if (garrisonAssigned(g) >= foodSupport(g)) return { ok: false, reason: 'not enough Food support — build a Farm' };
+    t.garrison = (t.garrison || 0) + 1;
+    emitAudioEvent(g, 'towerEntry', t);
+    return { ok: true };
+  }
+  if (delta < 0) {
+    if (!(t.garrison > 0)) return { ok: false, reason: 'no soldiers to withdraw' };
+    t.garrison--;
+    return { ok: true };
+  }
+  return { ok: false, reason: 'no change' };
+}
+
+/** Outposts stand down first and the Keep last; ties go to the newest tower. */
+function standDownOrder(g, a, b) {
+  const rank = (t) => (t.keep ? 2 : towerConnectivity(g, t) === 'outpost' ? 0 : 1);
+  return rank(a) - rank(b) || b.id - a.id;
+}
+
+function updateGarrison(g) {
+  const support = foodSupport(g);
+  let assigned = garrisonAssigned(g);
+  if (assigned <= support) {
+    if (g.supply.since !== null) say(g, 'Supply restored. The garrison is fed.');
+    g.supply.since = null;
+    g.supply.nextStandDownAt = null;
+    return;
+  }
+  if (g.supply.since === null) {
+    g.supply.since = g.time;
+    g.supply.nextStandDownAt = g.time + GARRISON.graceSeconds;
+    say(g, `SUPPLY DEFICIT: ${assigned} soldiers, Food for ${support}. ${GARRISON.graceSeconds}s before they stand down.`);
+    emitAudioEvent(g, 'supplyDeficit', keepTower(g) || g.player);
+  }
+  if (g.time < g.supply.nextStandDownAt) return;
+  const t = g.towers.filter((o) => o.garrison > 0).sort((a, b) => standDownOrder(g, a, b))[0];
+  if (!t) return;
+  t.garrison--;
+  assigned--;
+  g.stats.standDowns++;
+  g.supply.nextStandDownAt = g.time + GARRISON.standDownInterval;
+  floater(g, t.x, t.y - 1.3, 'STOOD DOWN', '#ffb347');
+  say(g, `Unfed soldiers stood down at ${t.keep ? 'the Keep' : `tower #${t.id}`}.`);
+}
+
+// ---------------------------------------------------------------------------
+// Wilderness nests (D92): local territory that resists expansion.
+// ---------------------------------------------------------------------------
+
+// A nest is solid ground for everyone, never a thing the army chooses to
+// break: its path cost is effectively infinite.
+const NEST_BLOCK_HP = 1e7;
+
+export function addNest(g, x, y, guards = null) {
+  const n = {
+    id: `nest-${g.nests.length}`, nest: true, x, y, guards,
+    radius: NEST.radius, hp: NEST.maxHp, maxHp: NEST.maxHp,
+    state: 'dormant', underSiege: false, siegeCheckAt: 0,
+    spawnCd: 0, lastThreatAt: -Infinity, destroyed: false, destroyedAt: null,
+    flash: 0, shake: 0,
+  };
+  n.blockerTiles = towerFootprintTiles(n);
+  for (const i of n.blockerTiles) g.blockerGrid[i] = { kind: 'nest', id: n.id, structure: n, maxHp: NEST_BLOCK_HP };
+  g.nests.push(n);
+  invalidateKeepFields(g);
+  return n;
+}
+
+function nestThreatened(g, n) {
+  const r = NEST.territory;
+  if (dist(g.player, n) <= r) return true;
+  return g.towers.some((t) => dist(t, n) <= r)
+    || g.buildings.some((b) => !b.destroyed && dist(b, n) <= r);
+}
+
+/** D93 applies to nests: visible, within the annulus and in line of sight. */
+export function towerCanHitNest(g, t, n) {
+  if (!t.built || n.destroyed) return false;
+  const d = dist(t, n);
+  if (d < towerMinRange(g, t) || d - n.radius > towerStats(g, t).range) return false;
+  return isPointVisible(g, n.x, n.y) && hasLineOfSight(g.map, t.x, t.y, n.x, n.y);
+}
+
+function agitateNest(g, n) {
+  if (n.state !== 'dormant' || n.destroyed) return;
+  n.state = 'agitated';
+  n.spawnCd = 1.0;
+  n.lastThreatAt = g.time;
+  floater(g, n.x, n.y - 1.6, 'NEST AGITATED', '#d7f36b');
+  say(g, 'A nest stirs: its defenders are coming.');
+  emitAudioEvent(g, 'nestAgitated', n);
+}
+
+function damageNest(g, n, amount) {
+  if (n.destroyed) return;
+  n.hp -= amount;
+  n.flash = 1;
+  n.lastThreatAt = g.time;
+  agitateNest(g, n);
+  burst(g, n.x, n.y, '#9fbf4a', 3, 2.5);
+  if (n.hp <= 0) destroyNest(g, n);
+}
+
+function destroyNest(g, n) {
+  if (n.destroyed) return;
+  n.destroyed = true;
+  n.hp = 0;
+  n.state = 'destroyed';
+  n.underSiege = false;
+  n.destroyedAt = g.time;
+  for (const i of n.blockerTiles) if (g.blockerGrid[i]?.structure === n) g.blockerGrid[i] = null;
+  invalidateKeepFields(g);
+  g.wildFields.clear();
+  for (const key of SPEND_KEYS) {
+    g.res[key] += NEST.reward[key] || 0;
+    g.stats.resourcesEarned[key] += NEST.reward[key] || 0;
+  }
+  for (const e of g.enemies) {
+    if (e.nestId === n.id) e.fadeAt = g.time + Math.random() * NEST.feralFadeSeconds;
+  }
+  g.stats.nestsDestroyed++;
+  burst(g, n.x, n.y, '#9fbf4a', 40, 7);
+  burst(g, n.x, n.y, '#ffb347', 24, 6);
+  g.shockwaves.push({ x: n.x, y: n.y, t: 0, life: 0.9, radius: 5, color: '#d7f36b' });
+  floater(g, n.x, n.y - 1.8, `TERRITORY CLEARED +${NEST.reward.stone} Stone +${NEST.reward.gold} Gold`, '#d7f36b');
+  say(g, 'Nest destroyed. The territory is cleared.');
+  emitAudioEvent(g, 'nestDestroyed', n);
+}
+
+function spawnFeral(g, n) {
+  for (let tries = 0; tries < 12; tries++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = n.radius + 1.1 + Math.random();
+    const x = n.x + Math.cos(a) * r;
+    const y = n.y + Math.sin(a) * r;
+    const tx = Math.floor(x);
+    const ty = Math.floor(y);
+    if (!inBounds(tx, ty) || !isPassable(g.map, tx, ty) || g.blockerGrid[idx(tx, ty)]) continue;
+    const def = WILD.feral;
+    const e = {
+      id: g.nextEnemyId++, type: 'feral', def, side: 'wild', wild: true, nestId: n.id,
+      home: { x: n.x, y: n.y, radius: n.radius },
+      x, y, hp: def.hp, maxHp: def.hp, structMult: 1,
+      targetId: null, strategicTargetId: null, econTargetId: null, blockerTargetId: null,
+      playerAggroUntil: 0, playerAggroCooldownUntil: 0, hitCd: 0, flash: 0, stuckOrigin: 'spawn',
+    };
+    g.enemies.push(e);
+    burst(g, x, y, def.color, 8, 3);
+    return e;
+  }
+  return null;
+}
+
+function updateNests(g, dt) {
+  for (const n of g.nests) {
+    if (n.destroyed) continue;
+    n.flash = Math.max(0, n.flash - dt * 3);
+    if (nestThreatened(g, n)) {
+      n.lastThreatAt = g.time;
+      agitateNest(g, n);
+    }
+    if (g.time >= n.siegeCheckAt) {
+      n.siegeCheckAt = g.time + NEST.siegeCheckInterval;
+      const was = n.underSiege;
+      n.underSiege = g.towers.some((t) => towerCanHitNest(g, t, n));
+      if (n.underSiege && !was) say(g, 'A tower has the nest in its sights: UNDER SIEGE.');
+    }
+    if (n.state !== 'agitated') continue;
+    if (g.time - n.lastThreatAt > NEST.calmAfter) {
+      n.state = 'dormant';
+      say(g, 'The nest settles.');
+      continue;
+    }
+    n.spawnCd -= dt;
+    if (n.spawnCd <= 0) {
+      n.spawnCd = NEST.spawnInterval;
+      const alive = g.enemies.filter((e) => e.nestId === n.id && !e.fadeAt).length;
+      if (alive < NEST.maxAlive) spawnFeral(g, n);
+    }
+  }
+}
+
+export function nestState(g) {
+  return g.nests.map((n) => ({
+    id: n.id, x: n.x, y: n.y, guards: n.guards, hp: n.hp, maxHp: n.maxHp,
+    state: n.destroyed ? 'destroyed' : n.underSiege ? 'siege' : n.state,
+    underSiege: n.underSiege, destroyed: n.destroyed,
+    ferals: g.enemies.filter((e) => e.nestId === n.id).length,
+  }));
+}
+
+/** D93 future hook: closeDefense can only shrink the fixed blind radius. */
+export function towerMinRange(g, t) {
+  const base = t.keep ? KEEP.minRange : TOWER.weapon.minRange;
+  return Math.max(0, base - (t.closeDefense || 0));
 }
 
 export function upgradeCost(t, which = 'weapon') {
@@ -478,7 +758,7 @@ export function tryUpgrade(g, t, which) {
   const cost = upgradeCost(t, which);
   if (cost === null || !canAfford(g, cost) || !t.built || t.upgrade) return false;
   if (dist(g.player, t) > PLAYER.presenceRadius) return false;
-  for (const key of ['food', 'stone', 'gold']) g.res[key] -= cost[key] || 0;
+  spend(g, cost);
   const level = t.wLevel;
   t.upgrade = { which, toLevel: level + 1, progress: 0, duration: TOWER.upgrade.buildTime[level] };
   emitAudioEvent(g, 'upgradeStart', t);
@@ -529,7 +809,13 @@ function towerFootprintTiles(t) {
 
 function invalidateKeepFields(g) {
   g.blockerVersion++;
-  g.keepFields = Object.create(null);
+  if (!g.keepFieldsDirty) {
+    g.keepFieldsDirty = true;
+    // An idle field reacts on the next frame (a breach must reroute at once);
+    // only changes arriving during a busy spell wait out the interval.
+    g.keepFieldNextAt = Math.max(g.time,
+      (g.keepFieldLastAt ?? -Infinity) + WALL_PATH.recomputeInterval);
+  }
 }
 
 function registerTowerBlocker(g, t) {
@@ -551,15 +837,12 @@ function keepTower(g) {
   return g.towers.find((t) => t.id === g.keepId) || null;
 }
 
-function keepField(g, type) {
+function rebuildKeepField(g, type) {
   const keep = keepTower(g);
   if (!keep) return null;
   const goal = idx(clampTx(keep.x), clampTy(keep.y));
-  const cached = g.keepFields[type];
-  // Blocker geometry is the only thing that changes in play; the goal and map
-  // keys just make a cached field impossible to read against the wrong board.
-  if (cached && cached.version === g.blockerVersion && cached.goal === goal && cached.map === g.map) return cached.field;
   const def = ENEMIES[type];
+  if (!def) return null;
   const obstacleCosts = new Float32Array(MAP.w * MAP.h);
   for (let i = 0; i < g.blockerGrid.length; i++) {
     const blocker = g.blockerGrid[i];
@@ -571,9 +854,45 @@ function keepField(g, type) {
   return field;
 }
 
+function keepField(g, type) {
+  const keep = keepTower(g);
+  if (!keep) return null;
+  g.keepFieldTypes.add(type);
+  const goal = idx(clampTx(keep.x), clampTy(keep.y));
+  const cached = g.keepFields[type];
+  // D90: a geometry change does not synchronously throw away a usable field.
+  // The field and its obstacle costs remain paired at their original version;
+  // live blocker collision still prevents walking through newer geometry.
+  if (cached && cached.goal === goal && cached.map === g.map) return cached.field;
+  return rebuildKeepField(g, type);
+}
+
+function updateKeepFieldRecomputes(g) {
+  if (!g.keepFieldsDirty || g.time + 1e-9 < g.keepFieldNextAt) return;
+  const type = [...g.keepFieldTypes].find((key) => g.keepFields[key]?.version !== g.blockerVersion);
+  if (!type) { g.keepFieldsDirty = false; return; }
+  rebuildKeepField(g, type);
+  // One type per frame; the remaining types follow on the next frames, and the
+  // interval starts once the whole set is current.
+  g.keepFieldsDirty = [...g.keepFieldTypes].some((key) => g.keepFields[key]?.version !== g.blockerVersion);
+  if (!g.keepFieldsDirty) g.keepFieldLastAt = g.time;
+}
+
+/** Test/tool seam: settle every requested field against current live blockers. */
+export function flushKeepFieldRecomputes(g) {
+  const types = g.keepFieldTypes.size ? [...g.keepFieldTypes] : Object.keys(g.keepFields);
+  for (const type of types) {
+    if (g.keepFields[type]?.version !== g.blockerVersion) rebuildKeepField(g, type);
+  }
+  g.keepFieldsDirty = false;
+  g.keepFieldLastAt = g.time;
+  g.keepFieldNextAt = g.time + WALL_PATH.recomputeInterval;
+  return types.length;
+}
+
 function keepObstacles(g, type) {
   const cached = g.keepFields[type];
-  return cached && cached.version === g.blockerVersion && cached.map === g.map ? cached.obstacleCosts : null;
+  return cached && cached.map === g.map ? cached.obstacleCosts : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -611,13 +930,222 @@ function wallLinkExists(g, aId, bId) {
   return g.walls.some((w) => (w.a === aId && w.b === bId) || (w.a === bId && w.b === aId));
 }
 
+function wallDegree(g, towerId) {
+  return g.walls.reduce((n, w) => n + ((w.a === towerId || w.b === towerId)
+    && (!w.cancelled || w.segments.some((s) => s.present)) ? 1 : 0), 0);
+}
+
+function maxWallDegree(t) {
+  return t.keep ? WALL.maxDegree.keep : WALL.maxDegree.tower;
+}
+
+function samePoint(a, b) {
+  return Math.abs(a.x - b.x) < 1e-7 && Math.abs(a.y - b.y) < 1e-7;
+}
+
+function orient(a, b, c) {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/** Strict centre-line crossing: endpoint touches and collinear runs are not proper crossings. */
+function properLineCross(a, b, c, d) {
+  if ([a, b].some((p) => samePoint(p, c) || samePoint(p, d))) return false;
+  const abC = orient(a, b, c);
+  const abD = orient(a, b, d);
+  const cdA = orient(c, d, a);
+  const cdB = orient(c, d, b);
+  const eps = 1e-8;
+  return abC * abD < -eps && cdA * cdB < -eps;
+}
+
+function linkPoints(g, link) {
+  const a = g.towers.find((t) => t.id === link.a) || link.aPos;
+  const b = g.towers.find((t) => t.id === link.b) || link.bPos;
+  return a && b ? [a, b] : null;
+}
+
+function towerComponents(g) {
+  const byId = new Map(g.towers.map((t) => [t.id, t]));
+  const edges = new Map(g.towers.map((t) => [t.id, []]));
+  for (const link of g.walls) {
+    if (!byId.has(link.a) || !byId.has(link.b)) continue;
+    edges.get(link.a).push(link.b);
+    edges.get(link.b).push(link.a);
+  }
+  const components = new Map();
+  let component = 0;
+  for (const tower of g.towers) {
+    if (components.has(tower.id)) continue;
+    const todo = [tower.id];
+    components.set(tower.id, component);
+    while (todo.length) {
+      const id = todo.pop();
+      for (const other of edges.get(id) || []) if (!components.has(other)) {
+        components.set(other, component);
+        todo.push(other);
+      }
+    }
+    component++;
+  }
+  return components;
+}
+
+function recomputeTowerConnectivity(g) {
+  const components = towerComponents(g);
+  const keepComponent = components.get(g.keepId);
+  const next = Object.create(null);
+  for (const t of g.towers) next[t.id] = t.keep ? 'keep'
+    : components.get(t.id) === keepComponent ? 'connected' : 'outpost';
+  g.towerConnectivityCache = next;
+}
+
+/** D89 cached graph accessor. The graph itself changes only with links/deaths. */
+export function towerConnectivity(g, towerOrId) {
+  const id = typeof towerOrId === 'object' ? towerOrId?.id : towerOrId;
+  const t = g.towers.find((o) => o.id === id);
+  if (!t) return null;
+  return g.towerConnectivityCache[id] || (t.keep ? 'keep' : 'outpost');
+}
+
+function footprintContains(structure, tile) {
+  const radius = structure.radius ?? 0.55;
+  const nx = clamp(structure.x, tile.x, tile.x + 1);
+  const ny = clamp(structure.y, tile.y, tile.y + 1);
+  return Math.hypot(nx - structure.x, ny - structure.y) <= radius + 1e-6;
+}
+
+function autoLinkCandidate(g, x, y, anchor) {
+  const length = Math.hypot(anchor.x - x, anchor.y - y);
+  if (length > WALL.maxLength + 1e-6 || wallDegree(g, anchor.id) >= maxWallDegree(anchor)) return null;
+  const planned = { x, y, radius: TOWER.radius };
+  const excluded = new Set([...towerFootprintTiles(anchor), ...towerFootprintTiles(planned)]);
+  const tiles = [];
+  const segments = [];
+  for (const tile of supercoverLine(anchor.x, anchor.y, x, y)) {
+    if (!inBounds(tile.x, tile.y)) continue;
+    const i = idx(tile.x, tile.y);
+    if (excluded.has(i)) continue;
+    tiles.push(tile);
+    if (!isPassable(g.map, tile.x, tile.y)) continue;
+    if (g.towers.some((t) => t !== anchor && footprintContains(t, tile))) return null;
+    if (g.buildings.some((b) => !b.destroyed && footprintContains(b, tile))) return null;
+    if ((g.nests || []).some((nest) => !nest.destroyed && footprintContains(nest, tile))) return null;
+    if (wallSegments(g).some((seg) => !seg.cancelled && seg.tx === tile.x && seg.ty === tile.y)) return null;
+    segments.push(tile);
+  }
+  if (!segments.length) return null;
+  const newPoint = { x, y };
+  for (const existing of g.walls) {
+    const points = linkPoints(g, existing);
+    if (points && properLineCross(anchor, newPoint, points[0], points[1])) return null;
+  }
+  return {
+    anchorId: anchor.id,
+    anchor,
+    length,
+    tiles,
+    segments,
+    cost: segments.length * WALL.costStonePerSegment,
+  };
+}
+
+function linkAngle(a, b) {
+  const dot = (a.anchor.x - a.newX) * (b.anchor.x - b.newX)
+    + (a.anchor.y - a.newY) * (b.anchor.y - b.newY);
+  const cos = clamp(dot / Math.max(1e-9, a.length * b.length), -1, 1);
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
+function costWithWalls(tower, wallStone) {
+  return { stone: (tower.stone || 0) + wallStone, gold: tower.gold || 0 };
+}
+
+function affordabilityReason(g, cost) {
+  const shortfall = Math.max(0, (cost.stone || 0) - g.res.stone);
+  return shortfall > 0 ? `Need ${Math.ceil(shortfall)} more Stone.` : `need ${costLabel(cost)}`;
+}
+
+/** Pure D89 plan for one local tower site. No state is mutated. */
+export function autoWallPlan(g, x, y) {
+  const tower = towerCost(g);
+  const components = towerComponents(g);
+  const keepComponent = components.get(g.keepId);
+  const candidates = g.towers.map((anchor) => autoLinkCandidate(g, x, y, anchor))
+    .filter(Boolean).map((link) => ({ ...link, newX: x, newY: y,
+      component: components.get(link.anchorId), connected: components.get(link.anchorId) === keepComponent }));
+  const connected = candidates.filter((c) => c.connected)
+    .sort((a, b) => a.length * (a.anchor.keep ? WALL.keepPreference : 1)
+      - b.length * (b.anchor.keep ? WALL.keepPreference : 1) || a.anchorId - b.anchorId);
+  const isolated = candidates.filter((c) => !c.connected)
+    .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
+  const first = connected[0] || isolated[0] || null;
+  let second = null;
+  if (first) {
+    const validSecond = candidates.filter((c) => c !== first
+      && linkAngle(first, c) + 1e-7 >= WALL.minLinkAngle
+      && !properLineCross(first.anchor, { x, y }, c.anchor, { x, y })
+      && !c.segments.some((tile) => first.segments.some((other) => tile.x === other.x && tile.y === other.y)));
+    const bridges = validSecond.filter((c) => c.component !== first.component)
+      .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
+    const loops = validSecond.filter((c) => c.component === first.component)
+      .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
+    second = bridges[0] || loops[0] || null;
+  }
+
+  const selected = first ? [first, ...(second ? [second] : [])] : [];
+  const firstWall = first?.cost || 0;
+  const allWalls = selected.reduce((sum, link) => sum + link.cost, 0);
+  const requiredCost = costWithWalls(tower, firstWall);
+  const fullCost = costWithWalls(tower, allWalls);
+  let links = selected;
+  let droppedOptional = false;
+  let ok = true;
+  let reason = null;
+  if (!canAfford(g, fullCost) && second && canAfford(g, requiredCost)) {
+    links = [first];
+    droppedOptional = true;
+  } else if (!canAfford(g, requiredCost)) {
+    ok = false;
+    reason = affordabilityReason(g, requiredCost);
+    links = [];
+  } else if (!canAfford(g, fullCost)) {
+    ok = false;
+    reason = affordabilityReason(g, fullCost);
+    links = [];
+  }
+  const costLinks = ok ? links : (first ? [first] : []);
+  const bridgeToKeep = costLinks.length > 1 && costLinks[0].component !== costLinks[1].component
+    && (costLinks[0].connected || costLinks[1].connected);
+  const status = bridgeToKeep ? 'bridges'
+    : (costLinks.some((link) => link.connected) ? 'connected' : 'outpost');
+  const wallCost = costLinks.reduce((sum, link) => sum + link.cost, 0);
+  const cost = costWithWalls(tower, wallCost);
+  const previewLinks = selected.map((link, index) => ({ ...link,
+    dropped: droppedOptional && index === 1,
+    refused: !ok && index === 0,
+  }));
+  return {
+    ok,
+    reasons: reason ? [reason] : [],
+    reason,
+    links: links.map(({ anchor, component, connected: isConnected, newX, newY, ...link }) => link),
+    previewLinks,
+    towerCost: tower.stone || 0,
+    wallCost,
+    total: (tower.stone || 0) + wallCost,
+    cost,
+    status,
+    droppedOptional,
+  };
+}
+
 /** Everything the wall preview needs: tiles, segments, cost and refusal reasons. */
 export function wallPlan(g, aId, bId) {
   const a = g.towers.find((t) => t.id === aId);
   const b = g.towers.find((t) => t.id === bId);
   const reasons = [];
   const result = { ok: false, reasons, a: aId, b: bId, tiles: [], segments: [], skipped: 0, length: 0,
-    cost: { food: 0, stone: 0, gold: 0 } };
+    cost: { stone: 0, gold: 0 } };
   if (!a || !b) { reasons.push('choose two towers'); return result; }
   if (a === b) { reasons.push('choose a different tower'); return result; }
   if (!a.built || !b.built) reasons.push('both towers must be finished');
@@ -643,7 +1171,7 @@ export function wallPlan(g, aId, bId) {
     result.segments.push(tile);
   }
   if (!result.segments.length && !reasons.length) reasons.push('nothing to build between these towers');
-  result.cost = { food: 0, stone: WALL.costStonePerSegment * result.segments.length, gold: 0 };
+  result.cost = { stone: WALL.costStonePerSegment * result.segments.length, gold: 0 };
   const unique = [...new Set(reasons)];
   if (!canAfford(g, result.cost)) unique.push(`need ${costLabel(result.cost)}`);
   result.reasons = unique;
@@ -653,6 +1181,32 @@ export function wallPlan(g, aId, bId) {
 
 function registerWallSegment(g, seg) {
   g.blockerGrid[seg.i] = { kind: 'wall', id: seg.id, structure: seg, maxHp: seg.maxHp };
+}
+
+function createAutomaticWall(g, plan, newTower) {
+  const anchor = g.towers.find((t) => t.id === plan.anchorId);
+  const link = {
+    id: g.nextWallId++, a: plan.anchorId, b: newTower.id,
+    aPos: { x: anchor.x, y: anchor.y }, bPos: { x: newTower.x, y: newTower.y },
+    builderTowerId: newTower.id,
+    automatic: true,
+    built: false, cancelled: false, progress: 0,
+    duration: Math.max(TOWER.buildTime, WALL.buildBase + WALL.buildPerTile * plan.segments.length),
+    segments: [],
+  };
+  plan.segments.forEach((tile, k) => {
+    link.segments.push({
+      id: `w${link.id}:${k}`, wall: true, linkId: link.id,
+      tx: tile.x, ty: tile.y, i: idx(tile.x, tile.y), x: tile.x + 0.5, y: tile.y + 0.5,
+      radius: 0.5, maxHp: WALL.segmentHp, hp: 0,
+      gate: k === 0 || k === plan.segments.length - 1,
+      present: false, cancelled: false, destroyed: false,
+      flash: 0, shake: 0, unseenHitAt: null,
+    });
+  });
+  g.walls.push(link);
+  g.stats.wallsBuilt++;
+  return link;
 }
 
 /** D81: start a wall link. The player must be at one of its towers. */
@@ -670,6 +1224,7 @@ export function tryBuildWall(g, aId, bId) {
   g.res.stone -= plan.cost.stone;
   const link = {
     id: g.nextWallId++, a: aId, b: bId,
+    aPos: { x: a.x, y: a.y }, bPos: { x: b.x, y: b.y },
     built: false, progress: 0,
     duration: WALL.buildBase + WALL.buildPerTile * plan.segments.length,
     segments: [],
@@ -681,13 +1236,14 @@ export function tryBuildWall(g, aId, bId) {
       radius: 0.5, maxHp: WALL.segmentHp, hp: WALL.segmentHp * WALL.buildHpFraction,
       // The segment next to each anchor is a postern: enemy-solid, player-open.
       gate: k === 0 || k === plan.segments.length - 1,
-      destroyed: false, flash: 0, shake: 0, unseenHitAt: null,
+      present: true, cancelled: false, destroyed: false, flash: 0, shake: 0, unseenHitAt: null,
     };
     link.segments.push(seg);
     registerWallSegment(g, seg);
   });
   g.walls.push(link);
   invalidateKeepFields(g);
+  recomputeTowerConnectivity(g);
   g.stats.wallsBuilt++;
   say(g, `Wall started: ${plan.segments.length} segments.`);
   emitAudioEvent(g, 'constructionStart', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
@@ -706,11 +1262,46 @@ function wallSegmentAt(g, i) {
 function updateWalls(g, dt) {
   for (const link of g.walls) {
     for (const seg of link.segments) {
+      if (!seg.present) continue;
       seg.flash = Math.max(0, seg.flash - dt * 3);
       if (seg.shake > 0) seg.shake = Math.max(0, seg.shake - dt);
       if (!seg.destroyed && seg.hp <= 0) destroyWallSegment(g, seg);
     }
-    if (link.built) continue;
+    if (link.built || link.cancelled) continue;
+    if (link.automatic) {
+      const builder = g.towers.find((t) => t.id === link.builderTowerId);
+      if (builder?.built) link.builderFinished = true;
+      if (!builder && !link.builderFinished) {
+        link.cancelled = true;
+        for (const seg of link.segments) if (!seg.present) seg.cancelled = true;
+        continue;
+      }
+      const rate = builder ? constructionRateMult(g, builder) : 1;
+      link.progress = Math.min(1, link.progress + rate * dt / link.duration);
+      const count = link.segments.length;
+      for (let k = 0; k < count; k++) {
+        const seg = link.segments[k];
+        if (seg.cancelled) continue;
+        const share = clamp(link.progress * count - k, 0, 1);
+        if (share <= 0) continue;
+        if (!seg.present) {
+          seg.present = true;
+          seg.hp = seg.maxHp * WALL.buildHpFraction;
+          registerWallSegment(g, seg);
+          invalidateKeepFields(g);
+        }
+        if (!seg.destroyed) seg.hp = Math.min(seg.maxHp,
+          seg.maxHp * (WALL.buildHpFraction + share * (1 - WALL.buildHpFraction)));
+      }
+      if (link.progress >= 1) {
+        link.built = true;
+        for (const seg of link.segments) if (seg.present && !seg.destroyed) seg.hp = seg.maxHp;
+        say(g, 'Wall complete.');
+        const mid = link.segments[Math.floor(link.segments.length / 2)];
+        emitAudioEvent(g, 'constructionComplete', mid || g.player);
+      }
+      continue;
+    }
     const near = link.segments.some((s) => dist(g.player, s) <= PLAYER.presenceRadius)
       || [link.a, link.b].some((id) => { const t = g.towers.find((o) => o.id === id); return t && dist(g.player, t) <= PLAYER.presenceRadius; });
     const rate = (near ? occupancyMults(g).construction : 1) / link.duration;
@@ -729,7 +1320,7 @@ function updateWalls(g, dt) {
 }
 
 function destroyWallSegment(g, seg, attacker = null) {
-  if (seg.destroyed) return;
+  if (seg.destroyed || !seg.present) return;
   seg.destroyed = true;
   seg.hp = 0;
   if (g.blockerGrid[seg.i]?.structure === seg) g.blockerGrid[seg.i] = null;
@@ -768,9 +1359,10 @@ function rebuildWallSegment(g, seg) {
 
 export function wallState(g) {
   return g.walls.map((w) => ({
-    id: w.id, a: w.a, b: w.b, built: w.built, progress: w.progress, duration: w.duration,
+    id: w.id, a: w.a, b: w.b, built: w.built, cancelled: !!w.cancelled,
+    progress: w.progress, duration: w.duration,
     segments: w.segments.map((s) => ({ id: s.id, tx: s.tx, ty: s.ty, hp: s.hp, maxHp: s.maxHp,
-      gate: s.gate, destroyed: s.destroyed })),
+      gate: s.gate, present: s.present !== false, cancelled: !!s.cancelled, destroyed: s.destroyed })),
   }));
 }
 
@@ -780,6 +1372,7 @@ function destroyTower(g, t) {
   t.upgrade = null;
   unregisterTowerBlocker(g, t);
   g.towers = g.towers.filter((o) => o !== t);
+  recomputeTowerConnectivity(g);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
   for (const e of g.enemies) if (e.blockerTargetId === t.id) e.blockerTargetId = null;
@@ -1014,6 +1607,15 @@ function updatePlayer(g, dt) {
       damageEnemy(g, e, PLAYER.melee.damage);
       hit = true;
     }
+    // D92: the player may chop at a nest, but its hp makes towers the real answer.
+    for (const n of g.nests) {
+      if (n.destroyed || dist(p, n) > PLAYER.melee.range + n.radius) continue;
+      const ang = Math.atan2(n.y - p.y, n.x - p.x);
+      const face = Math.atan2(p.facing.y, p.facing.x);
+      if (Math.abs(((ang - face + Math.PI * 3) % (Math.PI * 2)) - Math.PI) > PLAYER.melee.arc / 2) continue;
+      damageNest(g, n, PLAYER.melee.damage);
+      hit = true;
+    }
     burst(g, p.x + p.facing.x, p.y + p.facing.y, hit ? '#ffffff' : '#666c78', 6, 3);
   }
 
@@ -1039,6 +1641,7 @@ function moveWithCollision(g, ent, dx, dy, radius) {
     const blocker = g.blockerGrid[i];
     if (!blocker) return false;
     if (enemy) return true;
+    if (blocker.kind === 'nest') return true;
     return blocker.kind === 'wall' && !blocker.structure.gate;
   };
   const tryAxis = (nx, ny) => {
@@ -1104,10 +1707,26 @@ function updateTowers(g, dt) {
     if (t.retargetIn <= 0) {
       t.retargetIn = 0.22;
       t.targetId = acquireTarget(g, t, s.range);
+      // D92: a nest is the target only when no enemy or feral is in the annulus.
+      t.nestTargetId = t.targetId === null ? acquireNestTarget(g, t) : null;
+    }
+    if (t.shotCd <= 0 && t.targetId === null && t.nestTargetId !== null) {
+      const n = g.nests.find((o) => o.id === t.nestTargetId);
+      if (n && towerCanHitNest(g, t, n)) {
+        t.shotCd = 1 / s.fireRate;
+        g.tracers.push({ x0: t.x, y0: t.y, x1: n.x, y1: n.y, t: 0,
+          life: 0.09, color: s.occupied ? '#ffe680' : '#cfd6e0' });
+        emitAudioEvent(g, 'towerFire', { ...t, occupied: s.occupied });
+        damageNest(g, n, s.damage);
+      } else {
+        t.nestTargetId = null;
+      }
     }
     if (t.shotCd <= 0 && t.targetId !== null) {
       const e = g.enemies.find((o) => o.id === t.targetId);
-      if (e && dist(e, t) <= s.range && hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) {
+      const targetDistance = e ? dist(e, t) : Infinity;
+      if (e && targetDistance >= towerMinRange(g, t) && targetDistance <= s.range
+          && hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) {
         t.shotCd = 1 / s.fireRate;
         g.tracers.push({ x0: t.x, y0: t.y, x1: e.x, y1: e.y, t: 0,
           life: 0.09, color: s.occupied ? '#ffe680' : '#cfd6e0' });
@@ -1160,6 +1779,7 @@ function updateBuildings(g, dt) {
       continue;
     }
     const key = def.resource;
+    if (key === 'food') continue; // D91: Food is support (foodSupport), never a stockpile
     const gained = b.rate * dt;
     g.res[key] += gained;
     g.stats.resourcesEarned[key] += gained;
@@ -1172,12 +1792,23 @@ function acquireTarget(g, t, range) {
   let bestKey = Infinity;
   for (const e of g.enemies) {
     const d = dist(e, t);
-    if (d > range) continue;
+    if (d < towerMinRange(g, t) || d > range) continue;
     const key = (e.blockerTargetId === t.id ? 0 : 1000) + d;
     if (key >= bestKey) continue;
     if (!hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) continue;
     bestKey = key;
     best = e;
+  }
+  return best ? best.id : null;
+}
+
+function acquireNestTarget(g, t) {
+  let best = null;
+  let bestD = Infinity;
+  for (const n of g.nests) {
+    if (n.destroyed) continue;
+    const d = dist(t, n);
+    if (d < bestD && towerCanHitNest(g, t, n)) { best = n; bestD = d; }
   }
   return best ? best.id : null;
 }
@@ -1323,22 +1954,13 @@ function updateEnemies(g, dt) {
   for (const e of [...g.enemies]) {
     e.flash = Math.max(0, e.flash - dt * 4);
     e.hitCd = Math.max(0, e.hitCd - dt);
+    if (e.wild) { updateFeral(g, e, dt); continue; }
     retarget(g, e);
     if (e.targetId !== PLAYER_TARGET_ID) e.targetId = g.keepId;
 
     // Opportunistic swipe at a player who wanders into reach, wherever it is headed.
     const dPlayer = dist(e, p);
-    if (g.occupiedTowerId === null && dPlayer <= ENEMY.playerAttackRange + e.def.radius
-        && e.hitCd <= 0 && p.hurtCd <= 0 && structureClearLine(g, e, p)) {
-      e.hitCd = ENEMY.playerHitCooldown;
-      const armour = hasEquipment(g, 'armourPlate') ? DROP.equipment.armourPlate.playerDamageTaken : 1;
-      const playerDamage = e.def.playerHit * armour;
-      p.hp -= playerDamage;
-      emitAudioEvent(g, 'playerDamage', p);
-      p.hurtCd = PLAYER.invulnAfterHit;
-      floater(g, p.x, p.y - 0.8, `-${Math.round(playerDamage)}`, '#ff6b6b');
-      burst(g, p.x, p.y, '#ff6b6b', 5, 2.5);
-    }
+    swipePlayer(g, e);
 
     const keep = keepTower(g);
     const huntingPlayer = isHunting(g, e);
@@ -1362,14 +1984,14 @@ function updateEnemies(g, dt) {
       } else aim = normTo(e, econ);
     } else if (keep) {
       motionField = keepField(g, e.type);
-      motionFieldKey = `keep:${e.type}:${g.blockerVersion}`;
+      motionFieldKey = `keep:${e.type}:${g.keepFields[e.type]?.version ?? 'none'}`;
       if (dist(e, keep) <= structureReach(e, keep)) {
         attackStructure(g, e, keep, dt);
         attacking = true;
       } else {
         aim = steer(g.map, motionField, e.x, e.y, keepObstacles(g, e.type)) || safeNormTo(g, e, keep, motionField);
         const blocker = aim?.i !== undefined ? g.blockerGrid[aim.i] : null;
-        if (blocker) {
+        if (blocker && blocker.kind !== 'nest') {
           e.blockerTargetId = blocker.id;
           if (dist(e, blocker.structure) <= structureReach(e, blocker.structure)) {
             attackStructure(g, e, blocker.structure, dt);
@@ -1380,19 +2002,7 @@ function updateEnemies(g, dt) {
     }
 
     // Separation keeps the crowd from collapsing into one dot.
-    let sx = 0;
-    let sy = 0;
-    for (const o of g.enemies) {
-      if (o === e) continue;
-      const dx = e.x - o.x;
-      const dy = e.y - o.y;
-      const d2 = dx * dx + dy * dy;
-      const rad = e.def.radius + o.def.radius + ENEMY.separation;
-      if (d2 > rad * rad || d2 < 1e-6) continue;
-      const d = Math.sqrt(d2);
-      sx += (dx / d) * (1 - d / rad);
-      sy += (dy / d) * (1 - d / rad);
-    }
+    const { sx, sy } = separationPush(g, e);
 
     const terrainCost = moveCostAt(g.map, Math.floor(e.x), Math.floor(e.y));
     const speed = e.def.speed / Math.max(1, Number.isFinite(terrainCost) ? terrainCost : 1);
@@ -1427,6 +2037,115 @@ function updateEnemies(g, dt) {
     if (trackEnemyProgress(g, e, motionField, motionFieldKey,
       !!motionField && !attacking && !inPlayerReach)) continue;
   }
+}
+
+function swipePlayer(g, e) {
+  const p = g.player;
+  if (g.occupiedTowerId !== null || dist(e, p) > ENEMY.playerAttackRange + e.def.radius
+      || e.hitCd > 0 || p.hurtCd > 0 || !structureClearLine(g, e, p)) return;
+  e.hitCd = ENEMY.playerHitCooldown;
+  const armour = hasEquipment(g, 'armourPlate') ? DROP.equipment.armourPlate.playerDamageTaken : 1;
+  const playerDamage = e.def.playerHit * armour;
+  p.hp -= playerDamage;
+  emitAudioEvent(g, 'playerDamage', p);
+  p.hurtCd = PLAYER.invulnAfterHit;
+  floater(g, p.x, p.y - 0.8, `-${Math.round(playerDamage)}`, '#ff6b6b');
+  burst(g, p.x, p.y, '#ff6b6b', 5, 2.5);
+}
+
+function separationPush(g, e) {
+  let sx = 0;
+  let sy = 0;
+  for (const o of g.enemies) {
+    if (o === e) continue;
+    const dx = e.x - o.x;
+    const dy = e.y - o.y;
+    const d2 = dx * dx + dy * dy;
+    const rad = e.def.radius + o.def.radius + ENEMY.separation;
+    if (d2 > rad * rad || d2 < 1e-6) continue;
+    const d = Math.sqrt(d2);
+    sx += (dx / d) * (1 - d / rad);
+    sy += (dy / d) * (1 - d / rad);
+  }
+  return { sx, sy };
+}
+
+/** Terrain-only field to a tile, shared by every feral heading there. */
+function wildField(g, target) {
+  const goal = idx(clampTx(target.x), clampTy(target.y));
+  const cached = g.wildFields.get(goal);
+  if (cached && g.time - cached.at < 2) return cached.field;
+  for (const [key, entry] of g.wildFields) if (g.time - entry.at >= 4) g.wildFields.delete(key);
+  const field = computeField(g.map, [goal], 'direct');
+  g.wildFields.set(goal, { field, at: g.time });
+  return field;
+}
+
+/**
+ * D92: ferals guard their nest's territory. They attack the player inside it,
+ * else the nearest player structure near it, else mill at home; they never
+ * march on the Keep and turn back beyond the leash.
+ */
+function feralFocus(g, e) {
+  const n = g.nests.find((o) => o.id === e.nestId);
+  const home = n && !n.destroyed ? n : e.home;
+  if (dist(e, home) > NEST.territory + NEST.leash) return { kind: 'home', target: home };
+  if (g.occupiedTowerId === null && dist(g.player, home) <= NEST.territory) {
+    return { kind: 'player', target: g.player };
+  }
+  const reach = NEST.territory + NEST.structureReach;
+  let best = null;
+  let bestD = Infinity;
+  const consider = (s) => {
+    if (dist(s, home) > reach) return;
+    const d = dist(e, s);
+    if (d < bestD) { best = s; bestD = d; }
+  };
+  for (const t of g.towers) consider(t);
+  for (const b of g.buildings) if (!b.destroyed) consider(b);
+  for (const seg of wallSegments(g)) if (seg.present !== false && !seg.destroyed && !seg.cancelled) consider(seg);
+  return best ? { kind: 'structure', target: best } : { kind: 'home', target: home };
+}
+
+function updateFeral(g, e, dt) {
+  if (e.fadeAt !== undefined && g.time >= e.fadeAt) {
+    g.enemies = g.enemies.filter((o) => o !== e);
+    burst(g, e.x, e.y, e.def.color, 10, 4);
+    return;
+  }
+  swipePlayer(g, e);
+  if (!(e.focusAt > g.time)) {
+    e.focusAt = g.time + 0.5;
+    e.focus = feralFocus(g, e);
+  }
+  const { kind, target } = e.focus;
+  let aim = null;
+  let attacking = false;
+  e.blockerTargetId = null;
+  if (kind === 'structure' && dist(e, target) <= structureReach(e, target)) {
+    attackStructure(g, e, target, dt);
+    if (!target.wall && !target.type) e.blockerTargetId = target.id;
+    attacking = true;
+  } else if (!(kind === 'home' && dist(e, target) < (target.radius || 1) + 2.2)) {
+    if (structureClearLine(g, e, target)) aim = normTo(e, target);
+    else {
+      aim = steer(g.map, wildField(g, target), e.x, e.y);
+      const blocker = aim?.i !== undefined ? g.blockerGrid[aim.i] : null;
+      if (blocker && blocker.kind !== 'nest' && dist(e, blocker.structure) <= structureReach(e, blocker.structure)) {
+        attackStructure(g, e, blocker.structure, dt);
+        if (blocker.kind === 'tower') e.blockerTargetId = blocker.id;
+        attacking = true;
+      }
+      if (!aim) aim = normTo(e, target);
+    }
+  }
+  const { sx, sy } = separationPush(g, e);
+  const terrainCost = moveCostAt(g.map, Math.floor(e.x), Math.floor(e.y));
+  const speed = e.def.speed / Math.max(1, Number.isFinite(terrainCost) ? terrainCost : 1);
+  const vx = (aim ? aim.x : 0) + sx * 1.6;
+  const vy = (aim ? aim.y : 0) + sy * 1.6;
+  const l = Math.hypot(vx, vy);
+  if (!attacking && l > 0.01) moveWithCollision(g, e, (vx / l) * speed * dt, (vy / l) * speed * dt, e.def.radius);
 }
 
 /** Centre of the adjacent walkable tile closest to the target, for unsticking. */
@@ -1636,9 +2355,11 @@ function damageEnemy(g, e, amount) {
   if (e.hp > 0) { emitAudioEvent(g, 'enemyHit', e); return; }
   g.enemies = g.enemies.filter((o) => o !== e);
   g.stats.kills++;
+  if (e.wild) g.stats.feralKills++;
   emitAudioEvent(g, 'enemyDeath', e);
   burst(g, e.x, e.y, e.def.color, 12, 5);
-  if (Math.random() < DROP.chance) spawnDrop(g, e.x, e.y);
+  // A nest respawns defenders forever, so ferals never drop loot (no farming).
+  if (!e.wild && Math.random() < DROP.chance) spawnDrop(g, e.x, e.y);
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,7 +2405,7 @@ export function spawnDrop(g, x, y, forcedCategory = null, forcedKey = null) {
   if (category === 'supply') {
     const def = DROP.supplyCache;
     const amount = Math.round(def.min + Math.random() * (def.max - def.min));
-    const resource = Math.random() < 0.5 ? 'food' : 'stone';
+    const resource = def.resources[Math.floor(Math.random() * def.resources.length)];
     g.drops.push({ category, key: resource, resource, def, amount, x, y, t: 0 });
     emitAudioEvent(g, 'dropSpawn', { x, y, category, key: resource });
     return;
@@ -1821,7 +2542,8 @@ function updateWaves(g, dt) {
         spawnEnemy(g, s.type, s.side, s.point);
       }
     }
-    if (!g.pendingSpawns.length && !g.enemies.length) {
+    // Ferals guard their nests and never hold a wave open.
+    if (!g.pendingSpawns.length && !g.enemies.some((e) => !e.wild)) {
       g.phase = 'aftermath';
       g.phaseLeft = WAVE.aftermath;
       g.stats.wavesCleared++;
@@ -1887,12 +2609,12 @@ export function keepState(g) {
 }
 
 export function resourceState(g) {
-  const rates = { food: 0, stone: 0, gold: 0 };
+  const rates = { stone: 0, gold: 0 };
   for (const b of g.buildings) {
-    if (b.destroyed || !b.built) continue;
+    if (b.destroyed || !b.built || BUILDINGS[b.type].resource === 'food') continue;
     rates[BUILDINGS[b.type].resource] += b.rate;
   }
-  return { totals: { ...g.res }, rates };
+  return { totals: { ...g.res }, rates, food: garrisonState(g) };
 }
 
 export function buildingState(g) {
@@ -1913,6 +2635,9 @@ export function keepFieldState(g) {
     blockerVersion: g.blockerVersion,
     recomputes: g.stats.keepFieldRecomputes,
     cachedTypes: Object.keys(g.keepFields),
+    cachedVersions: Object.fromEntries(Object.entries(g.keepFields).map(([type, entry]) => [type, entry.version])),
+    dirty: !!g.keepFieldsDirty,
+    nextAt: g.keepFieldNextAt,
     blockers: g.blockerGrid.reduce((n, b) => n + (b ? 1 : 0), 0),
   };
 }
@@ -1942,7 +2667,8 @@ export function repairTarget(g) {
   if (needs(selected) && inRepairReach(g, selected)) return selected;
   let best = null;
   let bestD = Infinity;
-  const candidates = [...g.towers, ...g.buildings.filter((b) => !b.destroyed), ...wallSegments(g)];
+  const candidates = [...g.towers, ...g.buildings.filter((b) => !b.destroyed),
+    ...wallSegments(g).filter((s) => s.present && !s.cancelled)];
   for (const s of candidates) {
     if (!needs(s) || !inRepairReach(g, s)) continue;
     const d = dist(g.player, s) - structureRadius(s);
@@ -2028,8 +2754,11 @@ export function update(g, dt, { ignorePause = false } = {}) {
   updateRepair(g, dt);
   updateTowers(g, dt);
   updateBuildings(g, dt);
+  updateGarrison(g);
   updateWalls(g, dt);
+  updateKeepFieldRecomputes(g);
   recomputeVisibility(g);
+  updateNests(g, dt);
   updateEnemies(g, dt);
   updateDrops(g, dt);
   updateFx(g, dt);

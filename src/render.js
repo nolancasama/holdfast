@@ -1,8 +1,10 @@
 // Canvas drawing. Simple shapes only — readability over polish (plan §1).
 
-import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, WALL } from './config.js';
+import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, WALL, NEST } from './config.js';
 import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
-import { towerStats, repairTarget } from './game.js';
+import {
+  autoWallPlan, towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
+} from './game.js';
 
 const TP = RENDER.baseTilePx;
 const ELEV_SHADE = [0.72, 0.96, 1.22];
@@ -192,8 +194,9 @@ export function draw(ctx, g, layers, view) {
   if (g.debug.showPaths) drawFlowField(ctx, g, view);
 
   drawResourceSites(ctx, g, view);
-  drawTowerRings(ctx, g);
+  drawTowerRings(ctx, g, view);
   drawDrops(ctx, g, view);
+  drawNests(ctx, g, view);
   drawBuildings(ctx, g, view);
   drawWalls(ctx, g, view);
   drawTowers(ctx, g, view);
@@ -201,8 +204,7 @@ export function draw(ctx, g, layers, view) {
   drawEnemies(ctx, g, view);
   drawPlayer(ctx, g, view);
   drawFx(ctx, g, view);
-  if (g.buildMode) drawBuildPreview(ctx, g);
-  if (g.wallMode) drawWallPreview(ctx, g, view);
+  if (g.buildMode) drawBuildPreview(ctx, g, view);
   if (g.debug.showFog) drawFogDebug(ctx, g, view);
 
   ctx.restore();
@@ -237,17 +239,45 @@ function drawIncomingRoads(ctx, g, view) {
   ctx.restore();
 }
 
-function drawTowerRings(ctx, g) {
+function drawRangeDisplay(ctx, g, tower, maxRange, view, outerColor = 'rgba(180,210,255,0.4)') {
+  const cx = tower.x * TP;
+  const cy = tower.y * TP;
+  const minRange = towerMinRange(g, tower);
+  ctx.save();
+  ctx.lineWidth = localPx(view, 1.5);
+  ctx.strokeStyle = outerColor;
+  ctx.beginPath();
+  ctx.arc(cx, cy, maxRange * TP, 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (minRange > 0) {
+    const r = minRange * TP;
+    ctx.fillStyle = 'rgba(255,154,64,0.10)';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.clip();
+    ctx.strokeStyle = 'rgba(255,178,92,0.25)';
+    ctx.lineWidth = localPx(view, 1);
+    const spacing = Math.max(TP * 0.42, localPx(view, 8));
+    for (let offset = -r * 2; offset <= r * 2; offset += spacing) {
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 1.5 + offset, cy + r * 1.5);
+      ctx.lineTo(cx + r * 1.5 + offset, cy - r * 1.5);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,178,92,0.72)';
+    ctx.setLineDash([localPx(view, 5), localPx(view, 4)]);
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawTowerRings(ctx, g, view) {
   const show = g.towers.filter((t) => t.id === g.selected || t.id === g.occupiedTowerId);
   for (const t of show) {
     const s = towerStats(g, t);
-    ctx.save();
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = 'rgba(180,210,255,0.4)';
-    ctx.beginPath();
-    ctx.arc(t.x * TP, t.y * TP, s.range * TP, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
+    drawRangeDisplay(ctx, g, t, s.range, view);
   }
 }
 
@@ -264,6 +294,17 @@ function drawTowers(ctx, g, view) {
     const collapsing = t.built && frac < TOWER.collapsingAt;
     const occupied = t.id === g.occupiedTowerId;
     const alarm = Number.isFinite(t.unseenHitAt) && g.time - t.unseenHitAt < 1.5;
+
+    if (!t.keep && towerConnectivity(g, t) === 'outpost') {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(242,169,59,0.92)';
+      ctx.lineWidth = localPx(view, 2);
+      ctx.setLineDash([localPx(view, 6), localPx(view, 4)]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + localPx(view, 6), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     if (occupied) {
       const pulse = 0.5 + 0.5 * Math.sin(g.time * 6);
@@ -408,6 +449,88 @@ function drawTowers(ctx, g, view) {
     }
     ctx.fillStyle = t.keep ? '#ffe59b' : '#e6ecf5';
     ctx.fillText(t.keep ? 'KEEP' : `W${t.wLevel}`, cx, cy + localPx(view, 3));
+
+    // D91: one pip per garrison slot under the tower; filled pips are soldiers.
+    if (t.built) {
+      const slots = garrisonSlots(t);
+      const pip = localPx(view, 2.6);
+      const gap = localPx(view, 7);
+      const y0 = cy + r + localPx(view, 6);
+      for (let k = 0; k < slots; k++) {
+        const px = cx + (k - (slots - 1) / 2) * gap;
+        ctx.beginPath();
+        ctx.arc(px, y0, pip, 0, Math.PI * 2);
+        ctx.fillStyle = k < (t.garrison || 0) ? '#f0c96a' : 'rgba(20,24,30,0.7)';
+        ctx.fill();
+        ctx.strokeStyle = '#f0c96a';
+        ctx.lineWidth = localPx(view, 1);
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+// D92: a nest is a dark mound; agitated nests pulse, besieged ones show hp.
+function drawNests(ctx, g, view) {
+  for (const n of g.nests || []) {
+    if (!inView(view, n.x, n.y, 12)) continue;
+    if (!g.debug.showFog && !tileExplored(g, Math.floor(n.x), Math.floor(n.y))) continue;
+    const cx = n.x * TP;
+    const cy = n.y * TP;
+    const r = Math.max(n.radius * TP, localPx(view, RENDER.towerMinRadiusPx));
+    ctx.save();
+    if (n.destroyed) {
+      ctx.fillStyle = 'rgba(40,36,28,0.75)';
+      ctx.beginPath(); ctx.arc(cx, cy, r * 0.9, 0, Math.PI * 2); ctx.fill();
+      ctx.font = `bold ${localPx(view, RENDER.labelMinPx)}px ui-monospace, monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(215,243,107,0.55)';
+      ctx.fillText('CLEARED', cx, cy - r - localPx(view, 6));
+      ctx.restore();
+      continue;
+    }
+    const visible = g.debug.showFog || pointVisible(g, n.x, n.y);
+    const agitated = visible && n.state === 'agitated';
+    if (agitated || (g.buildMode && visible)) {
+      // Territory: where building or walking wakes it.
+      ctx.strokeStyle = agitated ? 'rgba(215,243,107,0.35)' : 'rgba(215,243,107,0.18)';
+      ctx.lineWidth = localPx(view, 1.5);
+      ctx.setLineDash([localPx(view, 4), localPx(view, 6)]);
+      ctx.beginPath(); ctx.arc(cx, cy, NEST.territory * TP, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (agitated) {
+      const pulse = 0.5 + 0.5 * Math.sin(g.time * 5);
+      ctx.fillStyle = `rgba(215,243,107,${0.10 + pulse * 0.12})`;
+      ctx.beginPath(); ctx.arc(cx, cy, r * (1.6 + pulse * 0.25), 0, Math.PI * 2); ctx.fill();
+    }
+    // Spiked mound.
+    ctx.fillStyle = n.flash > 0 ? '#e9f5c0' : '#3d4a1f';
+    ctx.strokeStyle = '#1c2210';
+    ctx.lineWidth = localPx(view, 2);
+    ctx.beginPath();
+    const spikes = 9;
+    for (let k = 0; k < spikes * 2; k++) {
+      const a = (k / (spikes * 2)) * Math.PI * 2 + 0.2;
+      const rr = k % 2 === 0 ? r * 1.15 : r * 0.78;
+      const x = cx + Math.cos(a) * rr;
+      const y = cy + Math.sin(a) * rr;
+      if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = agitated ? '#d7f36b' : '#7f8f45';
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.32, 0, Math.PI * 2); ctx.fill();
+
+    ctx.font = `bold ${localPx(view, RENDER.labelMinPx)}px ui-monospace, monospace`;
+    ctx.textAlign = 'center';
+    const label = !visible ? 'NEST' : n.underSiege ? 'UNDER SIEGE' : agitated ? 'AGITATED' : 'NEST';
+    ctx.fillStyle = n.underSiege && visible ? '#ffb347' : agitated ? '#d7f36b' : '#b9c48f';
+    ctx.fillText(label, cx, cy - r - localPx(view, 12));
+    if (visible && (n.underSiege || n.hp < n.maxHp)) {
+      const barW = Math.max(r * 2.4, localPx(view, RENDER.healthBarMinWidthPx));
+      healthBar(ctx, cx - barW / 2, cy - r - localPx(view, 8), barW, localPx(view, 4), n.hp / n.maxHp, '#d7f36b');
+    }
+    ctx.restore();
   }
 }
 
@@ -434,7 +557,8 @@ function drawEnemies(ctx, g, view) {
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    // Ferals (nest defenders) get a dark rim so they never read as the army.
+    ctx.strokeStyle = e.wild ? '#2a3311' : 'rgba(0,0,0,0.6)';
     ctx.lineWidth = localPx(view, 1.5);
     ctx.stroke();
     if (e.hp < e.maxHp) {
@@ -588,10 +712,30 @@ function drawBuildings(ctx, g, view) {
   }
 }
 
-// D81: stone segments; posterns read as a dark gate slot; damage as cracks.
+// D81/D89: present segments are masonry; not-yet-present segments are a faint plan.
 function drawWalls(ctx, g, view) {
   for (const link of g.walls || []) {
+    const pending = link.segments.filter((seg) => seg.present === false && !seg.cancelled
+      && (g.debug.showFog || tileExplored(g, seg.tx, seg.ty)));
+    if (pending.length) {
+      const firstIndex = link.segments.indexOf(pending[0]);
+      const before = firstIndex > 0 ? link.segments[firstIndex - 1]
+        : g.towers.find((tower) => tower.id === link.a);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(231,214,165,0.38)';
+      ctx.lineWidth = localPx(view, 2);
+      ctx.setLineDash([localPx(view, 6), localPx(view, 5)]);
+      ctx.beginPath();
+      if (before) ctx.moveTo(before.x * TP, before.y * TP);
+      else ctx.moveTo(pending[0].x * TP, pending[0].y * TP);
+      for (const seg of pending) ctx.lineTo(seg.x * TP, seg.y * TP);
+      const end = g.towers.find((tower) => tower.id === link.b);
+      if (end) ctx.lineTo(end.x * TP, end.y * TP);
+      ctx.stroke();
+      ctx.restore();
+    }
     for (const seg of link.segments) {
+      if (seg.cancelled || seg.present === false) continue;
       if (!inView(view, seg.x, seg.y, 2)) continue;
       if (!g.debug.showFog && !tileExplored(g, seg.tx, seg.ty)) continue;
       const jolt = seg.shake > 0 ? localPx(view, 2.5) * (seg.shake / BREACH.shake) : 0;
@@ -649,7 +793,7 @@ function drawWalls(ctx, g, view) {
           frac < 0.34 ? '#ff5a5a' : frac < 0.66 ? '#ffd166' : '#7be196');
       }
     }
-    if (!link.built) {
+    if (!link.built && !link.cancelled) {
       const mid = link.segments[Math.floor(link.segments.length / 2)];
       if (mid && inView(view, mid.x, mid.y, 3) && (g.debug.showFog || tileExplored(g, mid.tx, mid.ty))) {
         ctx.font = `bold ${localPx(view, RENDER.labelMinPx)}px ui-monospace, monospace`;
@@ -658,41 +802,6 @@ function drawWalls(ctx, g, view) {
       }
     }
   }
-}
-
-function drawWallPreview(ctx, g, view) {
-  const mode = g.wallMode;
-  if (!mode || mode.fromId === null) return;
-  const from = g.towers.find((t) => t.id === mode.fromId);
-  if (!from) return;
-  ctx.save();
-  ctx.strokeStyle = 'rgba(255,214,102,0.8)';
-  ctx.lineWidth = localPx(view, 2);
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath(); ctx.arc(from.x * TP, from.y * TP, (from.radius + 0.4) * TP, 0, Math.PI * 2); ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,214,102,0.22)';
-  ctx.beginPath(); ctx.arc(from.x * TP, from.y * TP, WALL.maxLength * TP, 0, Math.PI * 2); ctx.stroke();
-  ctx.setLineDash([]);
-  const plan = mode.plan;
-  if (plan) {
-    const ok = plan.ok;
-    plan.segments.forEach((tile, k) => {
-      ctx.fillStyle = ok ? 'rgba(123,225,150,0.38)' : 'rgba(255,90,90,0.38)';
-      ctx.fillRect(tile.x * TP, tile.y * TP, TP, TP);
-      ctx.strokeStyle = ok ? '#7be196' : '#ff5a5a';
-      ctx.lineWidth = localPx(view, k === 0 || k === plan.segments.length - 1 ? 2.5 : 1);
-      ctx.strokeRect(tile.x * TP, tile.y * TP, TP, TP);
-    });
-    const to = g.towers.find((t) => t.id === plan.b);
-    if (to) {
-      ctx.font = `bold ${localPx(view, 11)}px ui-monospace, monospace`;
-      ctx.textAlign = 'center';
-      ctx.fillStyle = ok ? '#c9f7d4' : '#ffb0b0';
-      ctx.fillText(ok ? `${plan.cost.stone} Stone` : plan.reasons[0],
-        (from.x + to.x) / 2 * TP, (from.y + to.y) / 2 * TP - localPx(view, 12));
-    }
-  }
-  ctx.restore();
 }
 
 /** Cyan brackets on what holding R would repair from here (D83: local only). */
@@ -797,19 +906,27 @@ function drawMinimap(ctx, g, layers, view) {
     const gold = (g.map.goldSites || []).includes(site);
     miniPoint(ctx, rect, site.x, site.y, gold ? '#ffd64f' : '#d8e0e5', 2);
   }
+  // D92: discovered nests; a cleared one stays as a faint mark.
+  for (const n of g.nests || []) {
+    if (!tileExplored(g, Math.floor(n.x), Math.floor(n.y))) continue;
+    miniPoint(ctx, rect, n.x, n.y, n.destroyed ? '#55603a' : '#b5e04a', n.destroyed ? 3 : 5);
+    if (!n.destroyed) miniPoint(ctx, rect, n.x, n.y, '#20280c', 2);
+  }
   for (const b of g.buildings || []) {
     if (b.destroyed || b.hp <= 0 || !tileExplored(g, Math.floor(b.x), Math.floor(b.y))) continue;
     miniPoint(ctx, rect, b.x, b.y, BUILDING_STYLE[b.type]?.color || '#ddd', 3);
   }
   for (const link of g.walls || []) {
     for (const seg of link.segments) {
-      if (seg.destroyed || !tileExplored(g, seg.tx, seg.ty)) continue;
-      miniPoint(ctx, rect, seg.x, seg.y, link.built ? '#d9d1c0' : '#9b937f', 2);
+      if (seg.destroyed || seg.cancelled || seg.present === false || !tileExplored(g, seg.tx, seg.ty)) continue;
+      miniPoint(ctx, rect, seg.x, seg.y, '#d9d1c0', 2);
     }
   }
   for (const t of g.towers) {
     if (!tileExplored(g, Math.floor(t.x), Math.floor(t.y))) continue;
-    miniPoint(ctx, rect, t.x, t.y, t.keep ? '#ffd666' : '#a8d2ff', t.keep ? 6 : 4);
+    const connectivity = towerConnectivity(g, t);
+    const color = t.keep ? '#ffd666' : connectivity === 'outpost' ? '#f2a93b' : '#70c9ff';
+    miniPoint(ctx, rect, t.x, t.y, color, t.keep ? 6 : 4);
   }
   miniPoint(ctx, rect, g.player.x, g.player.y, '#ffffff', 4);
   const px = rect.x + g.player.x / MAP.w * rect.w;
@@ -981,7 +1098,45 @@ function drawFx(ctx, g, view) {
   ctx.globalAlpha = 1;
 }
 
-function drawBuildPreview(ctx, g) {
+function previewLinkTiles(link) {
+  if (Array.isArray(link.segments)) return link.segments;
+  if (Array.isArray(link.tiles)) return link.tiles;
+  return [];
+}
+
+function drawAutoWallPreview(ctx, g, view, x, y, check) {
+  const plan = check.autoWalls || check.autoWallPlan || check.wallPlan || autoWallPlan(g, x, y);
+  if (!plan) return;
+  const previews = plan.previewLinks || plan.links || [];
+  for (const link of previews) {
+    const refused = !check.ok || !plan.ok || link.refused;
+    const dropped = !refused && link.dropped;
+    const color = refused ? '#ff5a5a' : dropped ? '#f2a93b' : '#7be196';
+    const fill = refused ? 'rgba(255,90,90,0.27)' : dropped ? 'rgba(242,169,59,0.25)' : 'rgba(123,225,150,0.25)';
+    const anchor = g.towers.find((tower) => tower.id === link.anchorId);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = fill;
+    ctx.lineWidth = localPx(view, 2);
+    if (dropped || refused) ctx.setLineDash([localPx(view, 6), localPx(view, 4)]);
+    if (anchor) {
+      ctx.beginPath();
+      ctx.moveTo(anchor.x * TP, anchor.y * TP);
+      ctx.lineTo(x * TP, y * TP);
+      ctx.stroke();
+    }
+    for (const tile of previewLinkTiles(link)) {
+      const tx = Number.isFinite(tile.tx) ? tile.tx : tile.x;
+      const ty = Number.isFinite(tile.ty) ? tile.ty : tile.y;
+      if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+      ctx.fillRect(tx * TP, ty * TP, TP, TP);
+      ctx.strokeRect(tx * TP, ty * TP, TP, TP);
+    }
+    ctx.restore();
+  }
+}
+
+function drawBuildPreview(ctx, g, view) {
   const { x, y } = g.buildSite || g.cursor;
   const check = g.buildCheck;
   if (!check) return;
@@ -1001,12 +1156,9 @@ function drawBuildPreview(ctx, g) {
   ctx.stroke();
 
   if (type === 'tower') {
-    ctx.setLineDash([5, 5]);
-    ctx.strokeStyle = 'rgba(180,210,255,0.5)';
-    ctx.beginPath();
-    ctx.arc(cx, cy, TOWER.weapon.range * TP, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    drawRangeDisplay(ctx, g, { x, y, keep: false, closeDefense: 0 }, TOWER.weapon.range, view,
+      'rgba(180,210,255,0.5)');
+    drawAutoWallPreview(ctx, g, view, x, y, check);
   }
 
   // Minimum-spacing rings around existing towers, so refusals are legible.

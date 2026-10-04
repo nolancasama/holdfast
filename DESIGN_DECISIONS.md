@@ -1398,3 +1398,175 @@ D76 roles, extraction, Materials, richness, jackpots, the prep bot) stay
 deleted.
 **Why:** the fortress loop is the experiment; full-map road cosmetics matter
 less under a follow camera.
+
+## 2026-10-04 — Fortress rework phase 3: automatic walls, garrison, nests, blind spots
+
+Frozen by the controller from the user's full fortress brief (sections 1-65)
+before implementation. Phases 1-2 already satisfy sections 1-9, 15-17, 32-36,
+47 and 50; this phase covers the remainder. Numbers marked *start* may be tuned
+with the simulations; record final values here. Everything else is contract.
+
+### D89 — Walls are automatic; tower placement is the only wall decision (supersedes D81/D84 workflow)
+**Decision:** the manual wall mode (`X`, click, Enter, Wall button,
+`tryBuildWall` as a player action) is removed. Placing a tower plans up to two
+links to existing anchors (the Keep and every other tower, finished or under
+construction), centre-to-centre at most `WALL.maxLength` (13), using the D81
+tile line, segment, postern, rubble and repair rules unchanged.
+- Candidate valid when: not a duplicate; no line tile under another tower,
+  economic building, nest or existing segment; its centre line does not
+  properly cross any existing link's centre line; anchor degree below
+  `WALL.maxDegree` (*start* 3 for a tower, 6 for the Keep).
+- **First link (required if any candidate exists):** prefer anchors in the
+  Keep-connected component; among them the smallest `distance x (Keep ?
+  WALL.keepPreference : 1)` (*start* 0.85). If no connected anchor is in
+  range, link to the nearest isolated tower. No candidate at all: the tower is
+  an **isolated outpost**, tower cost only.
+- **Second link (optional):** among the remaining candidates, the angle at the
+  new tower between the two links must be at least `WALL.minLinkAngle`
+  (*start* 50 degrees) and the two links must not cross each other or anything.
+  Prefer an anchor in a *different* component (bridges an outpost into the
+  fortress), else one that closes a loop (D87's enclosure) — shortest wins.
+- Cost preview, shown before placement: Tower N Stone / Walls M Stone
+  (segments) / Total, plus `CONNECTED`, `OUTPOST` or `BRIDGES OUTPOST`. If the
+  total is unaffordable but tower + first link is affordable, the optional
+  link is dropped and the preview says so. If tower + first link is
+  unaffordable the build is refused with the shortfall. No hidden costs.
+- **Construction:** links are created at placement. Segments appear from the
+  existing anchor toward the new tower, one after another, across the tower's
+  build time (`max(towerBuildTime, WALL.buildBase + WALL.buildPerTile x n)`,
+  presence multiplier applies). Each segment becomes present and blocking when
+  it appears, at `buildHpFraction` hp rising to full over its share; planned
+  but unbuilt segments draw as a faint dashed line. If the new tower is
+  destroyed before finishing, its unbuilt segments are cancelled; built ones
+  stay.
+- **Connectivity:** cached tower graph over links whose two anchors are alive;
+  states `keep` / `connected` / `outpost`; recomputed only when a link is
+  created or a tower dies. Outposts draw with a distinct (dashed amber) ring
+  and minimap colour.
+**Why:** the brief's core principle — the player decides where the tower goes,
+the game derives the fortress. Max two links and the angle/crossing/degree
+rules keep geometry readable (no spaghetti).
+**Rejected:** keeping manual walls alongside (two systems for one decision);
+linking only to the connected network (makes the outpost-bridging chain of
+section 28 impossible); dropping the required link silently when unaffordable.
+
+### D90 — Field recomputes are coalesced
+**Decision:** blocking-geometry changes set a dirty flag; Keep fields rebuild
+at most every `WALL_PATH.recomputeInterval` (*start* 0.5 s) and one enemy type
+per frame, enemies reading the previous field meanwhile. Movement collision
+and stuck recovery read live geometry immediately.
+**Why:** growing walls change geometry every second; 40-90 ms per change
+would stutter.
+
+### D91 — Food is support, not currency; garrison population
+**Decision:** Food is no longer stockpiled or spent. `g.res = { stone, gold }`.
+Every alive, finished Farm adds `round(GARRISON.supportPerFarm x fertility)`
+(*start* 3) to Food support; Steward adds +2. Garrison slots: Keep 4, tower 1,
+tower with weapon level >= 2 gets 2. Assignment is instant from the selected
+tower's panel (`+`/`-` buttons, keys `G` / `Shift+G`), remote allowed (command,
+not labour); assigned total may not exceed support. Garrisoned tower per
+soldier: fire rate x(1 + 0.20), damage x(1 + 0.15) (*start*); stacks with
+player occupancy. Garrison never changes minimum range (D93). A destroyed
+tower loses its garrison (returned to the pool).
+**Deficit:** when assigned > support, `SUPPLY DEFICIT` with a visible countdown
+of `GARRISON.graceSeconds` (*start* 30); after it, one soldier (from the
+lowest-priority tower: outposts first, Keep last) stands down every
+`GARRISON.standDownInterval` (*start* 8 s) until assigned <= support. Support
+recovering clears the deficit and the countdown. Costs become Stone-only:
+Tower 60 + 25 per non-Keep tower (*start*), Farm 35, Quarry 40, Gold Mine 70
+Stone (*start*); upgrades unchanged (Stone + Gold). Supply Cache drops give
+Stone. Start resources 340 Stone, 0 Gold (*start*): enough for two towers with
+their walls, a Farm and a Quarry.
+**Why:** "Food supports people" only holds if Food cannot be spent on anything
+else.
+**Rejected:** a Food stock with upkeep (hunger, excluded by the brief);
+instant deletion on deficit.
+
+### D92 — Wilderness nests
+**Decision:** one nest type and one defender type (`feral`, *start* hp 42,
+speed 3.6, structDps 7, playerHit 26, radius 0.36, `wild: true`). Generation
+places `NEST.count` (*start* 5-8) nests: each rich gold site and roughly half
+the rich/middle stone sites beyond `NEST.minFromKeep` (*start* 30) get one
+3-6 tiles away on passable non-road ground; separation 16. Nest: hp 1400,
+radius 1.1, footprint impassable to everything (an extra blocker; removal
+invalidates fields).
+- **Dormant** → **Agitated** when the player is within `NEST.territory`
+  (*start* 9) or any player structure (incl. under construction) has its
+  centre within it. Agitated spawns a feral every `NEST.spawnInterval` (*start*
+  4.5 s) up to `NEST.maxAlive` (*start* 6). Ferals attack the nearest player
+  structure within territory + 3, else the player if within it; they leash to
+  territory + 6 and walk back. No threat for 25 s → Dormant again (living
+  ferals return and stay).
+- **Under Siege** when any finished tower can fire on it (D93 annulus, LOS,
+  nest tile visible): HP bar and `UNDER SIEGE` label. Towers prefer enemies
+  and ferals; they fire on a nest only with no other valid target.
+- **Destroyed:** spawning stops, ferals die off over 3 s, burst/shockwave and
+  `nestDestroyed` cue, log "Territory cleared", +40 Stone +15 Gold (*start*),
+  a rubble mark; never respawns. Ferals are not wave enemies and never march
+  on the Keep. The player can melee ferals and the nest normally, but nest hp
+  is sized so manual chopping is slow.
+- Nests appear in render/minimap only once explored; state shows only when
+  visible.
+**Why:** valuable territory should cost a fortification push to take.
+**Rejected:** nests attacking the Keep; spreading; several nest types.
+
+### D93 — Tower minimum range (blind spot)
+**Decision:** a tower (and the Keep) fires only at targets with
+`minRange <= centre distance <= maxRange`; *start* minRange 2.8 tower, 3.2
+Keep, via `towerMinRange(g, t)` which reads `t.closeDefense` (always 0 now) so
+a later Murder Holes upgrade can shrink it. Weapon upgrades and garrison never
+change it. No exception for an enemy attacking the tower itself. Applies to
+nests. Range display (placement preview, selection, occupancy) draws the
+outer circle and a hatched inner blind circle.
+**Why:** a tower that cannot defend its own base makes paired and triangular
+layouts — which automatic walls produce — matter.
+
+### D94 — Pressure retune after phase 3
+**Decision:** retune with `npm run wave-report` after D89-D93, preferring
+budget, cluster size and Heavy share over hp, never speed. Record evidence.
+
+## 2026-10-04 — Phase 3 as built (D89-D94)
+
+Codex implemented slice A (D89, D90, D93) and stopped on a usage limit during
+validation; Claude reviewed it, corrected D90 and implemented slice B (D91,
+D92) and the D94 evaluation directly.
+
+### D95 — As-built values and corrections
+**Decision:**
+- D90 correction: an idle Keep field rebuilds on the next frame (the first
+  version waited 0.5 s, then 0.5 s between each enemy type, so a Heavy's
+  breach took ~1.5 s to reroute the Swarm). Types rebuild on consecutive
+  frames; only changes during a busy spell wait out `recomputeInterval`.
+- D91 final: Tower 60 + 25 Stone per non-Keep tower; Farm 35 + 8 per Farm;
+  Quarry 40; **Gold Mine 120** (at 70 the whole opening plus a mine fitted in
+  the start Stone); start 340 Stone, 0 Gold. A Farm feeds
+  `round(3 x rate / baseRate)` (a 3x3 of plain fertile soil feeds 3, an edge
+  placement 1-2, rich soil 4-5). Deficit grace 30 s, then one stand-down per
+  8 s. `BUILDINGS.farm.minSpacing` (3) was referenced but never defined; it
+  is now enforced.
+- D92 final: 5-8 nests; the guaranteed middle-band gold (the first placed) is
+  never guarded, so a first Gold Mine never needs a siege, while rich far
+  gold is. Nests are placed after every other generation step so existing
+  seeds keep their terrain, roads and resources. Ferals drop no loot (a nest
+  respawns them forever) and are excluded from the wave count.
+- D93 consequence accepted: the Keep cannot shoot at its own base, so a Keep
+  with no supporting tower is nearly defenceless once enemies arrive; test
+  and report bots step out to finish stragglers there, as a player must.
+**Evidence:**
+- `npm run nest-probe` (4 seeds, nest hp 1400, sites 4.5-7 tiles out with
+  line of sight): a lone tower is chewed down from its blind spot in 30-42 s
+  with the nest at 1048-1202 hp on every seed; two towers ~7 apart destroy
+  it in 67-72 s at or near full health on all 3 seeds that offer a second
+  sighted site (BRAVO's nest has none within 7 tiles). Placement without
+  line of sight never damages the nest: siting matters.
+- `npm run economy-sim`: two connected towers (4 segments each, 84 and 109
+  Stone with walls), a Farm and a Quarry at 0 s on all 8 seeds; first Gold
+  Mine on unguarded gold at 111-117 s.
+- `npm run wave-report` (bot garrisons what one farm feeds): lone Keep with
+  two isolated outposts falls on waves 1-2; fortress falls on 8-10 (0/6 won,
+  D86: 9-10, 1/6); fortress+ won 2/5, others reach 9-10 (D86: 1/6 won).
+**D94 outcome:** pressure is not raised. Garrison and the blind spot roughly
+cancel for a passive bot, so the fortress is not yet stronger than at D86;
+raise budget/clusters only if hand-play finds the game easy.
+**Rejected:** guarding every gold site (one seed had no reachable Gold);
+ferals dropping loot.

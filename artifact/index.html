@@ -154,7 +154,8 @@
     <canvas id="game"></canvas>
 
     <div id="topbar">
-      <div class="chip">Food <b id="hud-food">0</b> <span class="muted" id="hud-food-rate">+0.00/s</span></div>
+      <div class="chip" title="Food supports soldiers: garrisoned / supported">Garrison <b id="hud-food">0/0</b> <span class="muted" id="hud-food-rate">fed by farms</span></div>
+      <div class="chip" id="hud-deficit" hidden>SUPPLY DEFICIT</div>
       <div class="chip">Stone <b id="hud-stone">0</b> <span class="muted" id="hud-stone-rate">+0.00/s</span></div>
       <div class="chip">Gold <b id="hud-gold">0</b> <span class="muted" id="hud-gold-rate">+0.00/s</span></div>
       <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
@@ -184,7 +185,7 @@
         <button class="start" id="start-btn">Start run</button>
         <p class="keys" style="margin-top:14px">
           <b>WASD</b> move · <b>B</b> build menu · <b>Enter</b>/<b>click</b> build here / select structure ·
-          <b>R</b> hold to repair · <b>1</b> weapon upgrade · <b>- / =</b> zoom · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
+          <b>R</b> hold to repair · <b>1</b> weapon upgrade · <b>G</b> garrison · <b>- / =</b> zoom · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
         </p>
       </div>
     </div>
@@ -205,7 +206,7 @@
       <div class="row"><span>Character</span><span id="p-arch">—</span></div>
       <div class="row"><span>Player HP</span><span id="p-hp">—</span></div>
       <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
-      <div class="row"><span>Production</span><span id="p-income">F 0.00 / S 0.00 / G 0.00</span></div>
+      <div class="row"><span>Production</span><span id="p-income">S 0.00 · G 0.00 /s</span></div>
       <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
       <div class="row"><span>Buildings</span><span id="p-buildings">0</span></div>
       <div class="row"><span>Combat danger</span><span id="p-danger">safe during prep</span></div>
@@ -224,6 +225,12 @@
         <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
         <div class="row"><span>Range</span><span id="sel-range">—</span></div>
         <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
+        <div class="row" id="sel-garrison-row"><span>Garrison</span><span>
+          <button id="garrison-minus" style="width:auto; padding:0 8px" title="Withdraw a soldier [Shift+G]">−</button>
+          <b id="sel-garrison">0 / 1</b>
+          <button id="garrison-plus" style="width:auto; padding:0 8px" title="Assign a soldier [G]">+</button>
+        </span></div>
+        <div class="keys" id="sel-garrison-note"></div>
         <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:4px" hidden>
           <div class="row"><span id="sel-upgrade-label"></span><span id="sel-upgrade-time"></span></div>
           <div class="bar"><i id="sel-upgrade-bar" style="background:var(--blue)"></i></div>
@@ -243,19 +250,17 @@
         <button id="build-farm">Farm<span class="cost" id="build-farm-cost"></span></button>
         <button id="build-quarry">Quarry<span class="cost" id="build-quarry-cost"></span></button>
         <button id="build-mine">Gold Mine<span class="cost" id="build-mine-cost"></span></button>
-        <button id="build-wall">[X] Wall<span class="cost" id="build-wall-cost"></span></button>
       </div>
       <button id="build-confirm" disabled>Build here [Enter]</button>
-      <div id="build-info" class="keys" style="margin-top:6px">Press B, walk to a site, Enter to build here.</div>
+      <div id="build-info" class="keys" style="margin-top:6px">Press B, walk to a site, Enter to build here. Towers create their own wall links.</div>
     </div>
 
     <div class="sec">
       <h2>Controls</h2>
       <div class="keys">
         <b>WASD</b> move · <b>B</b> build · <b>Enter</b>/<b>click</b> build here/select<br />
-        <b>X</b> wall from selected tower, then click another tower · gates at each tower end<br />
-        <b>R</b> hold repair · <b>1</b> weapon upgrade · <b>- / =</b> or wheel zoom · <b>Space</b> melee<br />
-        <b>P</b> pause · <b>Esc</b> cancel build/wall · <b>F1</b> debug panel
+        <b>R</b> hold repair · <b>1</b> weapon upgrade · <b>G</b> / <b>Shift+G</b> garrison +/− · <b>- / =</b> or wheel zoom · <b>Space</b> melee<br />
+        <b>P</b> pause · <b>Esc</b> cancel build · <b>F1</b> debug panel
       </div>
     </div>
 
@@ -278,7 +283,7 @@
         <button id="d-pause" style="width:auto">Pause spawning</button>
         <button id="d-regen" style="width:auto">Regenerate map</button>
         <div class="keys" style="margin-top:8px">
-          <b>M</b> resources · <b>N</b> next wave · <b>G</b> spawn · <b>K</b> damage ·
+          <b>M</b> resources · <b>N</b> next wave · <b>Y</b> spawn · <b>K</b> damage ·
           <b>J</b> destroy · <b>H</b> paths · <b>V</b> fog · <b>L</b> pause spawns · <b>O</b> regen
         </div>
         <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>

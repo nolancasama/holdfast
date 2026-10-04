@@ -1,15 +1,17 @@
-// D83 wave-pressure report. Real wave rolls, spawning, pathing, combat, walls
-// and repair; a scripted player sits in the Keep holding Repair. Two defences:
-//   open     - the Keep plus two towers beside it, no walls
-//   fortress - the Keep enclosed by a three-tower triangle joined by walls,
-//              towers upgraded to W1 on wave 4 and W2 on wave 7
-//   fortress+ - the same, plus three outer towers covering the walls
-// Both get a farm and a quarry at the nearest valid sites, then live on the
+// D89-D94 wave-pressure report. Real wave rolls, spawning, pathing, combat,
+// walls and repair; a scripted player sits in the Keep holding Repair. Three
+// defences exercise the automatic-wall placement rules:
+//   outposts  - the Keep plus two isolated towers beyond automatic-link range
+//   fortress  - three inner towers whose placements form an auto-linked fan,
+//               upgraded to W1 on wave 4 and W2 on wave 7
+//   fortress+ - the same, plus three auto-linked towers extending around the Keep
+// All get a farm and a quarry at the nearest valid sites, then live on the
 // real economy (no cheats after setup). Run: npm run wave-report [seeds...]
 
-import { MAP, WAVE } from '../src/config.js';
+import { MAP, WALL, WAVE, KEEP, PLAYER } from '../src/config.js';
 import {
-  createGame, update, canPlaceAt, tryBuild, tryUpgrade, wallPlan, tryBuildWall, wallSegments,
+  autoWallPlan, createGame, update, canPlaceAt, tryBuild, tryUpgrade, wallSegments,
+  assignGarrison, garrisonState,
 } from '../src/game.js';
 
 const SEEDS = process.argv.slice(2).length ? process.argv.slice(2)
@@ -33,8 +35,6 @@ function place(g, x, y, type) {
   return r.ok ? r.structure : null;
 }
 
-function finish(s) { s.built = true; s.progress = 1; s.hp = s.maxHp; }
-
 function nearestSite(g, type, maxDistance = 40) {
   const keep = g.towers[0];
   let best = null;
@@ -47,72 +47,101 @@ function nearestSite(g, type, maxDistance = 40) {
   return best;
 }
 
-/** Three towers ~7.4 tiles out at 120 degrees, every pair wallable. */
-function enclosingTriangle(g) {
-  const keep = g.towers[0];
-  for (let r of [7.2, 7.4, 7.0, 7.5]) {
-    for (let a0 = 0; a0 < 120; a0 += 5) {
-      const pts = [0, 120, 240].map((d) => {
-        const a = ((a0 + d) * Math.PI) / 180;
-        return { x: Math.floor(keep.x + Math.cos(a) * r) + 0.5, y: Math.floor(keep.y + Math.sin(a) * r) + 0.5 };
-      });
-      const saved = { towers: g.towers.slice(), next: g.nextTowerId, res: { ...g.res }, grid: g.blockerGrid.slice(), v: g.blockerVersion };
-      const built = [];
-      for (const p of pts) { const t = place(g, p.x, p.y, 'tower'); if (!t) break; finish(t); built.push(t); }
-      const ok = built.length === 3 && [[0, 1], [1, 2], [2, 0]].every(([i, j]) => wallPlan(g, built[i].id, built[j].id).ok);
-      if (ok) return built;
-      g.towers = saved.towers; g.nextTowerId = saved.next; g.res = saved.res; g.blockerGrid = saved.grid;
-      g.blockerVersion = saved.v + 1; g.keepFields = Object.create(null);
-    }
+function towerSiteNear(g, x, y, minimumLinks, maximumLinks = Infinity) {
+  const candidates = [];
+  for (let oy = -3; oy <= 3; oy++) for (let ox = -3; ox <= 3; ox++) {
+    const wx = Math.floor(x + ox) + 0.5;
+    const wy = Math.floor(y + oy) + 0.5;
+    const d = Math.hypot(wx - x, wy - y);
+    candidates.push({ x: wx, y: wy, d });
   }
-  return null;
+  candidates.sort((a, b) => a.d - b.d || a.y - b.y || a.x - b.x);
+  return candidates.find((p) => {
+    if (!canPlaceAt(g, p.x, p.y, 'tower').ok) return false;
+    const links = autoWallPlan(g, p.x, p.y).links.length;
+    return links >= minimumLinks && links <= maximumLinks;
+  }) || null;
+}
+
+/** Three adjacent towers form two Keep-centred triangles under D89 placement. */
+function innerNetwork(g) {
+  const keep = g.towers[0];
+  const radius = 7.4;
+  const towers = [];
+  for (const degrees of [-60, 0, 60]) {
+    const a = (degrees * Math.PI) / 180;
+    const site = towerSiteNear(g, keep.x + Math.cos(a) * radius, keep.y + Math.sin(a) * radius,
+      towers.length ? 2 : 1);
+    if (!site) return null;
+    const t = place(g, site.x, site.y, 'tower');
+    if (!t) return null;
+    towers.push(t);
+  }
+  return towers;
+}
+
+function isolatedOutpost(g, angle) {
+  const keep = g.towers[0];
+  const radius = WALL.maxLength + 2;
+  const x = keep.x + Math.cos(angle) * radius;
+  const y = keep.y + Math.sin(angle) * radius;
+  return towerSiteNear(g, x, y, 0, 0);
+}
+
+/** Let the real construction code finish towers, buildings and sequential walls. */
+function finishSetup(g) {
+  g.phase = 'prep';
+  g.phaseLeft = 1e9;
+  for (let guard = 0; guard < 2400; guard++) {
+    const pending = g.towers.some((t) => !t.built)
+      || g.buildings.some((b) => !b.destroyed && !b.built)
+      || g.walls.some((w) => !w.built);
+    if (!pending) break;
+    update(g, STEP);
+  }
+  if (g.towers.some((t) => !t.built) || g.buildings.some((b) => !b.destroyed && !b.built)
+      || g.walls.some((w) => !w.built)) return false;
+  g.time = 0;
+  g.phase = 'prep';
+  g.phaseLeft = WAVE.prepFirst;
+  return true;
 }
 
 function setup(seed, profile) {
   const g = createGame(seed, 'gunner');
-  g.res = { food: 1e5, stone: 1e5, gold: 1e5 };
+  g.res = { stone: 1e5, gold: 1e5 };
   const keep = g.towers[0];
   let towers = [];
   if (profile.startsWith('fortress')) {
-    towers = enclosingTriangle(g);
+    towers = innerNetwork(g);
     if (!towers) return null;
-    for (const [i, j] of [[0, 1], [1, 2], [2, 0]]) {
-      g.player.x = towers[i].x; g.player.y = towers[i].y;
-      const r = tryBuildWall(g, towers[i].id, towers[j].id);
-      if (!r.ok) return null;
-      r.link.built = true; r.link.progress = 1;
-      for (const s of r.link.segments) s.hp = s.maxHp;
-    }
     if (profile === 'fortress+') {
-      // Outer towers opposite each wall's midpoint, ~5 tiles beyond it.
-      for (const [i, j] of [[0, 1], [1, 2], [2, 0]]) {
-        const mx = (towers[i].x + towers[j].x) / 2; const my = (towers[i].y + towers[j].y) / 2;
-        const ox = mx - keep.x; const oy = my - keep.y; const l = Math.hypot(ox, oy) || 1;
-        let t = null;
-        for (let k = 0; k < 30 && !t; k++) {
-          const r = 9 + (k % 6) * 0.5; const a = Math.atan2(oy, ox) + (Math.floor(k / 6) - 2) * 0.12;
-          t = place(g, Math.floor(keep.x + Math.cos(a) * r) + 0.5, Math.floor(keep.y + Math.sin(a) * r) + 0.5, 'tower');
-        }
-        if (t) { finish(t); towers.push(t); }
-        void l;
+      // Continue the automatic chain around the far side of the Keep.
+      for (const degrees of [120, 180, 240]) {
+        const a = (degrees * Math.PI) / 180;
+        const site = towerSiteNear(g, keep.x + Math.cos(a) * 8.5, keep.y + Math.sin(a) * 8.5, 2);
+        if (!site) return null;
+        const t = place(g, site.x, site.y, 'tower');
+        if (!t) return null;
+        towers.push(t);
       }
     }
   } else {
-    for (const want of [{ dx: 9, dy: 0 }, { dx: -9, dy: 0 }]) {
-      let t = null;
-      for (let k = 0; k < 40 && !t; k++) {
-        const a = (k / 40) * Math.PI * 2;
-        t = place(g, Math.floor(keep.x + want.dx + Math.cos(a) * (k / 10)) + 0.5,
-          Math.floor(keep.y + want.dy + Math.sin(a) * (k / 10)) + 0.5, 'tower');
-      }
-      if (t) { finish(t); towers.push(t); }
+    for (const angle of [0, Math.PI]) {
+      const site = isolatedOutpost(g, angle);
+      if (!site || autoWallPlan(g, site.x, site.y).links.length) return null;
+      const t = place(g, site.x, site.y, 'tower');
+      if (t) towers.push(t);
     }
   }
   for (const type of ['farm', 'quarry']) {
     const site = nearestSite(g, type);
-    if (site) finish(place(g, site.x, site.y, type));
+    if (site) place(g, site.x, site.y, type);
   }
-  g.res = { food: 60, stone: 120, gold: 0 };
+  if (!finishSetup(g)) return null;
+  g.res = { stone: 120, gold: 0 };
+  // D91: man what the farm feeds, outer towers first, the Keep with the rest.
+  for (const t of [...towers, keep]) while (garrisonState(g).free > 0 && assignGarrison(g, t, 1).ok);
   g.player.x = keep.x; g.player.y = keep.y;
   return { g, keep, towers };
 }
@@ -138,7 +167,17 @@ function runProfile(seed, profile) {
           const side = Math.hypot(worst.x + 1.3 - keep.x, worst.y - keep.y) < Math.hypot(worst.x - 1.3 - keep.x, worst.y - keep.y) ? 1.3 : -1.3;
           g.player.x = worst.x + side; g.player.y = worst.y;
         } else { g.player.x = keep.x; g.player.y = keep.y; }
-      } else if (Math.hypot(g.player.x - keep.x, g.player.y - keep.y) > 0.5) { g.player.x = keep.x; g.player.y = keep.y; }
+      } else {
+        // D93: the Keep cannot shoot at its own base, so the bot steps out to
+        // fight whatever reaches it, as a player must; otherwise it shelters.
+        // A careful player only steps out to finish stragglers, never into a crowd.
+        const near = g.enemies.filter((e) => !e.wild && Math.hypot(e.x - keep.x, e.y - keep.y) < 9);
+        const base = near.find((e) => Math.hypot(e.x - keep.x, e.y - keep.y) < KEEP.minRange + 1);
+        if (base && near.length <= 2 && g.player.hp > g.player.maxHp * 0.7) {
+          const dx = base.x - g.player.x; const dy = base.y - g.player.y;
+          g.input = { mx: dx, my: dy, melee: Math.hypot(dx, dy) < PLAYER.melee.range, repair: false };
+        } else if (Math.hypot(g.player.x - keep.x, g.player.y - keep.y) > 0.5) { g.player.x = keep.x; g.player.y = keep.y; }
+      }
       if (g.wave !== lastWave && g.phase === 'prep') {
         lastWave = g.wave;
         if (profile.startsWith('fortress') && (g.wave === 4 || g.wave === 7)) {
@@ -181,14 +220,14 @@ function runProfile(seed, profile) {
 }
 
 const results = [];
-for (const seed of SEEDS) for (const profile of ['open', 'fortress', 'fortress+']) {
+for (const seed of SEEDS) for (const profile of ['outposts', 'fortress', 'fortress+']) {
   const started = Date.now();
   const r = runProfile(seed, profile);
   r.ms = Date.now() - started;
   results.push(r);
 }
 
-for (const profile of ['open', 'fortress', 'fortress+']) {
+for (const profile of ['outposts', 'fortress', 'fortress+']) {
   console.log(`\n## ${profile}`);
   console.log('| seed | outcome | per wave: S/R/H spawned, wall segs lost, Keep hp lost (Keep hp at end) |');
   console.log('|---|---|---|');

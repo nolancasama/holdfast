@@ -6,10 +6,12 @@ question, not to look good: is building and defending territory fun?
 > Start with a Keep. Claim useful land. Build a fortress. Protect what makes
 > the fortress worth having. Hold until the walls fail.
 
-Explore a 208x104 procedural map for Food, Stone and Gold, raise farms,
-quarries and mines, anchor towers around the Keep and join them with walls.
-Ten waves march on the Keep; walls redirect them into tower fire until a
-Heavy smashes a breach.
+Explore a 208x104 procedural map, raise farms, quarries and mines, and place
+towers whose automatic links shape the walls. Stone builds, Gold upgrades
+weapons, and Food feeds the soldiers you garrison in towers. Towers cannot
+shoot at their own base, so they must cover each other. Wilderness nests guard
+the best Gold and Stone and must be besieged with towers. Ten waves march on
+the Keep; walls redirect them into tower fire until a Heavy smashes a breach.
 
 ## Run it
 
@@ -36,16 +38,16 @@ npm test                  # headless terrain, pathing, LOS and simulation checks
 | `WASD` / arrows | move |
 | `B` | build menu (Tower, Farm, Quarry, Gold Mine); `Enter`/click builds where you stand |
 | **click** | select a tower or building |
-| `X` | wall from the selected tower; click another tower to build it |
 | `R` (hold) | repair what is in reach (or rebuild wall rubble) — costs Stone |
 | `1` | weapon upgrade (at the tower; Stone + Gold) |
+| `G` / `Shift+G` | assign / withdraw a soldier on the selected tower (needs Food support) |
 | wheel / `-` `=` | zoom |
 | `Space` | weak melee swing |
 | `P` | pause |
-| `Esc` | cancel build / wall mode |
+| `Esc` | cancel build mode |
 | `F1` | debug panel |
 
-Debug keys: `M` resources · `N` next wave · `G` spawn a group at the cursor ·
+Debug keys: `M` resources · `N` next wave · `Y` spawn a group at the cursor ·
 `K` damage selected tower · `J` destroy it · `H` path overlay · `V` fog debug ·
 `L` pause spawning · `O` regenerate the map.
 

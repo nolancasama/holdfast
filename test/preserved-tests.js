@@ -23,7 +23,7 @@ import {
   emitAudioEvent, drainAudioEvents, isHunting, PLAYER_TARGET_ID, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState, upgradeState,
   upgradeRateMult, towerAlarmState, recomputeVisibility, stuckState, endState, towerCost,
-  playerSpeed, enemyKeepField,
+  playerSpeed, enemyKeepField, flushKeepFieldRecomputes, towerMinRange,
 } from '../src/game.js';
 import { AUDIO_PRIORITY, shouldRateLimit, selectVoices } from '../src/audio.js';
 
@@ -702,7 +702,8 @@ check('D54: roads touch the map boundary only at entry roads', () => {
 
 check('terrain buildability and tower placement terrain rules agree', () => {
   for (const map of maps.slice(0, 3)) {
-    const g = { map, towers: [], buildings: [], res: { food: Infinity, stone: Infinity, gold: Infinity }, arch: {} };
+    const g = { map, towers: [], buildings: [], walls: [], nests: [],
+      res: { stone: Infinity, gold: Infinity }, arch: {} };
     for (let y = 0; y < MAP.h; y++) {
       for (let x = 0; x < MAP.w; x++) {
         const expected = isTerrainBuildable(map, x + 0.5, y + 0.5);
@@ -794,7 +795,7 @@ function hasLineOfSightAtElev(map, x0, y0, x1, y1, shooterElev) {
 
 check('placement refuses cliffs, deep water and crowding', () => {
   const g = createGame('PLACEMENT', 'engineer');
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   const m = g.map;
 
   let cliff = null;
@@ -816,7 +817,7 @@ check('placement refuses cliffs, deep water and crowding', () => {
 
 check('tower footprints refuse road tiles', () => {
   const g = createGame('ROAD-PLACEMENT', 'engineer');
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   const start = g.towers[0];
   for (let y = Math.floor(start.y - TOWER.radius); y <= Math.ceil(start.y + TOWER.radius); y++) {
     for (let x = Math.floor(start.x - TOWER.radius); x <= Math.ceil(start.x + TOWER.radius); x++) {
@@ -873,7 +874,7 @@ check('one remaining or COLLAPSING tower keeps the run playing', () => {
 
 check('an unfinished tower does not keep the run alive once the Keep falls', () => {
   const g = createGame('DEFEAT-BUILDING', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const keep = g.towers[0];
   let building = null;
   for (let y = 3; y < MAP.h - 3 && !building; y++) {
@@ -939,7 +940,7 @@ check('Keep collapse gives death priority only when it kills the player', () => 
 
 check('defeat freezes waves, spawns, extraction, construction and upgrades', () => {
   const g = createGame('DEFEAT-FREEZE', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade precondition failed';
   g.phase = 'combat'; g.phaseLeft = 17; g.combatT = 0;
@@ -962,7 +963,7 @@ check('defeat freezes waves, spawns, extraction, construction and upgrades', () 
 
 function aggroFixture(seed) {
   const g = createGame(seed, 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   const a = g.towers[0];
   const sites = [];
   for (let y = 3; y < MAP.h - 3; y++) {
@@ -1043,7 +1044,7 @@ function forestTowerFixture() {
   g.map = map;
   g.towers = [];
   g.nextTowerId = 1;
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   g.phase = 'prep';
   g.phaseLeft = 999;
   const x = Math.floor(MAP.w / 2) + 0.5;
@@ -1061,13 +1062,16 @@ function forestTowerFixture() {
   return { g, map, tower };
 }
 
-check('D69 forest clearing gives every sampled siege position LOS and fire', () => {
+check('D69/D93 forest clearing gives sampled positions outside the blind zone LOS and fire', () => {
   const fixture = forestTowerFixture();
   if (!fixture) return 'could not place a tower on the all-forest fixture';
   const { g, map, tower } = fixture;
   for (const type of Object.keys(ENEMIES)) {
     const reach = TOWER.radius + ENEMY.attackRange + ENEMIES[type].radius;
-    for (const distance of [reach, reach - 0.35]) {
+    const blind = towerMinRange(g, tower);
+    // D93 supersedes fire at the tower's base. Keep the original siege-reach
+    // LOS coverage intent, but sample firing just outside the blind circle.
+    for (const distance of [Math.max(reach, blind + 0.15), Math.max(reach + 0.35, blind + 0.5)]) {
       for (let sample = 0; sample < 32; sample++) {
         const angle = sample * Math.PI * 2 / 32;
         const x = tower.x + Math.cos(angle) * distance;
@@ -1171,17 +1175,19 @@ check('D69 placement invalidates movement and visibility caches', () => {
   oldTower.y = 26.5;
   g.player.x = x;
   g.player.y = y;
-  enemyKeepField(g, 'swarm');
+  const oldKeepField = enemyKeepField(g, 'swarm');
   g.playerField = computeField(map, [idx(52, 26)], 'direct');
   g.playerFieldAt = 10;
   recomputeVisibility(g, true);
   if (isTileVisible(g, 57, 26)) return 'visibility precondition was not forest-blocked';
   const beforeField = computeField(map, [idx(52, 26)], 'direct')[idx(54, 26)];
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   const built = tryBuild(g, x, y);
   if (!built.ok) return `placement failed: ${built.reasons.join(', ')}`;
   const afterField = computeField(map, [idx(52, 26)], 'direct')[idx(54, 26)];
-  if (Object.keys(g.keepFields).length) return 'a Keep flow field stayed cached';
+  if (enemyKeepField(g, 'swarm') !== oldKeepField) return 'a dirty Keep field did not remain usable during the D90 delay';
+  flushKeepFieldRecomputes(g);
+  if (enemyKeepField(g, 'swarm') === oldKeepField) return 'the deferred Keep field did not rebuild after the clearing';
   if (g.playerField !== null || g.playerFieldAt !== -99) return 'a player flow field stayed cached';
   if (!(afterField < beforeField)) return `movement field did not reflect Forest -> Plain (${beforeField} -> ${afterField})`;
   if (!isTileVisible(g, 57, 26)) return 'visibility cache did not rebuild through the clearing';
@@ -1214,7 +1220,7 @@ check('D69 reproduces and fixes a real-seed forest siege LOS failure', () => {
 
 function embeddedRecoveryFixture(type = 'swarm') {
   const g = createGame(`STUCK-EMBEDDED-${type}`, 'gunner');
-  g.phaseLeft = 999; g.res = { food: 0, stone: 0, gold: 0 };
+  g.phaseLeft = 999; g.res = { stone: 0, gold: 0 };
   const t = g.towers[0];
   t.hp = t.maxHp = 1e9; t.shotCd = 1e9; t.resourceScore = 0;
   if (!occupy(g, t)) return null;
@@ -1512,7 +1518,7 @@ check('resource sites are discovered once and remain explored', () => {
 
 check('construction is local and playerBuildSite can be built while standing there', () => {
   const g = createGame('LOCAL-BUILD', 'engineer');
-  g.res = { food: 99999, stone: 99999, gold: 99999 };
+  g.res = { stone: 99999, gold: 99999 };
   let site = null;
   for (let y = 3; y < MAP.h - 3 && !site; y++) for (let x = 3; x < MAP.w - 3; x++) {
     if (Math.hypot(x + 0.5 - g.towers[0].x, y + 0.5 - g.towers[0].y) < 12) continue;
@@ -1530,7 +1536,7 @@ check('construction is local and playerBuildSite can be built while standing the
 
 check('unfinished construction continues unassisted after the player leaves', () => {
   const g = createGame('BUILD-AWAY', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   let site = null;
   for (let y = 3; y < MAP.h - 3 && !site; y++) for (let x = 3; x < MAP.w - 3; x++) {
     g.player.x = x + 0.5; g.player.y = y + 0.5;
@@ -1549,7 +1555,7 @@ check('unfinished construction continues unassisted after the player leaves', ()
 
 check('timed upgrade keeps old stats until completion and refuses a second job', () => {
   const g = createGame('UPGRADE-TIMED', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   g.player.x = t.x + 1; g.player.y = t.y;
   const old = towerStats(g, t);
@@ -1577,14 +1583,14 @@ check('timed upgrade keeps old stats until completion and refuses a second job',
 
 check('old weapon output persists during a timed upgrade', () => {
   const g = createGame('UPGRADE-FUNCTION', 'gunner');
-  g.map = syntheticMap(); g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.map = syntheticMap(); g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   t.x = 30.5; t.y = 20.5;
   g.player.x = t.x + 1; g.player.y = t.y;
   const old = towerStats(g, t);
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
   g.player.x = 5.5; g.player.y = 5.5;
-  const e = testEnemy(g, { x: t.x + 3, y: t.y }, null);
+  const e = testEnemy(g, { x: t.x + towerMinRange(g, t) + 0.2, y: t.y }, null);
   update(g, 0.5);
   const midWeapon = towerStats(g, t);
   if (t.targetId !== e.id) return 'tower did not acquire a target during upgrade';
@@ -1594,7 +1600,7 @@ check('old weapon output persists during a timed upgrade', () => {
 
 check('weapon upgrade completion applies exactly once', () => {
   const g = createGame('UPGRADE-ONCE-weapon', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   g.player.x = t.x + 1; g.player.y = t.y;
   const old = towerStats(g, t);
@@ -1611,7 +1617,7 @@ check('weapon upgrade completion applies exactly once', () => {
 check('upgrade durations use x1 except for an occupying Engineer', () => {
   const measure = (arch, occupied) => {
     const g = createGame(`UPGRADE-DUR-${arch}-${occupied}`, arch);
-    g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 9999;
+    g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 9999;
     const t = g.towers[0];
     if (occupied) {
       if (!occupy(g, t)) return { error: 'could not occupy tower' };
@@ -1651,7 +1657,7 @@ check('upgrade durations use x1 except for an occupying Engineer', () => {
 
 check('an Engineer leaving mid-upgrade continues at x1 with blended timing', () => {
   const g = createGame('UPGRADE-LEAVE', 'engineer');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   if (!occupy(g, t) || upgradeRateMult(g, t) !== 3.6) return 'Engineer did not occupy at x3.6';
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
@@ -1671,7 +1677,7 @@ check('an Engineer leaving mid-upgrade continues at x1 with blended timing', () 
 
 check('destroying a tower loses its upgrade job without a refund', () => {
   const g = createGame('UPGRADE-DESTROY', 'gunner');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
   const paid = g.res.stone;
@@ -1683,7 +1689,7 @@ check('destroying a tower loses its upgrade job without a refund', () => {
 
 check('pausing freezes an upgrade already in progress', () => {
   const g = createGame('UPGRADE-PAUSE', 'engineer');
-  g.res = { food: 99999, stone: 99999, gold: 99999 }; g.phaseLeft = 999;
+  g.res = { stone: 99999, gold: 99999 }; g.phaseLeft = 999;
   const t = g.towers[0];
   if (!tryUpgrade(g, t, 'weapon')) return 'upgrade refused';
   update(g, 1);
@@ -1753,7 +1759,7 @@ check('run-long equipment is one-of-each and capped at four', () => {
 
 check('pause freezes simulation and refuses player actions', () => {
   const g = createGame('PAUSE-FREEZE', 'engineer');
-  g.res = { food: 9999, stone: 9999, gold: 9999 };
+  g.res = { stone: 9999, gold: 9999 };
   const start = g.towers[0];
   start.hp -= 100;
   g.effects.damage = 9;
@@ -2052,18 +2058,27 @@ check('dense waves 3-8 report stuck counters without last-resort despawns', () =
 
 check('a full run simulates for several waves without crashing', () => {
   const g = createGame('LONGRUN', 'prospector');
-  g.res = { food: 4000, stone: 4000, gold: 4000 };
+  g.res = { stone: 4000, gold: 4000 };
   const dt = 1 / 30;
   let built = 0;
 
   for (let step = 0; step < 30 * 60 * 6; step++) { // 6 simulated minutes
     // A crude bot: sit in the start tower, and build a couple of extra towers.
+    // D93: the Keep cannot shoot at its own base, so the bot steps out and
+    // fights anything inside the blind spot, as a player must.
     const t = g.towers[0];
-    if (t) { g.player.x = t.x; g.player.y = t.y; }
-    g.input = { mx: 0, my: 0, melee: false, repair: true };
+    const base = t && g.enemies.find((e) => Math.hypot(e.x - t.x, e.y - t.y) < KEEP.minRange + 1);
+    if (base) {
+      const dx = base.x - g.player.x;
+      const dy = base.y - g.player.y;
+      g.input = { mx: dx, my: dy, melee: Math.hypot(dx, dy) < PLAYER.melee.range, repair: false };
+    } else {
+      if (t) { g.player.x = t.x; g.player.y = t.y; }
+      g.input = { mx: 0, my: 0, melee: false, repair: true };
+    }
     update(g, dt);
 
-    if (built < 3 && step % 900 === 400 && g.res.stone > TOWER.cost) {
+    if (built < 3 && step % 900 === 400 && g.res.stone > towerCost(g).stone) {
       for (let d = TOWER.minSpacing + 1; d < 25; d += 2) {
         if (buildAt(g, g.map.start.x + d, g.map.start.y).ok) { built++; break; }
       }
@@ -2123,7 +2138,7 @@ check('audio events keep their cue name when a whole entity is passed as data', 
 check('every cue the simulation actually emits has a sound defined', () => {
   // Drive a real, violent stretch of play and collect every emitted type.
   const g = createGame('AUDIOCOVER', 'gunner');
-  g.res = { food: 9000, stone: 9000, gold: 9000 };
+  g.res = { stone: 9000, gold: 9000 };
   const seen = new Set();
   const t = g.towers[0];
   spawnGroupAt(g, t.x + 3, t.y, 'swarm', 12);

@@ -10,6 +10,7 @@
     "artifact": "node generate-artifact.js",
     "road-report": "node tools/road-report.js",
     "economy-sim": "node tools/economy-sim.js",
-    "wave-report": "node tools/wave-report.js"
+    "wave-report": "node tools/wave-report.js",
+    "nest-probe": "node tools/nest-probe.js"
   }
 }

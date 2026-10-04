@@ -2,7 +2,7 @@
 
 import {
   MAP, T, PLAYER, TOWER, KEEP, START_RESOURCES, WALL_PATH,
-  ENEMIES, WAVE, PASSABLE,
+  ENEMIES, WAVE, PASSABLE, GARRISON, NEST,
 } from '../src/config.js';
 import {
   generateMap, validateResourceGeography, idx,
@@ -14,7 +14,8 @@ import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats,
   spawnGroupAt, isTileExplored, resourceState,
   resourceSitesState, keepState, buildingState, keepFieldState,
-  enemyKeepField, endState, playerSpeed,
+  enemyKeepField, flushKeepFieldRecomputes, endState, playerSpeed,
+  foodSupport, garrisonState, assignGarrison, addNest, nestState, towerCanHitNest, towerMinRange,
 } from '../src/game.js';
 
 let passed = 0;
@@ -88,7 +89,6 @@ function gameOn(map = flatMap(), archetype = 'gunner') {
 }
 
 function rich(g) {
-  g.res.food = 10000;
   g.res.stone = 10000;
   g.res.gold = 10000;
 }
@@ -168,7 +168,7 @@ check('D80 g.res replaces Materials and tower extraction', () => {
   assert(!('income' in stats) && !('extractRadius' in stats), 'tower extraction stats remain');
 });
 
-check('D80 Farm requires fertility and produces Food only after construction', () => {
+check('D80/D91 Farm requires fertility and feeds soldiers only after construction', () => {
   const map = flatMap();
   const g = gameOn(map); rich(g);
   const x = map.start.x + 4.5; const y = map.start.y + 4.5;
@@ -177,9 +177,10 @@ check('D80 Farm requires fertility and produces Food only after construction', (
   const farm = buildAt(g, x, y, 'farm');
   const before = { ...g.res };
   update(g, 0.5);
-  approx(g.res.food, before.food, 1e-9, 'unfinished farm produced');
+  assert(foodSupport(g) === 0, 'unfinished farm fed soldiers');
   run(g, 12);
-  assert(farm.built && g.res.food > before.food, 'built farm did not produce Food');
+  assert(farm.built && foodSupport(g) === GARRISON.supportPerFarm, `built farm feeds ${foodSupport(g)}`);
+  assert(!('food' in g.res), 'Food became a stockpile again');
   approx(g.res.stone, before.stone, 1e-6, 'farm produced Stone');
   approx(g.res.gold, before.gold, 1e-6, 'farm produced Gold');
 });
@@ -223,10 +224,159 @@ check('D80 Steward discounts and accelerates economic buildings', () => {
   const normal = gameOn(structuredClone(map), 'gunner'); const steward = gameOn(structuredClone(map), 'prospector');
   rich(normal); rich(steward);
   const s = map.stoneSites[0];
-  assert(canPlaceAt(steward, s.x, s.y, 'quarry').cost.food < canPlaceAt(normal, s.x, s.y, 'quarry').cost.food, 'no Steward discount');
+  assert(canPlaceAt(steward, s.x, s.y, 'quarry').cost.stone < canPlaceAt(normal, s.x, s.y, 'quarry').cost.stone, 'no Steward discount');
+  assert(foodSupport(steward) === foodSupport(normal) + 2, 'Steward does not feed two extra soldiers');
   const a = buildAt(normal, s.x, s.y, 'quarry'); const b = buildAt(steward, s.x, s.y, 'quarry');
   update(normal, 1); update(steward, 1);
   assert(b.progress > a.progress, 'no Steward build-speed bonus');
+});
+
+// --- D91 garrison ----------------------------------------------------------
+
+function fedGame(farms = 1) {
+  const map = flatMap();
+  const g = gameOn(map); rich(g);
+  for (let k = 0; k < farms; k++) {
+    const x = map.start.x - 6.5 - k * 4; const y = map.start.y + 5.5;
+    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) map.fertility[idx(Math.floor(x) + ox, Math.floor(y) + oy)] = 1;
+    const farm = buildAt(g, x, y, 'farm');
+    farm.built = true; farm.progress = 1; farm.hp = farm.maxHp;
+  }
+  return g;
+}
+
+check('D91 Food support caps garrison; Keep has 4 slots, a tower 1 (2 at W2)', () => {
+  const bare = gameOn(); rich(bare);
+  assert(!assignGarrison(bare, bare.towers[0], 1).ok, 'garrisoned with no Food support');
+  const g = fedGame(2);
+  const keep = g.towers[0];
+  assert(foodSupport(g) === 2 * GARRISON.supportPerFarm, `support ${foodSupport(g)}`);
+  for (let k = 0; k < GARRISON.slots.keep; k++) assert(assignGarrison(g, keep, 1).ok, `Keep slot ${k} refused`);
+  assert(!assignGarrison(g, keep, 1).ok, 'Keep took a fifth soldier');
+  const t = buildAt(g, keep.x + 8, keep.y);
+  assert(!assignGarrison(g, t, 1).ok, 'unfinished tower garrisoned');
+  t.built = true; t.progress = 1;
+  assert(assignGarrison(g, t, 1).ok && !assignGarrison(g, t, 1).ok, 'basic tower is not one slot');
+  t.wLevel = GARRISON.upgradedFromLevel;
+  assert(assignGarrison(g, t, 1).ok, 'W2 tower has no second slot');
+  assert(garrisonState(g).assigned === 2 * GARRISON.supportPerFarm, 'assigned count wrong');
+  t.wLevel = 3; g.towers.push({ ...t, id: 777, garrison: 0 });
+  assert(!assignGarrison(g, 777, 1).ok, 'assigned beyond Food support');
+});
+
+check('D91 garrison raises damage and fire rate but never min range', () => {
+  const g = fedGame(1);
+  const keep = g.towers[0];
+  const before = towerStats(g, keep);
+  const minBefore = towerMinRange(g, keep);
+  assignGarrison(g, keep, 1); assignGarrison(g, keep, 1);
+  const after = towerStats(g, keep);
+  approx(after.damage / before.damage, 1 + 2 * GARRISON.damagePerSoldier, 1e-9, 'damage bonus');
+  approx(after.fireRate / before.fireRate, 1 + 2 * GARRISON.fireRatePerSoldier, 1e-9, 'fire-rate bonus');
+  approx(towerMinRange(g, keep), minBefore, 1e-12, 'garrison changed min range');
+});
+
+check('D91 supply deficit has a grace period, then soldiers stand down one at a time', () => {
+  const g = fedGame(1);
+  const keep = g.towers[0];
+  for (let k = 0; k < GARRISON.supportPerFarm; k++) assignGarrison(g, keep, 1);
+  const farm = g.buildings[0];
+  farm.hp = 0; update(g, 0.05);
+  assert(farm.destroyed && garrisonState(g).deficit, 'no deficit after losing the farm');
+  run(g, GARRISON.graceSeconds - 1);
+  assert(keep.garrison === GARRISON.supportPerFarm, 'soldiers vanished during the grace period');
+  run(g, 1.5);
+  assert(keep.garrison === GARRISON.supportPerFarm - 1, `first stand-down missing (${keep.garrison})`);
+  run(g, GARRISON.standDownInterval * 0.5);
+  assert(keep.garrison === GARRISON.supportPerFarm - 1, 'stood down faster than the interval');
+  // Recovering Food ends the deficit and nobody else leaves.
+  g.arch = { ...g.arch, foodSupportBonus: 10 };
+  run(g, GARRISON.standDownInterval * 2);
+  assert(!garrisonState(g).deficit && keep.garrison === GARRISON.supportPerFarm - 1, 'deficit did not clear on recovery');
+});
+
+// --- D92 nests ---------------------------------------------------------------
+
+function nestGame() {
+  const map = flatMap();
+  const g = gameOn(map); rich(g);
+  const n = addNest(g, map.start.x + 40.5, map.start.y + 0.5);
+  flushKeepFieldRecomputes(g);
+  return { g, n };
+}
+
+check('D92 a nest sleeps until the player enters its territory, then spawns defenders', () => {
+  const { g, n } = nestGame();
+  run(g, 5);
+  assert(n.state === 'dormant' && !g.enemies.some((e) => e.wild), 'dormant nest spawned');
+  g.player.x = n.x - NEST.territory + 1; g.player.y = n.y;
+  run(g, NEST.spawnInterval + 1.5);
+  assert(n.state === 'agitated', 'nest did not agitate');
+  assert(g.enemies.some((e) => e.wild && e.nestId === n.id), 'agitated nest spawned no ferals');
+});
+
+check('D92 a tower can hit a nest only inside its annulus', () => {
+  const { g, n } = nestGame();
+  g.fog.visible.fill(1);
+  const at = (d) => ({ id: 999, x: n.x - d, y: n.y, built: true, keep: false, wLevel: 0, radius: TOWER.radius });
+  assert(!towerCanHitNest(g, at(TOWER.weapon.minRange - 0.2), n), 'fired inside the blind spot');
+  assert(towerCanHitNest(g, at(TOWER.weapon.minRange + 1), n), 'could not fire inside the annulus');
+  assert(!towerCanHitNest(g, at(TOWER.weapon.range + n.radius + 0.5), n), 'fired beyond max range');
+  g.fog.visible.fill(0);
+  assert(!towerCanHitNest(g, at(TOWER.weapon.minRange + 1), n), 'fired at an unseen nest');
+});
+
+check('D92 ferals never hold a wave open and never march on the Keep', () => {
+  const { g, n } = nestGame();
+  g.player.hp = g.player.maxHp = 1e9; // the ferals must not end the run
+  g.player.x = n.x - 4; g.player.y = n.y;
+  run(g, NEST.spawnInterval * 2);
+  const feral = g.enemies.find((e) => e.wild);
+  assert(feral, 'no feral to test');
+  g.player.x = g.towers[0].x; g.player.y = g.towers[0].y + 2;
+  g.phase = 'combat'; g.pendingSpawns = []; g.combatT = 0;
+  update(g, 0.05);
+  assert(g.phase === 'aftermath', 'ferals held the wave open');
+  run(g, 8);
+  assert(g.enemies.filter((e) => e.wild).every((e) => Math.hypot(e.x - n.x, e.y - n.y) <= NEST.territory + NEST.leash + 1),
+    'a feral left its territory');
+});
+
+check('D92 a destroyed nest stops spawning, frees its ground and pays a modest reward', () => {
+  const { g, n } = nestGame();
+  g.player.hp = g.player.maxHp = 1e9;
+  g.player.x = n.x - 4; g.player.y = n.y;
+  run(g, 2);
+  const stone = g.res.stone; const gold = g.res.gold;
+  const version = keepFieldState(g).blockerVersion;
+  n.hp = 1; g.fog.visible.fill(1);
+  g.player.x = n.x - n.radius - 0.8; g.player.facing = { x: 1, y: 0 }; g.player.meleeCd = 0;
+  g.input = { mx: 0, my: 0, melee: true, repair: false };
+  update(g, 0.05);
+  g.input = { mx: 0, my: 0, melee: false, repair: false };
+  assert(n.destroyed, 'nest survived a killing blow');
+  approx(g.res.stone - stone, NEST.reward.stone, 1, 'Stone reward'); approx(g.res.gold - gold, NEST.reward.gold, 1, 'Gold reward');
+  assert(keepFieldState(g).blockerVersion > version, 'nest removal did not invalidate fields');
+  run(g, NEST.feralFadeSeconds + 1);
+  run(g, NEST.spawnInterval * 3);
+  assert(!g.enemies.some((e) => e.nestId === n.id), 'destroyed nest still has or spawns ferals');
+  assert(nestState(g)[0].state === 'destroyed', 'nest state not destroyed');
+});
+
+check('D92 generated nests guard valuable sites, far from the Keep and unexplored at start', () => {
+  for (const map of maps) {
+    const g = createGame('NESTCHK', 'gunner', map);
+    const nests = g.nests;
+    assert(nests.length >= 3 && nests.length <= NEST.countMax, `${nests.length} nests`);
+    for (const n of nests) {
+      const d = Math.hypot(n.x - map.start.x - 0.5, n.y - map.start.y - 0.5);
+      assert(d >= NEST.minFromKeep, `nest ${d.toFixed(1)} tiles from the Keep`);
+      const site = [...map.stoneSites, ...map.goldSites].find((s) => s.id === n.guards);
+      assert(site && Math.hypot(site.x - n.x, site.y - n.y) <= NEST.siteOffsetMax + 1.5, 'nest is not by its site');
+      assert(!map.road[idx(Math.floor(n.x), Math.floor(n.y))], 'nest on a road');
+      assert(!isTileExplored(g, Math.floor(n.x), Math.floor(n.y)), 'nest revealed at start');
+    }
+  }
 });
 
 check('D83 repair is refused remotely and works within 2.5 tiles of edge', () => {
@@ -278,12 +428,12 @@ check('D78 unfinished economic buildings are non-producing, attackable and destr
   const x = map.start.x + 12.5; const y = map.start.y + 4.5;
   for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) map.fertility[idx(Math.floor(x) + ox, Math.floor(y) + oy)] = 1;
   const farm = buildAt(g, x, y, 'farm');
-  const food = g.res.food;
+  const support = foodSupport(g);
   spawnGroupAt(g, x + 2, y, 'heavy', 1);
   const e = g.enemies[0]; e.x = x + 2; e.y = y; g.player.x = g.towers[0].x; g.player.y = g.towers[0].y;
   const hp = farm.hp;
   update(g, 0.5);
-  approx(g.res.food, food, 1e-6, 'unfinished farm produced');
+  assert(foodSupport(g) === support, 'unfinished farm fed soldiers');
   assert(farm.hp < hp, 'unfinished farm was not attacked');
   farm.hp = 0; update(g, 0.01);
   assert(farm.destroyed, 'unfinished farm was not destructible');
@@ -325,14 +475,17 @@ check('D82 fields stay cached when geometry is unchanged', () => {
   assert(keepFieldState(g).recomputes === count, 'field recomputed per frame');
 });
 
-check('D82 tower geometry invalidates each per-type field exactly once on demand', () => {
+check('D90 tower geometry defers and coalesces each cached field rebuild', () => {
   const g = gameOn(); rich(g); const keep = g.towers[0];
-  enemyKeepField(g, 'runner'); const before = keepFieldState(g).recomputes;
+  const old = enemyKeepField(g, 'runner'); const before = keepFieldState(g).recomputes;
   buildAt(g, keep.x + 9, keep.y, 'tower');
-  enemyKeepField(g, 'runner');
-  assert(keepFieldState(g).recomputes === before + 1, 'geometry did not invalidate field once');
-  enemyKeepField(g, 'runner');
-  assert(keepFieldState(g).recomputes === before + 1, 'cached field recomputed twice');
+  assert(enemyKeepField(g, 'runner') === old, 'dirty geometry discarded the previous field immediately');
+  assert(keepFieldState(g).recomputes === before, 'geometry rebuilt the field synchronously');
+  flushKeepFieldRecomputes(g);
+  const rebuilt = enemyKeepField(g, 'runner');
+  assert(rebuilt !== old && keepFieldState(g).recomputes === before + 1, 'flush did not rebuild the cached type once');
+  assert(enemyKeepField(g, 'runner') === rebuilt && keepFieldState(g).recomputes === before + 1,
+    'clean cached field recomputed twice');
 });
 
 check('D82 break-cost mutation guard: Heavy pays less than Swarm', () => {
@@ -395,8 +548,8 @@ check('flow-field obstacle layer remains optional and finite', () => {
 
 check('read-only building/resource states are detached summaries', () => {
   const g = gameOn();
-  const resources = resourceState(g); resources.totals.food = -1;
-  assert(g.res.food === START_RESOURCES.food, 'resource state mutated game');
+  const resources = resourceState(g); resources.totals.stone = -1;
+  assert(g.res.stone === START_RESOURCES.stone, 'resource state mutated game');
   assert(Array.isArray(buildingState(g)), 'building state missing');
 });
 

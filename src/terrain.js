@@ -1,7 +1,7 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, RESOURCE_GEN, VALID, ROAD, TOWER, KEEP, EXPOSURE_GEN, READABILITY,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, RESOURCE_GEN, NEST, VALID, ROAD, TOWER, KEEP, EXPOSURE_GEN, READABILITY,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
 import { findCostPath } from './flowfield.js';
@@ -416,6 +416,62 @@ function placeResourceSites(map, rng) {
     addPointSite(map.goldSites, 'gold', q.x, q.y, rich ? 'rich' : 'normal', rich ? G.rich : G.normal);
   }
   map.sites = [...map.farmland, ...map.stoneSites, ...map.goldSites];
+}
+
+/**
+ * D92: a nest sits in open ground near a valuable site: every rich gold site,
+ * most normal gold and about half the worthwhile stone. Its 3x3 footprint and
+ * the ring around it must be open, so a nest never plugs a pass or a road.
+ */
+function nestGroundOK(map, x, y) {
+  for (let oy = -2; oy <= 2; oy++) {
+    for (let ox = -2; ox <= 2; ox++) {
+      const tx = x + ox;
+      const ty = y + oy;
+      if (!inBounds(tx, ty)) return false;
+      const kind = map.kind[idx(tx, ty)];
+      if (!PASSABLE[kind] || kind === T.SHALLOW) return false;
+      if (Math.abs(ox) <= 1 && Math.abs(oy) <= 1 && map.road[idx(tx, ty)]) return false;
+    }
+  }
+  return true;
+}
+
+function placeNests(map, rng) {
+  map.nests = [];
+  const valuable = [];
+  // The guaranteed middle-band gold (the first placed) stays unguarded, so a
+  // first Gold Mine never requires a siege; the rich far gold is contested.
+  for (const s of map.goldSites.slice(1)) {
+    if (s.tier === 'rich' || rng() < NEST.normalGoldChance) valuable.push(s);
+  }
+  for (const s of map.stoneSites) {
+    const d = resourceDistance(map, s.x, s.y);
+    if ((s.tier === 'rich' || d > RESOURCE_GEN.nearRadius * 2) && rng() < NEST.stoneChance) valuable.push(s);
+  }
+  // Gold first: the brief's picture is "Gold Deposit + Hostile Nest".
+  const target = randInt(rng, NEST.countMin, NEST.countMax);
+  const allSites = [...map.stoneSites, ...map.goldSites];
+  for (const site of valuable) {
+    if (map.nests.length >= target) break;
+    if (resourceDistance(map, site.x, site.y) < NEST.minFromKeep) continue;
+    let placed = null;
+    for (let tries = 0; tries < 40 && !placed; tries++) {
+      const a = rng() * Math.PI * 2;
+      const r = NEST.siteOffsetMin + rng() * (NEST.siteOffsetMax - NEST.siteOffsetMin);
+      const x = Math.floor(site.x + Math.cos(a) * r);
+      const y = Math.floor(site.y + Math.sin(a) * r);
+      if (x < 3 || y < 3 || x > MAP.w - 4 || y > MAP.h - 4) continue;
+      if (resourceDistance(map, x + 0.5, y + 0.5) < NEST.minFromKeep) continue;
+      if (!nestGroundOK(map, x, y)) continue;
+      if (map.nests.some((n) => Math.hypot(n.x - x - 0.5, n.y - y - 0.5) < NEST.minSeparation)) continue;
+      if (allSites.some((s) => Math.hypot(s.x - x - 0.5, s.y - y - 0.5) < 2.5)) continue;
+      placed = { x, y };
+    }
+    if (placed) {
+      map.nests.push({ id: `nest-${map.nests.length}`, x: placed.x + 0.5, y: placed.y + 0.5, guards: site.id });
+    }
+  }
 }
 
 /** The generation-side D80 contract, also useful to tests/debug surfaces. */
@@ -1025,6 +1081,7 @@ function finishMap(map, rng) {
   map.exposureFeatures = [];
   if (validateMap(map).ok) authorExposureFeatures(map, rng);
   placeResourceSites(map, rng);
+  placeNests(map, rng);
   return map;
 }
 
