@@ -55,19 +55,10 @@ class MinHeap {
  * @param {number[]} seeds tile indices to flood out from (usually one tower tile)
  * @returns {Float32Array} cost-to-reach, Infinity where unreachable
  */
-function costFor(map, i, mode, fromI = i) {
+// D96: road laying has its own direction-aware router (roads.js); fields here
+// are movement only.
+function costFor(map, i, mode) {
   const terrain = map.kind[i];
-  if (mode === 'carve') {
-    if (map.road[i]) return ROAD.existingCost + (map.roadAvoid && map.roadAvoid[i] ? ROAD.parallelRoadAvoidCost : 0);
-    let cost = ROAD.carveCost[terrain];
-    if (!Number.isFinite(cost)) return cost;
-    if (map.roadAvoid && map.roadAvoid[i]) cost += ROAD.parallelRoadAvoidCost;
-    if (map.waterDist && map.waterDist[i] > 0 && map.waterDist[i] <= ROAD.riverCheapRadius) {
-      cost *= ROAD.riverbankCostMult;
-    }
-    cost += Math.abs(map.elev[i] - map.elev[fromI]) * ROAD.elevationCrossingCost;
-    return cost;
-  }
   const base = MOVE_COST[terrain];
   return mode === 'lane' && map.road[i] ? base * ROAD.laneDiscount : base;
 }
@@ -123,42 +114,6 @@ export function computeField(map, seeds, mode = 'direct', obstacleCosts = null) 
     }
   }
   return dist;
-}
-
-/**
- * Recover one minimum-cost tile path using the same Dijkstra implementation as
- * the runtime fields. Terrain generation uses the private `carve` cost mode;
- * gameplay uses only the public lane/direct distinction.
- */
-export function findCostPath(map, start, target) {
-  const field = computeField(map, [target], 'carve');
-  if (!Number.isFinite(field[start])) return [];
-  const path = [start];
-  let current = start;
-  const seen = new Uint8Array(MAP.w * MAP.h);
-  seen[current] = 1;
-
-  for (let guard = 0; guard < MAP.w * MAP.h && current !== target; guard++) {
-    const x = current % MAP.w;
-    const y = (current / MAP.w) | 0;
-    let best = -1;
-    let bestDist = field[current];
-    for (const [ox, oy] of NEIGHBOURS) {
-      const nx = x + ox;
-      const ny = y + oy;
-      if (!inBounds(nx, ny)) continue;
-      const ni = idx(nx, ny);
-      if (!PASSABLE[map.kind[ni]]) continue;
-      if (ox !== 0 && oy !== 0
-          && (!PASSABLE[map.kind[idx(x + ox, y)]] || !PASSABLE[map.kind[idx(x, y + oy)]])) continue;
-      if (field[ni] < bestDist - 1e-6) { bestDist = field[ni]; best = ni; }
-    }
-    if (best < 0 || seen[best]) return [];
-    current = best;
-    seen[current] = 1;
-    path.push(current);
-  }
-  return current === target ? path : [];
 }
 
 /**

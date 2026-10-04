@@ -1570,3 +1570,49 @@ cancel for a passive bot, so the fortress is not yet stronger than at D86;
 raise budget/clusters only if hand-play finds the game easy.
 **Rejected:** guarding every gold site (one seed had no reachable Gold);
 ferals dropping loot.
+
+## 2026-10-04 — Simple roads
+
+### D96 — Roads are simple transport and invasion routes (supersedes D20-D22 shaping, D33 waypoints, D44 parallel gate, D49-D55 exposure/knot repair, D79/D88 road gaps)
+**Decision:** roads stop trying to be tower-exposure devices; fortress
+geometry, blind spots and resources carry the strategy. Removed outright:
+seeded waypoints and Y offsets, duplicate-mouth alternates and the D44
+"parallel approaches" validation gate, lateral connectors, riverbank
+attraction, authored exposure features (spined hairpins) and their
+measurement code, and the knot-merging repair pass.
+New generator (`src/roads.js`):
+- Direction-aware Dijkstra: terrain carve cost + elevation crossing +
+  turn cost (45 deg 1.5, 90 deg 25, sharper forbidden) + a proximity price
+  inside 6 tiles of other roads + a boundary-band price. Existing road is
+  impassable except at the goal, so a road meets the network only at its
+  end: the network is a tree.
+- Pulled tight by line-of-sight simplification: a straight segment replaces
+  raw tiles when it is legal, costs at most 5% more and climbs no more often.
+- Hard per-road rules (a failing road is skipped, never forced): no repeated
+  tile, no near self-pass (12+ tiles apart along the road, within 3 on the
+  map), 4+ tiles from unrelated roads away from its junction, at most 5 turns
+  over 30 deg (3 for a branch), none over 95 deg, no hairpin (bends summing
+  to 120 deg within 16 tiles), and at least 7 tiles per straight segment.
+- Network: one main road per side from its cheapest mouth to the hub north
+  of the Keep (the two meet as one through-road), then up to one branch per
+  side from a mouth 24+ rows away, joining as a T at least 14 tiles from
+  other junctions and the edges. 2-4 roads per map.
+- Enemies spawn only at road mouths (1-2 per side), so "Incoming: WEST"
+  names a visible road. Enemy Keep fields keep their road discount
+  (`laneDiscount`), the player keeps the 1.25x road speed.
+- Map validation now requires a main road per side, zero self-intersections,
+  zero loops (measured as contact away from a join) and zero knots.
+- Debug: `U` / Road debug draws centre lines, nodes, junctions, rejected
+  mouths with reasons and per-road turns; the map-info panel lists metrics.
+**Evidence:** `npm run road-report` (40 seeds): 0 maps with a hard defect,
+0 readability defects, 2-4 roads per map, generation median 783 ms (was
+~2.1 s), max 2.7 s. 24 probe seeds and the 20 canonical seeds likewise;
+visual sheets of 12 seeds show long simple routes and clean forks.
+`npm run wave-report`: fortress falls on waves 9-10, fortress+ won 1/5 and
+otherwise reaches 9-10 - pressure unchanged from D95; waves are ~90 s
+instead of ~110 s because routes are more direct.
+**Rejected:** tuning the old generator (the brief: change the philosophy, not
+the numbers); north/south invasion roads (waves still come from west/east
+only; adding sides is a wave-design change); roads to resource sites
+(exploration should still leave the road); smoothing curves (straight
+segments read well at tile scale and keep validation exact).

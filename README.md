@@ -48,11 +48,12 @@ npm test                  # headless terrain, pathing, LOS and simulation checks
 | `F1` | debug panel |
 
 Debug keys: `M` resources · `N` next wave · `Y` spawn a group at the cursor ·
-`K` damage selected tower · `J` destroy it · `H` path overlay · `V` fog debug ·
+`K` damage selected tower · `J` destroy it · `H` path overlay · `U` road debug · `V` fog debug ·
 `L` pause spawning · `O` regenerate the map.
 
 Extra reports: `npm run economy-sim` (opening economy), `npm run wave-report`
-(ten-wave pressure against scripted fortresses), `npm run road-report`.
+(ten-wave pressure against scripted fortresses), `npm run road-report` (road
+quality on 40 seeds), `npm run nest-probe` (one vs two towers against a nest).
 
 ## Run objective
 

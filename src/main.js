@@ -156,6 +156,7 @@ window.addEventListener('keydown', (e) => {
     case 'KeyK': debugDamage(); break;
     case 'KeyJ': debugKill(); break;
     case 'KeyH': game.debug.showPaths = !game.debug.showPaths; break;
+    case 'KeyU': game.debug.showRoads = !game.debug.showRoads; break;
     case 'KeyL': game.debug.spawnPaused = !game.debug.spawnPaused; break;
     case 'KeyO': startRun(randomSeed(), game.archetypeKey); break;
     default: break;
@@ -323,6 +324,7 @@ $('d-spawn').onclick = () => { if (!game.paused) debugSpawn(); };
 $('d-dmg').onclick = () => { if (!game.paused) debugDamage(); };
 $('d-kill').onclick = () => { if (!game.paused) debugKill(); };
 $('d-paths').onclick = () => { game.debug.showPaths = !game.debug.showPaths; };
+$('d-roads').onclick = () => { game.debug.showRoads = !game.debug.showRoads; };
 $('d-fog').onclick = () => { game.debug.showFog = !game.debug.showFog; };
 $('d-pause').onclick = () => {
   game.debug.spawnPaused = !game.debug.spawnPaused;

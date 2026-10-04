@@ -13,10 +13,8 @@ import {
   isTerrainBuildable, clearTowerForest,
 } from '../src/terrain.js';
 import { computeField, steer } from '../src/flowfield.js';
-import {
-  straightRoadBaseline, pathExposure, measureSiteExposure, findExposureFeatures,
-  analyseRoadKnots, analyseRoadReadability, exposureEfficiency, walkedExtraLength,
-} from '../src/roadexposure.js';
+import { analyseRoadKnots, analyseRoadReadability } from '../src/roadexposure.js';
+import { buildSimpleRoads, analyseRoadNetwork, polylineTurns, isHairpin } from '../src/roads.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats, spawnGroupAt,
   setPaused, collectDrop, grantEquipment,
@@ -111,16 +109,6 @@ function makeHairpin({ spine = false, pocketKind = null, forestRing = false } = 
   }
   if (spine) for (let x = 0; x <= 73; x++) map.kind[idx(x, 21)] = T.DEEP;
   return map;
-}
-
-function bestMeasured(map, sites) {
-  const fieldCache = new Map();
-  let best = null;
-  for (const [x, y] of sites) {
-    const result = measureSiteExposure(map, x + 0.5, y + 0.5, { fieldCache });
-    if (!best || result.exposure > best.exposure) best = result;
-  }
-  return best;
 }
 
 // --- D2: the validation gate actually holds on accepted maps -----------------
@@ -310,13 +298,13 @@ function floodRoad(map) {
   return seen;
 }
 
-check('roads form one network from both spawn sides to the centre', () => {
+const readabilityOf = (map) => analyseRoadReadability(map);
+const defectKinds = (r) => [...new Set(r.defects.flatMap((d) => d.kinds))].join(',') || 'none';
+
+check('roads form one network from every spawn mouth to the centre', () => {
   for (const m of maps) {
     const roadCount = m.road.reduce((n, v) => n + v, 0);
     if (!roadCount) return `${m.seed}: no road tiles`;
-    if (m.roadConnectors < ROAD.connectorsMin || m.roadConnectors > ROAD.connectorsMax) {
-      return `${m.seed}: expected ${ROAD.connectorsMin}-${ROAD.connectorsMax} lateral connectors, got ${m.roadConnectors}`;
-    }
     const seen = floodRoad(m);
     if (!seen[idx(m.roadCenter.x, m.roadCenter.y)]) return `${m.seed}: centre is not road`;
     for (const side of ['west', 'east']) {
@@ -331,21 +319,6 @@ check('roads form one network from both spawn sides to the centre', () => {
   return null;
 });
 
-check('roads provide separate approaches on both sides of the centre', () => {
-  for (const m of maps) {
-    for (const side of ['west', 'east']) {
-      const p = m.report.parallelRoutes[side];
-      if (p.median < VALID.parallelRouteMedianMin) {
-        return `${m.seed}: ${side} median ${p.median}, expected ${VALID.parallelRouteMedianMin}`;
-      }
-    }
-    if (m.report.columnsWithThree < VALID.parallelRouteColumnsWithThreeMin) {
-      return `${m.seed}: ${m.report.columnsWithThree} columns have 3+ runs`;
-    }
-  }
-  return null;
-});
-
 check('roads never make or cross impassable terrain', () => {
   for (const m of maps) {
     for (let i = 0; i < m.road.length; i++) {
@@ -355,53 +328,12 @@ check('roads never make or cross impassable terrain', () => {
   return null;
 });
 
-check('road networks use authored shallow-water fords', () => {
+check('roads cross rivers only at shallow fords', () => {
   for (const m of maps) {
-    let fordTiles = 0;
     for (let i = 0; i < m.road.length; i++) {
-      if (m.road[i] && m.kind[i] === T.SHALLOW) fordTiles++;
-    }
-    if (!fordTiles) return `${m.seed}: no road crosses a shallow-water ford`;
-  }
-  return null;
-});
-
-check('seeded routes add bends and riverbank travel without multiplying lanes', () => {
-  let routes = 0;
-  let reversing = 0;
-  let riverFollowing = 0;
-  for (const m of maps) {
-    // D79: one main route per authored mouth (four per side on 208x104).
-    const approaches = m.roadRoutes.length;
-    if (approaches !== ROAD.mouthsPerSide * 2) return `${m.seed}: ${approaches} approach routes, expected ${ROAD.mouthsPerSide * 2}`;
-    for (const route of m.roadRoutes) {
-      routes++;
-      const verticalRuns = [];
-      let waterStreak = 0;
-      let longestWaterStreak = 0;
-      for (let n = 1; n < route.path.length; n++) {
-        const a = route.path[n - 1];
-        const b = route.path[n];
-        const dy = Math.sign(((b / MAP.w) | 0) - ((a / MAP.w) | 0));
-        if (dy) {
-          const last = verticalRuns[verticalRuns.length - 1];
-          if (last && last.sign === dy) last.distance++;
-          else verticalRuns.push({ sign: dy, distance: 1 });
-        }
-        if (m.waterDist[b] > 0 && m.waterDist[b] <= 2) {
-          waterStreak++;
-          longestWaterStreak = Math.max(longestWaterStreak, waterStreak);
-        } else waterStreak = 0;
-      }
-      const meaningfulReversal = verticalRuns.some((run, i) => i > 0
-        && run.sign !== verticalRuns[i - 1].sign
-        && run.distance >= 4 && verticalRuns[i - 1].distance >= 4);
-      if (meaningfulReversal) reversing++;
-      if (longestWaterStreak >= 4) riverFollowing++;
+      if (m.road[i] && m.kind[i] === T.DEEP) return `${m.seed}: road on deep water`;
     }
   }
-  if (reversing < routes * 0.35) return `only ${reversing}/${routes} routes have a sustained direction reversal`;
-  if (riverFollowing < routes * 0.20) return `only ${riverFollowing}/${routes} routes follow water for 4+ tiles`;
   return null;
 });
 
@@ -430,60 +362,174 @@ check('lane fields discount roads while direct fields ignore the road bitfield',
   return null;
 });
 
-// --- D48/D49: road exposure and knot analysis ------------------------------
+// --- D96: simple roads ---------------------------------------------------------
 
-check('straight-road exposure matches the geometric baseline', () => {
-  const map = syntheticMap();
-  stampRoute(map, horizontal(26));
-  const result = measureSiteExposure(map, 52.5, 28.5);
-  const baseline = straightRoadBaseline();
-  return Math.abs(result.exposure - baseline) <= baseline * 0.10
-    ? null : `measured ${result.exposure.toFixed(2)}, baseline ${baseline.toFixed(2)}`;
-});
-
-check('an impassable-spined hairpin produces a strong exposure feature', () => {
-  const map = makeHairpin({ spine: true });
-  const features = findExposureFeatures(map);
-  const best = features[0];
-  if (!best) return 'reported no feature';
-  if (best.ratio < 1.75 || best.tier !== 'strong') {
-    return `best was ${best.ratio.toFixed(2)}x/${best.tier}`;
+check('D96: every generated map has 2-4 roads, one main road per side, at most one branch per side', () => {
+  for (const m of maps) {
+    const routes = m.roadRoutes;
+    if (routes.length < 2 || routes.length > ROAD.maxRoads) return `${m.seed}: ${routes.length} roads`;
+    for (const side of ['west', 'east']) {
+      const mains = routes.filter((r) => r.side === side && r.kind === 'main').length;
+      const branches = routes.filter((r) => r.side === side && r.kind === 'branch').length;
+      if (mains !== 1 || branches > 1) return `${m.seed}: ${side} has ${mains} main / ${branches} branch roads`;
+    }
+    if (m.exposureFeatures.length) return `${m.seed}: authored exposure features came back`;
   }
   return null;
 });
 
-check('an open U-turn is cut across and is not useful exposure', () => {
-  const map = makeHairpin();
-  const sites = [];
-  for (let y = 20; y <= 23; y++) for (let x = 73; x <= 77; x++) sites.push([x, y]);
-  const best = bestMeasured(map, sites);
-  return best.ratio < 1.35 ? null : `open U scored ${best.ratio.toFixed(2)}x`;
+check('D96: no self-intersection, no loops, no knots, no readability defects on any map', () => {
+  for (const m of maps) {
+    const r = analyseRoadNetwork(m);
+    if (r.selfIntersections) return `${m.seed}: ${r.selfIntersections} self-intersecting road(s)`;
+    if (r.loops) return `${m.seed}: ${r.loops} road(s) touch another away from a junction`;
+    const knots = analyseRoadKnots(m);
+    if (knots.count) return `${m.seed}: ${knots.count} knot(s)`;
+    const read = analyseRoadReadability(m);
+    if (read.count) return `${m.seed}: readability defects ${defectKinds(read)}`;
+  }
+  return null;
 });
 
-check('an unbuildable hairpin pocket cannot report a strong feature', () => {
-  const map = makeHairpin({ spine: true, pocketKind: T.CLIFF });
-  const strong = findExposureFeatures(map).filter((f) => f.tier === 'strong');
-  return strong.length ? `reported ${strong.length} strong feature(s)` : null;
+check('D96: roads stay simple - few turns, no sharp turns, no hairpins, spaced apart', () => {
+  for (const m of maps) {
+    const r = analyseRoadNetwork(m);
+    if (r.maxTurns > ROAD.maxTurnsMain) return `${m.seed}: a road has ${r.maxTurns} turns`;
+    if (r.minSpacing < ROAD.minSeparation) return `${m.seed}: unrelated roads ${r.minSpacing} tiles apart`;
+    if (r.maxJunctionsInRadius > 1) return `${m.seed}: ${r.maxJunctionsInRadius} junctions crowded together`;
+    for (const route of m.roadRoutes) {
+      const t = polylineTurns(route.vertices);
+      if (t.sharpest > ROAD.maxTurnDegrees) return `${m.seed}: a ${Math.round(t.sharpest)} degree turn`;
+      if (isHairpin(route.vertices)) return `${m.seed}: ${route.side} ${route.kind} road has a hairpin`;
+      // Straightened: far fewer corner points than tiles.
+      if (route.vertices.length - 1 > route.path.length / ROAD.minTilesPerSegment + 1) {
+        return `${m.seed}: ${route.vertices.length - 1} segments for ${route.path.length} tiles`;
+      }
+    }
+  }
+  return null;
 });
 
-check('a same-height forest ring drops hairpin exposure below strong', () => {
-  const map = makeHairpin({ spine: true, forestRing: true });
-  const features = findExposureFeatures(map);
-  const best = features[0];
-  return !best || best.ratio < 1.75 ? null : `forest-ringed pocket scored ${best.ratio.toFixed(2)}x`;
+check('D96: spawn mouths are exactly the road mouths, entering from the boundary', () => {
+  for (const m of maps) {
+    for (const side of ['west', 'east']) {
+      const roadMouths = m.roadRoutes.filter((r) => r.side === side).map((r) => r.mouth.y).sort((a, b) => a - b);
+      const spawns = m.spawns[side].map((s) => s.y);
+      if (roadMouths.join() !== spawns.join()) return `${m.seed} ${side}: spawns ${spawns} vs road mouths ${roadMouths}`;
+    }
+    for (const route of m.roadRoutes) {
+      if (route.path[0] % MAP.w !== (route.side === 'west' ? 0 : MAP.w - 1)) {
+        return `${m.seed} ${route.side} road starts at x=${route.path[0] % MAP.w}, not the boundary`;
+      }
+    }
+  }
+  return null;
 });
 
-check('a cliff wall prevents a site from combining separate roads', () => {
+check('D96: roads touch the map boundary only at their entries', () => {
+  for (const m of maps) {
+    for (let y = 0; y < MAP.h; y++) {
+      for (const side of ['west', 'east']) {
+        const edgeX = side === 'west' ? 0 : MAP.w - 1;
+        if (m.road[idx(edgeX, y)] && !m.spawns[side].some((mouth) => Math.abs(mouth.y - y) <= 1)) {
+          return `${m.seed} road runs along the ${side} edge at y=${y}`;
+        }
+      }
+    }
+    for (let x = 0; x < MAP.w; x++) {
+      if (m.road[idx(x, 0)] || m.road[idx(x, MAP.h - 1)]) return `${m.seed} road on the north/south boundary at x=${x}`;
+    }
+  }
+  return null;
+});
+
+check('D96: the Keep reaches every invasion road along a lane path', () => {
+  for (const m of maps) {
+    const lane = computeField(m, [idx(m.start.x, m.start.y)], 'lane');
+    for (const side of ['west', 'east']) {
+      for (const mouth of m.spawns[side]) {
+        if (!Number.isFinite(lane[idx(mouth.x, mouth.y)])) return `${m.seed} ${side} mouth unreachable from the Keep`;
+      }
+    }
+  }
+  return null;
+});
+
+/** An open synthetic map ready for the road builder. */
+function roadSandbox() {
   const map = syntheticMap();
-  stampRoute(map, horizontal(18));
-  stampRoute(map, horizontal(30), 'east');
-  for (let x = 0; x < MAP.w; x++) map.kind[idx(x, 24)] = T.CLIFF;
-  const result = measureSiteExposure(map, 52.5, 20.5);
-  const baseline = straightRoadBaseline();
-  if (result.routeIndex !== 0) return `selected blocked route ${result.routeIndex}`;
-  return result.exposure <= baseline * 1.10
-    ? null : `combined roads into ${result.exposure.toFixed(2)} exposure`;
+  map.spawns = { west: [{ x: 1, y: 30 }, { x: 1, y: 80 }], east: [{ x: MAP.w - 2, y: 50 }] };
+  map.roadCenter = { x: Math.floor(MAP.w / 2), y: 52 };
+  return map;
+}
+
+check('D96: on open ground a main road is one straight segment', () => {
+  const map = roadSandbox();
+  map.spawns.west = [{ x: 1, y: 52 }];
+  map.spawns.east = [{ x: MAP.w - 2, y: 52 }];
+  buildSimpleRoads(map, () => 0.99);
+  for (const r of map.roadRoutes) {
+    if (r.vertices.length !== 2) return `${r.side} road has ${r.vertices.length - 1} segments on open ground`;
+  }
+  return map.roadRoutes.length === 2 ? null : `${map.roadRoutes.length} roads`;
 });
+
+check('D96: a wall with one gap gives a broad bend, not a zigzag', () => {
+  const map = roadSandbox();
+  map.spawns.west = [{ x: 1, y: 52 }];
+  const gapY = 20;
+  for (let y = 0; y < MAP.h; y++) if (Math.abs(y - gapY) > 2) map.kind[idx(50, y)] = T.CLIFF;
+  buildSimpleRoads(map, () => 0.99);
+  const west = map.roadRoutes.find((r) => r.side === 'west');
+  if (!west) return 'no west road through the gap';
+  const t = polylineTurns(west.vertices);
+  if (t.turns > 2) return `${t.turns} turns to thread one gap`;
+  return new Set(west.path).size === west.path.length ? null : 'road crosses itself';
+});
+
+check('D96: a branch joins the network as a T, away from the main junction', () => {
+  const map = roadSandbox();
+  buildSimpleRoads(map, () => 0.1);
+  const branch = map.roadRoutes.find((r) => r.kind === 'branch');
+  if (!branch) return 'no branch was built on open ground';
+  const end = branch.path[branch.path.length - 1];
+  const ex = end % MAP.w; const ey = (end / MAP.w) | 0;
+  if (Math.hypot(ex - map.roadCenter.x, ey - map.roadCenter.y) < ROAD.junctionSpacing) return 'branch joined at the hub';
+  if (!map.roadRoutes.some((r) => r !== branch && r.path.includes(end))) return 'branch does not end on another road';
+  return analyseRoadNetwork(map).loops ? 'branch touches the network twice' : null;
+});
+
+check('D96: the hairpin rule catches a hairpin built from several legal bends', () => {
+  const v = (x, y) => idx(x, y);
+  if (isHairpin([v(10, 50), v(30, 50), v(45, 40), v(70, 40)])) return 'a broad S-bend was flagged';
+  if (isHairpin([v(10, 50), v(30, 50), v(42, 62), v(42, 90)])) return 'a 90 degree sweep was flagged';
+  return isHairpin([v(10, 50), v(30, 50), v(36, 44), v(30, 38), v(10, 38)]) ? null : 'a U-turn passed';
+});
+
+check('D96: map generation succeeds on many extra seeds with zero road defects', () => {
+  for (let n = 0; n < 12; n++) {
+    const m = generateMap(`ROADS-${n}`);
+    if (!m.report.ok) return `ROADS-${n}: ${m.report.problems.join('; ')}`;
+    const r = analyseRoadNetwork(m);
+    if (r.selfIntersections || r.loops || analyseRoadKnots(m).count) return `ROADS-${n}: road defects`;
+  }
+  return null;
+});
+
+check('D96: road analysis stays cheap', () => {
+  let worst = { seed: '', ms: 0 };
+  for (const map of maps) {
+    const started = performance.now();
+    analyseRoadNetwork(map); analyseRoadKnots(map); analyseRoadReadability(map);
+    const ms = performance.now() - started;
+    if (ms > worst.ms) worst = { seed: map.seed, ms };
+    if (ms > 1500) return `${map.seed} took ${ms.toFixed(1)}ms (budget 1500ms)`;
+  }
+  console.log(`Road analysis worst: ${worst.seed} ${worst.ms.toFixed(1)}ms`);
+  return null;
+});
+
+// --- D49/D55: the knot and readability analysers (used as validation) --------
 
 check('road-knot analysis finds planted defects and ignores clean roads', () => {
   const clean = syntheticMap();
@@ -514,8 +560,6 @@ check('road-knot analysis finds planted defects and ignores clean roads', () => 
   return null;
 });
 
-// --- D55: road readability ---------------------------------------------------
-
 /** Axis-aligned polyline through corner points, as route tiles. */
 function polyline(corners) {
   const out = [corners[0]];
@@ -538,14 +582,7 @@ function routeMap(corners) {
   return map;
 }
 
-const readabilityOf = (map) => analyseRoadReadability(map);
-const defectKinds = (r) => [...new Set(r.defects.flatMap((d) => d.kinds))].join(',') || 'none';
-
-check('D55: a clean hairpin, switchback and straight road read as clean', () => {
-  const hairpin = readabilityOf(makeHairpin({ spine: true }));
-  if (hairpin.count) return `clean hairpin flagged: ${defectKinds(hairpin)}`;
-  const switchback = readabilityOf(routeMap([[0, 10], [80, 10], [80, 18], [20, 18], [20, 26], [103, 26]]));
-  if (switchback.count) return `clean switchback flagged: ${defectKinds(switchback)}`;
+check('D55: a straight road reads as clean', () => {
   const straight = syntheticMap();
   stampRoute(straight, horizontal(26));
   const s = readabilityOf(straight);
@@ -586,120 +623,6 @@ check('D55: a small confusing multi-junction area is rejected', () => {
   return r.junctionClutter.length ? null : `junction grid passed (${defectKinds(r)})`;
 });
 
-check('D55: long road spaghetti is rejected despite high raw exposure', () => {
-  const corners = [[0, 12], [70, 12], [70, 16], [30, 16], [30, 20], [70, 20], [70, 24], [30, 24], [30, 28], [103, 28]];
-  const map = routeMap(corners);
-  const points = polyline(corners).map(([x, y]) => ({ x: x + 0.5, y: y + 0.5 }));
-  const site = { x: 50.5, y: 18.5 };
-  if (!isTerrainBuildable(map, site.x, site.y)) return 'test site is not buildable';
-  const window = points.filter((p) => p.x >= 28 && p.x <= 72);
-  const raw = pathExposure(map, site.x, site.y, window).length;
-  const baseline = straightRoadBaseline();
-  if (raw < EXPOSURE.strongRatio * baseline) return `raw exposure only ${(raw / baseline).toFixed(2)}x - not a high-exposure case`;
-  const efficiency = exposureEfficiency(raw, walkedExtraLength(window), baseline);
-  if (efficiency >= READABILITY.minExposureEfficiency) return `spaghetti efficiency ${efficiency.toFixed(2)} passed`;
-  return readabilityOf(map).count ? null : 'spaghetti read as clean';
-});
-
-check('D55: a spined hairpin with a buildable pocket is strong, readable and efficient', () => {
-  const map = makeHairpin({ spine: true });
-  const best = findExposureFeatures(map).find((f) => f.tier === 'strong');
-  if (!best) return 'no strong feature';
-  if (!isTerrainBuildable(map, best.x, best.y)) return 'feature site is not buildable';
-  if (!best.readable || readabilityOf(map).count) return 'hairpin not readable';
-  return best.efficiency >= READABILITY.minExposureEfficiency
-    ? null : `efficiency ${best.efficiency.toFixed(2)} below ${READABILITY.minExposureEfficiency}`;
-});
-
-check('D55: generated maps have no knots and at most isolated readability defects', () => {
-  const flagged = maps.filter((m) => analyseRoadReadability(m).count);
-  // D79 known gap (2026-10-04): with eight routes converging on the centre,
-  // HOTEL keeps one small loop beside the central junction. At most one
-  // canonical map may keep a single knot; more is a regression.
-  const knotted = maps.filter((m) => analyseRoadKnots(m).count);
-  if (knotted.length > 1 || knotted.some((m) => analyseRoadKnots(m).count > 1)) {
-    return `road knots on ${knotted.map((m) => `${m.seed}:${analyseRoadKnots(m).count}`).join(', ')}`;
-  }
-  for (const m of maps) {
-    const r = analyseRoadReadability(m);
-    // D79: 208x104 is four 104x52 maps of road; the old one-defect-per-map
-    // ceiling scales with area (x4) and routes (8 vs 5) to six. Flagged maps
-    // are no longer rare: measured 0-5 per map (median 2.5) on the 20 seeds.
-    if (r.count > 6) return `${m.seed} keeps ${r.count} readability defects (${defectKinds(r)})`;
-  }
-  return flagged.length <= maps.length ? null : 'unreachable';
-});
-
-check('D55: authored exposure features are efficient', () => {
-  for (const m of maps) {
-    for (const f of m.exposureFeatures) {
-      if (!(f.efficiency >= READABILITY.minExposureEfficiency)) return `${m.seed} feature at ${f.x},${f.y} efficiency ${f.efficiency}`;
-    }
-  }
-  return null;
-});
-
-// --- D54: entry roads run out through the map edge ---------------------------
-
-check('D54: every spawn mouth has a road from the boundary column into the network', () => {
-  for (const m of maps) {
-    const reach = new Uint8Array(m.road.length);
-    const queue = [idx(m.roadCenter.x, m.roadCenter.y)];
-    reach[queue[0]] = 1;
-    for (let head = 0; head < queue.length; head++) {
-      const x = queue[head] % MAP.w;
-      const y = (queue[head] / MAP.w) | 0;
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const nx = x + ox;
-          const ny = y + oy;
-          if (nx < 0 || ny < 0 || nx >= MAP.w || ny >= MAP.h) continue;
-          const n = idx(nx, ny);
-          if (m.road[n] && !reach[n]) { reach[n] = 1; queue.push(n); }
-        }
-      }
-    }
-    const lane = computeField(m, [idx(m.start.x, m.start.y)], 'lane');
-    for (const side of ['west', 'east']) {
-      const edgeX = side === 'west' ? 0 : MAP.w - 1;
-      for (const mouth of m.spawns[side]) {
-        if (mouth.x !== (side === 'west' ? 1 : MAP.w - 2)) return `${m.seed} ${side} spawn moved to x=${mouth.x}`;
-        if (![0, -1, 1].some((oy) => m.road[idx(edgeX, mouth.y + oy)] && reach[idx(edgeX, mouth.y + oy)])) {
-          return `${m.seed} ${side} mouth (${mouth.x},${mouth.y}) has no connected road on the boundary`;
-        }
-        if (!reach[idx(mouth.x, mouth.y)]) return `${m.seed} ${side} mouth is off the road network`;
-        if (!Number.isFinite(lane[idx(mouth.x, mouth.y)])) return `${m.seed} ${side} mouth has no lane path`;
-      }
-    }
-    for (const route of m.roadRoutes) {
-      if (route.path[0] % MAP.w !== (route.side === 'west' ? 0 : MAP.w - 1)) {
-        return `${m.seed} ${route.side} route starts at x=${route.path[0] % MAP.w}, not the boundary`;
-      }
-    }
-  }
-  return null;
-});
-
-check('D54: roads touch the map boundary only at entry roads', () => {
-  // D55 known gap: where deep water meets the edge beside a mouth, the road
-  // can be forced along the boundary (TANGO east). One canonical map may show it.
-  const hugging = [];
-  for (const m of maps) {
-    for (let y = 0; y < MAP.h; y++) {
-      for (const side of ['west', 'east']) {
-        const edgeX = side === 'west' ? 0 : MAP.w - 1;
-        if (m.road[idx(edgeX, y)] && !m.spawns[side].some((mouth) => Math.abs(mouth.y - y) <= 1)) {
-          if (!hugging.includes(m.seed)) hugging.push(m.seed);
-        }
-      }
-    }
-    for (let x = 0; x < MAP.w; x++) {
-      if (m.road[idx(x, 0)] || m.road[idx(x, MAP.h - 1)]) return `${m.seed} road on the north/south boundary at x=${x}`;
-    }
-  }
-  return hugging.length <= 1 ? null : `boundary-hugging roads on ${hugging.join(', ')}`;
-});
-
 check('terrain buildability and tower placement terrain rules agree', () => {
   for (const map of maps.slice(0, 3)) {
     const g = { map, towers: [], buildings: [], walls: [], nests: [],
@@ -712,23 +635,6 @@ check('terrain buildability and tower placement terrain rules agree', () => {
       }
     }
   }
-  return null;
-});
-
-check('road analysis stays within its per-map performance budget', () => {
-  let worst = { seed: '', ms: 0 };
-  for (const map of maps) {
-    const started = performance.now();
-    const fieldCache = new Map();
-    findExposureFeatures(map, { fieldCache });
-    analyseRoadKnots(map);
-    const ms = performance.now() - started;
-    if (ms > worst.ms) worst = { seed: map.seed, ms };
-    // D79: 400ms on 104x52 scales with area (x4) and route count (8 vs 5),
-    // capped by the D79 practical-generation target of about 3s.
-    if (ms > 3000) return `${map.seed} took ${ms.toFixed(1)}ms (budget 3000ms)`;
-  }
-  console.log(`Road analysis worst: ${worst.seed} ${worst.ms.toFixed(1)}ms`);
   return null;
 });
 
@@ -1898,6 +1804,8 @@ function breachEnemy(g, t, type, distance, angle = 0, speed = ENEMIES[type].spee
 function roadFixture(seed) {
   const g = createGame(seed, 'gunner');
   g.map = syntheticMap();
+  // The generated map's nests must not stay behind as solid blockers.
+  g.nests = []; g.blockerGrid.fill(null);
   for (let x = 0; x < MAP.w; x++) g.map.road[idx(x, 26)] = 1;
   g.phase = 'prep'; g.phaseLeft = 999; g.pendingSpawns = [];
   g.towers[0].x = 90.5; g.towers[0].y = 40.5; g.towers[0].field = null;
@@ -2067,8 +1975,10 @@ check('a full run simulates for several waves without crashing', () => {
     // D93: the Keep cannot shoot at its own base, so the bot steps out and
     // fights anything inside the blind spot, as a player must.
     const t = g.towers[0];
-    const base = t && g.enemies.find((e) => Math.hypot(e.x - t.x, e.y - t.y) < KEEP.minRange + 1);
-    if (base) {
+    // A careful player finishes stragglers only, never wades into a crowd.
+    const near = t ? g.enemies.filter((e) => !e.wild && Math.hypot(e.x - t.x, e.y - t.y) < 9) : [];
+    const base = near.find((e) => Math.hypot(e.x - t.x, e.y - t.y) < KEEP.minRange + 1);
+    if (base && near.length <= 2 && g.player.hp > g.player.maxHp * 0.7) {
       const dx = base.x - g.player.x;
       const dy = base.y - g.player.y;
       g.input = { mx: dx, my: dy, melee: Math.hypot(dx, dy) < PLAYER.melee.range, repair: false };

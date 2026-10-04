@@ -278,6 +278,9 @@ export function updateMapInfo(g) {
     `seed <b>${g.seed}</b> — accepted on attempt ${g.map.attempts}${g.map.relaxed ? ' <span class="warn">(relaxed)</span>' : ''}`,
     Number.isFinite(report.openFrac) ? `open ${(report.openFrac * 100).toFixed(0)}% · forest ${(report.forestFrac * 100).toFixed(0)}% · water ${(report.waterFrac * 100).toFixed(0)}%` : '',
     barriers,
+    report.roads ? `roads ${report.roads.roads} · junctions ${report.roads.junctions} · turns avg ${report.roads.avgTurns.toFixed(1)} max ${report.roads.maxTurns}`
+      + ` · min spacing ${Number.isFinite(report.roads.minSpacing) ? report.roads.minSpacing : '—'} · loops ${report.roads.loops}`
+      + ` · self-crossings ${report.roads.selfIntersections} · knots ${g.map.roadDefects?.knots ?? '?'} · rejected ${report.roads.rejected}` : '',
     (report.problems || []).length ? `<span class="warn">${report.problems.join('; ')}</span>` : '',
   ].filter(Boolean).join('<br />');
 }

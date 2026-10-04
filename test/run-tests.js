@@ -114,7 +114,11 @@ for (let n = 0; n < maps.length; n++) {
   check(`${seed}: D2 validation remains meaningful`, () => {
     assert(map.report.ok, map.report.problems.join('; '));
     assert(map.report.barriers.length >= 5, 'larger map has too few barriers');
-    assert(map.spawns.west.length >= 4 && map.spawns.east.length >= 4, 'not enough spawn mouths');
+    // D96: enemies enter only where roads do - one or two mouths per side.
+    for (const side of ['west', 'east']) {
+      const n = map.spawns[side].length;
+      assert(n >= 1 && n <= 2, `${side} has ${n} spawn mouths`);
+    }
   });
   check(`${seed}: D80 resource geography`, () => {
     const report = validateResourceGeography(map);

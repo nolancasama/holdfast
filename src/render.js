@@ -2,6 +2,7 @@
 
 import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, WALL, NEST } from './config.js';
 import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
+import { polylineTurns } from './roads.js';
 import {
   autoWallPlan, towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
 } from './game.js';
@@ -192,6 +193,7 @@ export function draw(ctx, g, layers, view) {
 
   if (g.phase === 'warning') drawIncomingRoads(ctx, g, view);
   if (g.debug.showPaths) drawFlowField(ctx, g, view);
+  if (g.debug.showRoads) drawRoadDebug(ctx, g, view);
 
   drawResourceSites(ctx, g, view);
   drawTowerRings(ctx, g, view);
@@ -468,6 +470,43 @@ function drawTowers(ctx, g, view) {
       }
     }
   }
+}
+
+// D96 debug: road centre-line nodes, junctions, rejected mouths and metrics.
+function drawRoadDebug(ctx, g, view) {
+  const map = g.map;
+  const colours = ['#ff6bd6', '#6bd8ff', '#ffe36b', '#8bff6b'];
+  ctx.save();
+  ctx.font = `bold ${localPx(view, 10)}px ui-monospace, monospace`;
+  ctx.textAlign = 'center';
+  (map.roadRoutes || []).forEach((route, n) => {
+    const colour = colours[n % colours.length];
+    const pts = (route.vertices || []).map((i) => ({ x: (i % MAP.w) + 0.5, y: Math.floor(i / MAP.w) + 0.5 }));
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = localPx(view, 2);
+    ctx.beginPath();
+    pts.forEach((p, k) => (k ? ctx.lineTo(p.x * TP, p.y * TP) : ctx.moveTo(p.x * TP, p.y * TP)));
+    ctx.stroke();
+    ctx.fillStyle = colour;
+    for (const p of pts) { ctx.beginPath(); ctx.arc(p.x * TP, p.y * TP, localPx(view, 4), 0, Math.PI * 2); ctx.fill(); }
+    const turns = polylineTurns(route.vertices || []);
+    const mid = pts[Math.floor(pts.length / 2)];
+    if (mid) ctx.fillText(`${route.side} ${route.kind} · ${turns.turns} turns (${turns.gentle} gentle)`, mid.x * TP, mid.y * TP - localPx(view, 10));
+  });
+  for (const j of map.roadDebug?.junctions || []) {
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = localPx(view, 2);
+    ctx.beginPath(); ctx.arc((j.x + 0.5) * TP, (j.y + 0.5) * TP, localPx(view, 9), 0, Math.PI * 2); ctx.stroke();
+  }
+  for (const r of map.roadDebug?.rejected || []) {
+    const x = (r.x + 0.5) * TP; const y = (r.y + 0.5) * TP; const s = localPx(view, 6);
+    ctx.strokeStyle = '#ff4040';
+    ctx.beginPath(); ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke();
+    ctx.fillStyle = '#ff8080';
+    ctx.textAlign = r.side === 'west' ? 'left' : 'right';
+    ctx.fillText(r.reason, x + (r.side === 'west' ? 1 : -1) * localPx(view, 10), y);
+  }
+  ctx.restore();
 }
 
 // D92: a nest is a dark mound; agitated nests pulse, besieged ones show hp.

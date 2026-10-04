@@ -45,7 +45,6 @@ export const GEN = {
   startClearRadius: 7,
   maxAttempts: 4,      // bounded strict retries keep the 4x-area generator practical
   maxRelaxedAttempts: 10,
-  readableExtraAttempts: 0, // readability remains gated; do not multiply full-map attempts
 };
 
 // D80: physical resource geography. Fertility is a tile layer (0/1/1.5),
@@ -72,47 +71,55 @@ export const RESOURCE_GEN = {
   },
 };
 
-// D20-D22: roads are an overlay. These costs are used only while carving the
-// network; ordinary movement continues to use MOVE_COST above.
+// D20-D22/D96: roads are an overlay. Carve costs are used only while laying
+// roads; ordinary movement uses MOVE_COST above (enemy Keep fields discount
+// road tiles by laneDiscount, the player runs faster on them).
+// D96: roads are simple - few, straight, tree-shaped, validated hard.
 export const ROAD = {
   existingCost: 0.15,
   carveCost: [1.0, 2.8, 4.2, 3.0, Infinity, Infinity],
   elevationCrossingCost: 5.5,
   riverCheapRadius: 2,
-  riverbankCostMult: 0.48,
-  waypointChance: 0.72,
-  waypointYOffsetMin: 14,
-  waypointYOffsetMax: 34,
-  parallelRouteFraction: 0.88,
-  parallelRouteYOffsetMin: 20,
-  parallelRoadAvoidRadius: 8,
-  branchClearRadius: 9,
-  entryTrunkLength: 4,
-  parallelRoadAvoidCost: 8.0,
   laneDiscount: 0.32,
-  connectorsMin: 1,
-  connectorsMax: 3,
-  mouthsPerSide: 4,
+  mouthsPerSide: 4,          // candidate mouths; only those with roads become spawns
   mouthMinSeparation: 16,
   startOffset: 6,
+  // Routing: turning is expensive, so roads bend only where terrain forces it.
+  turn45: 1.5,
+  turn90: 25,                // sharper than 90 degrees is never allowed
+  edgeCost: 8,               // the 2-tile boundary band, except the entry tile
+  spacing: 6,                // proximity to other roads is priced inside this...
+  proximityCost: 1.5,        // ...per tile closer
+  pullSlack: 1.05,           // a straightened segment may cost 5% more than the raw path
+  // Validation (a failing road is skipped, never forced).
+  minSeparation: 4,          // unrelated roads stay this far apart (Chebyshev)
+  selfPassGap: 12,           // tiles this far apart along one road...
+  selfPassDistance: 3,       // ...must not come this close on the map
+  turnDegrees: 30,           // a bend sharper than this counts as a turn
+  maxTurnsMain: 5,
+  maxTurnsBranch: 3,
+  maxTurnDegrees: 95,
+  hairpinDegrees: 120,       // bends adding up to this...
+  hairpinWindow: 16,         // ...within this many tiles of road are a hairpin
+  minTilesPerSegment: 7,     // a road averages at least this many tiles per straight segment
+  // Network shape: one main road per side, at most one branch per side.
+  maxRoads: 4,
+  branchChance: 0.75,
+  branchMouthSeparation: 24,
+  branchMaxLengthFrac: 0.6,  // of map width
+  junctionSpacing: 14,       // a branch never joins this close to another junction
+  joinEdgeClear: 14,         // or this close to the west/east edge
 };
 
-// D49: road exposure and road-knot measurement. Generation (D51/D52) uses it to
-// accept or undo knot fixes and exposure features.
+// D49: road-knot measurement; D96 validation requires zero knots.
 export const EXPOSURE = {
-  straightOffset: 2.0,
-  usefulRatio: 1.35,
-  strongRatio: 1.75,
-  featureClusterRadius: 8,
-  windowMargin: 6,
   knotClusterRadius: 6,
   smallLoopMaxArea: 60,
   braidMinRun: 5,
-  readableLegSeparation: 5,
 };
 
-// D55: road readability at full-map scale. Exposure scores tower sites; these
-// reject road areas a player would have to trace with a finger.
+// D55: road readability at full-map scale: road areas a player would have to
+// trace with a finger.
 export const READABILITY = {
   nearPassDistance: 4,       // an unrelated strand this close (tiles, Euclidean)...
   nearPassGraphMin: 12,      // ...that is at least this far away along the road
@@ -128,27 +135,6 @@ export const READABILITY = {
   turnWindow: 16,            // route steps
   maxSharpTurnsInWindow: 3,
   defectClusterRadius: 6,
-  minExposureEfficiency: 0.3, // (exposure - straight baseline) per tile of extra road
-};
-
-// D52: authored exposure features - a short impassable spine the road must wrap.
-export const EXPOSURE_GEN = {
-  targetMin: 3,
-  targetMax: 5,
-  maxTries: 24,            // candidate stretches tried per map before giving up
-  segmentHalf: 14,         // furthest route tiles searched either side for the re-laid stretch ends
-  depthMin: 5,             // spine length out from the old road line
-  depthMax: 8, 
-  rootBehind: 6,           // spine continues behind the road so it cannot be walked round
-  legHalfGap: 4,           // each leg this far from the spine centreline (legs ~8 apart)
-  bendBeyondTip: 5,        // the bend runs this far past the tip, leaving the tower pocket
-  spineWidth: 2,
-  waterChance: 0.45,       // water inlet vs rock spur
-  pocketOffset: 2.5,       // tower pocket centre past the spine tip
-  otherRoadClearance: 2,   // a feature keeps this far from any other road
-  minWalkedOnRoad: 0.9,
-  minFromStart: 16,
-  minApart: 22,
 };
 
 // D2: a map must satisfy these or it is thrown away and regenerated.
@@ -160,8 +146,6 @@ export const VALID = {
   openFracMin: 0.30,        // not a maze
   openFracMax: 0.66,        // not a featureless field
   minForestFrac: 0.05,
-  parallelRouteMedianMin: 2,
-  parallelRouteColumnsWithThreeMin: 10,
 };
 
 // --- player -----------------------------------------------------------------
