@@ -1,14 +1,16 @@
 // Bootstrap, input, and the frame loop.
 
-import { MAP, TOWER, ENEMIES } from './config.js';
+import { MAP, TOWER, ENEMIES, RENDER } from './config.js';
 import { randomSeed } from './terrain.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade,
   forceNextWave, spawnGroupAt,
-  towerStats, dangerState, setPaused, pauseState, equipmentState, depositRichness,
+  towerStats, dangerState, setPaused, pauseState, equipmentState,
   drainAudioEvents, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState,
   upgradeState, towerAlarmState, stuckState, endState,
+  keepState, resourceState, buildingState, resourceSitesState, keepFieldState, enemyKeepField,
+  wallPlan, tryBuildWall, wallState, repairTarget,
 } from './game.js';
 import { createAudioSystem } from './audio.js';
 import {
@@ -21,7 +23,7 @@ const ctx = canvas.getContext('2d');
 
 let game = null;
 let layers = null;
-const view = { w: 0, h: 0, tilePx: 1, offsetX: 0, offsetY: 0 };
+const view = { w: 0, h: 0, tilePx: RENDER.baseTilePx, zoom: RENDER.baseTilePx, offsetX: 0, offsetY: 0, worldX: 0, worldY: 0 };
 const keys = new Set();
 let lastBuildPlayerTile = '';
 let endShown = false;
@@ -50,7 +52,6 @@ function startRun(seed, archetype) {
   layers = {
     terrain,
     terrainDim: buildTerrainDimLayer(terrain),
-    terrainView: null,
     terrainVersion: game.map.terrainVersion || 0,
   };
   endShown = false;
@@ -81,12 +82,30 @@ function resize() {
   canvas.width = view.w * dpr;
   canvas.height = view.h * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  view.tilePx = Math.max(1, Math.floor(Math.min(view.w / MAP.w, view.h / MAP.h)));
-  view.offsetX = Math.floor((view.w - MAP.w * view.tilePx) / 2);
-  view.offsetY = Math.floor((view.h - MAP.h * view.tilePx) / 2);
+  updateCamera();
 }
 window.addEventListener('resize', resize);
 resize();
+
+function setZoom(next) {
+  view.zoom = Math.max(RENDER.minTilePx, Math.min(RENDER.maxTilePx, Math.round(next)));
+  view.tilePx = view.zoom;
+  updateCamera();
+}
+
+function updateCamera() {
+  view.tilePx = view.zoom;
+  const focusX = game?.player?.x ?? MAP.w / 2;
+  const focusY = game?.player?.y ?? MAP.h / 2;
+  const worldW = MAP.w * view.tilePx;
+  const worldH = MAP.h * view.tilePx;
+  view.offsetX = worldW <= view.w ? Math.floor((view.w - worldW) / 2)
+    : Math.round(Math.max(view.w - worldW, Math.min(0, view.w / 2 - focusX * view.tilePx)));
+  view.offsetY = worldH <= view.h ? Math.floor((view.h - worldH) / 2)
+    : Math.round(Math.max(view.h - worldH, Math.min(0, view.h / 2 - focusY * view.tilePx)));
+  view.worldX = -view.offsetX / view.tilePx;
+  view.worldY = -view.offsetY / view.tilePx;
+}
 
 // ---------------------------------------------------------------------------
 // Input
@@ -118,17 +137,19 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.code === 'F1') { e.preventDefault(); toggleDebug(); return; }
-  if (e.code === 'Escape') { setBuildMode(false); return; }
+  if ((e.code === 'Minus' || e.code === 'NumpadSubtract') && !e.repeat) { setZoom(view.zoom - 2); return; }
+  if ((e.code === 'Equal' || e.code === 'NumpadAdd') && !e.repeat) { setZoom(view.zoom + 2); return; }
+  if (e.code === 'Escape') { setBuildMode(false); setWallMode(false); return; }
   if (e.code === 'KeyV' && !e.repeat) { game.debug.showFog = !game.debug.showFog; return; }
   if (game.paused) return;
 
   switch (e.code) {
-    case 'KeyB': setBuildMode(!game.buildMode); break;
-    case 'Enter': confirmBuild(); break;
+    case 'KeyB': setWallMode(false); setBuildMode(!game.buildMode); break;
+    case 'KeyX': setWallMode(!game.wallMode); break;
+    case 'Enter': if (game.wallMode) confirmWall(); else confirmBuild(); break;
     case 'Digit1': upgradeSelected('weapon'); break;
-    case 'Digit2': upgradeSelected('extraction'); break;
     // debug
-    case 'KeyM': game.materials += 500; break;
+    case 'KeyM': addDebugResources(); break;
     case 'KeyN': forceNextWave(game); break;
     case 'KeyG': debugSpawn(); break;
     case 'KeyK': debugDamage(); break;
@@ -148,13 +169,17 @@ canvas.addEventListener('mousemove', (e) => {
   const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
 });
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  setZoom(view.zoom + (e.deltaY < 0 ? 2 : -2));
+}, { passive: false });
 
 canvas.addEventListener('mousedown', (e) => {
   audio.gesture();
   if (!game || game.status !== 'playing') return;
   e.preventDefault();
   if (e.button !== 0) {
-    if (e.button === 2) setBuildMode(false);
+    if (e.button === 2) { setBuildMode(false); setWallMode(false); }
     return;
   }
   const rect = canvas.getBoundingClientRect();
@@ -165,19 +190,44 @@ canvas.addEventListener('mousedown', (e) => {
     confirmBuild();
     return;
   }
+  if (game.wallMode && !game.paused) {
+    const target = towerNear(w, 1.8);
+    if (target && target.id !== game.wallMode.fromId) {
+      game.wallMode.toId = target.id;
+      confirmWall();
+    }
+    return;
+  }
   let best = null;
   let bestD = TOWER.radius + 0.9;
   for (const t of game.towers) {
     const d = Math.hypot(t.x - w.x, t.y - w.y);
     if (d < bestD) { bestD = d; best = t; }
   }
-  game.selected = best ? best.id : null;
+  let bestBuilding = null;
+  let bestBuildingD = 1.15;
+  for (const b of game.buildings || []) {
+    if (b.destroyed || b.hp <= 0) continue;
+    const d = Math.hypot(b.x - w.x, b.y - w.y);
+    if (d < bestBuildingD) { bestBuildingD = d; bestBuilding = b; }
+  }
+  if (bestBuilding && (!best || bestBuildingD < bestD)) {
+    game.selected = null;
+    game.selectedBuildingId = bestBuilding.id;
+    game.selectedBuilding = bestBuilding;
+  } else {
+    game.selected = best ? best.id : null;
+    game.selectedBuildingId = null;
+    game.selectedBuilding = null;
+  }
 });
-canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); setBuildMode(false); });
+canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); setBuildMode(false); setWallMode(false); });
 
-function setBuildMode(on) {
+function setBuildMode(on, type = game?.buildType || 'tower') {
   if (on && game.paused) return;
+  if (on) game.wallMode = null;
   game.buildMode = on;
+  game.buildType = type;
   lastBuildPlayerTile = '';
   if (on) refreshBuildCheck(true);
   else {
@@ -196,7 +246,7 @@ function refreshBuildCheck(force = false) {
   const key = `${Math.floor(game.player.x)},${Math.floor(game.player.y)}`;
   if (!force && key === lastBuildPlayerTile) return;
   lastBuildPlayerTile = key;
-  game.buildSite = playerBuildSite(game);
+  game.buildSite = playerBuildSite(game, game.buildType || 'tower');
   game.buildCheck = game.buildSite.check;
 }
 
@@ -205,18 +255,65 @@ function confirmBuild() {
   refreshBuildCheck(true);
   const site = game.buildSite;
   if (!site) return;
-  const res = tryBuild(game, site.x, site.y);
+  const res = tryBuild(game, site.x, site.y, game.buildType || 'tower');
   if (res.ok) setBuildMode(false);
 }
 
-function upgradeSelected(which) {
+function towerNear(w, radius) {
+  let best = null;
+  let bestD = radius;
+  for (const t of game.towers) {
+    const d = Math.hypot(t.x - w.x, t.y - w.y);
+    if (d < bestD) { bestD = d; best = t; }
+  }
+  return best;
+}
+
+/** D81: X starts a wall from the selected (or occupied) finished tower. */
+function setWallMode(on) {
+  if (!game) return;
+  if (!on) { game.wallMode = null; return; }
   if (game.paused) return;
+  const from = game.towers.find((t) => t.id === (game.selected ?? game.occupiedTowerId));
+  setBuildMode(false);
+  if (!from || !from.built) {
+    game.wallMode = { fromId: null, toId: null, plan: null, note: 'Select a finished tower first, then press X.' };
+    return;
+  }
+  game.wallMode = { fromId: from.id, toId: null, plan: null, note: null };
+}
+
+function refreshWallPlan() {
+  const mode = game.wallMode;
+  if (!mode || mode.fromId === null) return;
+  const hover = towerNear(game.cursor, 1.8);
+  if (hover && hover.id !== mode.fromId) mode.toId = hover.id;
+  mode.plan = mode.toId !== null ? wallPlan(game, mode.fromId, mode.toId) : null;
+}
+
+function confirmWall() {
+  const mode = game.wallMode;
+  if (!mode || mode.fromId === null || mode.toId === null || game.paused) return;
+  const res = tryBuildWall(game, mode.fromId, mode.toId);
+  if (res.ok) game.wallMode = null;
+  else mode.note = res.reasons.join(', ');
+}
+
+function upgradeSelected(which) {
+  if (game.paused || game.selectedBuildingId != null) return;
   const t = game.towers.find((o) => o.id === (game.selected ?? game.occupiedTowerId));
   if (t) tryUpgrade(game, t, which);
 }
 
 function selectedTower() {
   return game.towers.find((o) => o.id === (game.selected ?? game.occupiedTowerId));
+}
+
+function addDebugResources() {
+  if (!game.res) game.res = { food: 0, stone: 0, gold: 0 };
+  game.res.food += 500;
+  game.res.stone += 500;
+  game.res.gold += 500;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +352,7 @@ function debugKill() {
 }
 
 $('pause-toggle').onclick = togglePause;
-$('d-mat').onclick = () => { if (!game.paused) game.materials += 500; };
+$('d-mat').onclick = () => { if (!game.paused) addDebugResources(); };
 $('d-wave').onclick = () => { if (!game.paused) forceNextWave(game); };
 $('d-spawn').onclick = () => { if (!game.paused) debugSpawn(); };
 $('d-dmg').onclick = () => { if (!game.paused) debugDamage(); };
@@ -268,9 +365,13 @@ $('d-pause').onclick = () => {
 };
 $('d-regen').onclick = () => startRun(randomSeed(), game.archetypeKey);
 $('build-toggle').onclick = () => { if (!game.paused) setBuildMode(!game.buildMode); };
-$('build-confirm').onclick = confirmBuild;
+$('build-tower').onclick = () => setBuildMode(true, 'tower');
+$('build-farm').onclick = () => setBuildMode(true, 'farm');
+$('build-quarry').onclick = () => setBuildMode(true, 'quarry');
+$('build-mine').onclick = () => setBuildMode(true, 'mine');
+$('build-confirm').onclick = () => (game.wallMode ? confirmWall() : confirmBuild());
+$('build-wall').onclick = () => setWallMode(!game.wallMode);
 $('up-weapon').onclick = () => upgradeSelected('weapon');
-$('up-extract').onclick = () => upgradeSelected('extraction');
 
 // ---------------------------------------------------------------------------
 // Frame loop
@@ -291,7 +392,23 @@ window.holdfast = {
       const state = setPaused(game, paused);
       if (state) audio.suspendForPause(); else audio.resumeAfterPause();
       return state;
-    }, equipmentState, depositRichness,
+    }, equipmentState,
+    keepState: () => keepState(game),
+    resourceState: () => resourceState(game),
+    buildingState: () => buildingState(game),
+    resourceSitesState: () => resourceSitesState(game),
+    siteState: () => resourceSitesState(game),
+    keepFieldState: () => keepFieldState(game),
+    enemyKeepField: (type) => {
+      const field = enemyKeepField(game, type);
+      return field ? new Float32Array(field) : null;
+    },
+    cameraState: () => ({ ...view }),
+    wallPlan: (a, b) => wallPlan(game, a, b),
+    tryBuildWall: (a, b) => tryBuildWall(game, a, b),
+    wallState: () => wallState(game),
+    repairTarget: () => { const t = repairTarget(game); return t ? { id: t.id, wall: !!t.wall, type: t.type || null, hp: t.hp, destroyed: !!t.destroyed } : null; },
+    minimapState: () => layers?.minimapState ? { ...layers.minimapState } : null,
     setAudioEnabled: (enabled) => audio.setEnabled(enabled),
     audioState: () => audio.state,
   },
@@ -334,12 +451,13 @@ function frame(now) {
     layers = {
       terrain,
       terrainDim: buildTerrainDimLayer(terrain),
-      terrainView: null,
       terrainVersion: game.map.terrainVersion || 0,
     };
   }
 
   refreshBuildCheck();
+  refreshWallPlan();
+  updateCamera();
   draw(ctx, game, layers, view);
 
   hudAccum += dt;

@@ -2,8 +2,10 @@
 // Distances are in TILES unless the name says px. Times are in seconds.
 
 export const MAP = {
-  w: 104,           // compact enough for the entire battlefield to stay visible
-  h: 52,            // enough north/south room for alternate routes
+  // D79: four times the old map area. Rendering uses a follow camera; these
+  // dimensions are deliberately still only 2x each axis, not a 16x-area map.
+  w: 208,
+  h: 104,
 };
 
 // --- tile kinds -------------------------------------------------------------
@@ -34,33 +36,40 @@ export const ELEVATION_NAMES = ['Low', 'Normal', 'High'];
 // --- terrain generation -----------------------------------------------------
 export const GEN = {
   elevationCuts: [0.38, 0.68],
-  ridges: { min: 2, max: 4, thicknessMin: 2, thicknessMax: 4, wander: 7 },
-  ridgeGap: { min: 4, max: 8, minSeparation: 9 },
-  river: { widthMin: 3, widthMax: 6, wander: 11 },
-  fords: { min: 2, max: 4, heightMin: 4, heightMax: 7 },
-  deposits: {
-    // D74: background seams are the Poor/Moderate economy. They combine by
-    // max, not sum, so overlapping seams cannot stack into a Rich carpet.
-    min: 26, max: 38, radiusMin: 4, radiusMax: 9,
-    peakMin: 0.30, peakMax: 0.80, startIncomeTarget: 0.90,
-    // D74: Rich comes only from a few separated jackpots, each solved so the
-    // best site at its centre earns `targetMin..targetMax` Materials/s base.
-    rich: {
-      min: 3, max: 5, radius: 4.5, targetMin: 1.6, targetMax: 2.2,
-      minSeparation: 22, minFromStart: 18, candidates: 30, openNeighbourhood: 0.6,
-      seamClearance: 13,     // seam centres keep this far from a jackpot
-    },
-    startExclusionRadius: 12, startBufferRadius: 18, startBufferRejectChance: 0.70,
-    roadSearchRadius: 7, roadDistanceNormalizer: 8,
-    distanceWeight: 0.70, roadDistanceWeight: 0.30,
-    awkwardnessWeight: 0.65, randomWeight: 0.50,
-    distanceMapFraction: 0.48,
+  // D79: retain the old feature scale and author more barriers rather than
+  // stretching the old 104x52 layout over the larger world.
+  ridges: { min: 4, max: 6, thicknessMin: 2, thicknessMax: 5, wander: 10 },
+  ridgeGap: { min: 5, max: 10, minSeparation: 11 },
+  river: { widthMin: 4, widthMax: 7, wander: 15 },
+  fords: { min: 4, max: 6, heightMin: 5, heightMax: 9, minSeparation: 10 },
+  startClearRadius: 7,
+  maxAttempts: 4,      // bounded strict retries keep the 4x-area generator practical
+  maxRelaxedAttempts: 10,
+  readableExtraAttempts: 0, // readability remains gated; do not multiply full-map attempts
+};
+
+// D80: physical resource geography. Fertility is a tile layer (0/1/1.5),
+// while stone and gold are point sites with the matching multipliers.
+export const RESOURCE_GEN = {
+  nearRadius: 16,
+  goldExclusionRadius: 28,
+  middleRadius: 58,
+  farRadius: 62,
+  siteEdgeMargin: 4,
+  farmland: {
+    minBlobs: 14, maxBlobs: 20, radiusMin: 3, radiusMax: 5,
+    minNearFarms: 2, nearCentreMin: 5, minSeparation: 7,
+    fertile: 1.0, rich: 1.5,
+    richFrom: 22, richChanceMiddle: 0.72, richChanceFar: 0.9,
   },
-  ambientResource: 0.10,   // every site yields a trickle; deposits are where it pays
-  startClearRadius: 4,
-  maxAttempts: 24,     // strict validation attempts (D2)
-  maxRelaxedAttempts: 40,
-  readableExtraAttempts: 2, // D55: further valid maps tried when roads are not yet clean
+  stone: {
+    min: 9, max: 13, minSeparation: 10, minNear: 1,
+    nearCentreMin: 7, normal: 1.0, rich: 1.6, richFrom: 52,
+  },
+  gold: {
+    min: 4, max: 7, minSeparation: 18,
+    normal: 1.0, rich: 1.6, richFrom: 62,
+  },
 };
 
 // D20-D22: roads are an overlay. These costs are used only while carving the
@@ -72,18 +81,20 @@ export const ROAD = {
   riverCheapRadius: 2,
   riverbankCostMult: 0.48,
   waypointChance: 0.72,
-  waypointYOffsetMin: 8,
-  waypointYOffsetMax: 18,
-  parallelRouteFraction: 0.9,   // D55: was 0.62; a wide alternate must hold its own line most of the half
-  parallelRouteYOffsetMin: 12,
-  parallelRoadAvoidRadius: 6,  // D55: was 3, which bred strands 3-4 tiles apart
-  branchClearRadius: 7,        // D55: avoidance lifted round an alternate's fork point
-  entryTrunkLength: 3,         // D54: tiles an alternate shares with its mouth's primary route
+  waypointYOffsetMin: 14,
+  waypointYOffsetMax: 34,
+  parallelRouteFraction: 0.88,
+  parallelRouteYOffsetMin: 20,
+  parallelRoadAvoidRadius: 8,
+  branchClearRadius: 9,
+  entryTrunkLength: 4,
   parallelRoadAvoidCost: 8.0,
   laneDiscount: 0.32,
   connectorsMin: 1,
-  connectorsMax: 2,
-  startOffset: 4,
+  connectorsMax: 3,
+  mouthsPerSide: 4,
+  mouthMinSeparation: 16,
+  startOffset: 6,
 };
 
 // D49: road exposure and road-knot measurement. Generation (D51/D52) uses it to
@@ -122,8 +133,8 @@ export const READABILITY = {
 
 // D52: authored exposure features - a short impassable spine the road must wrap.
 export const EXPOSURE_GEN = {
-  targetMin: 2,
-  targetMax: 4,
+  targetMin: 3,
+  targetMax: 5,
   maxTries: 24,            // candidate stretches tried per map before giving up
   segmentHalf: 14,         // furthest route tiles searched either side for the re-laid stretch ends
   depthMin: 5,             // spine length out from the old road line
@@ -136,8 +147,8 @@ export const EXPOSURE_GEN = {
   pocketOffset: 2.5,       // tower pocket centre past the spine tip
   otherRoadClearance: 2,   // a feature keeps this far from any other road
   minWalkedOnRoad: 0.9,
-  minFromStart: 12,
-  minApart: 16,
+  minFromStart: 16,
+  minApart: 22,
 };
 
 // D2: a map must satisfy these or it is thrown away and regenerated.
@@ -145,12 +156,12 @@ export const VALID = {
   minRoutesPerBarrier: 2,   // >=2 topologically distinct ways through each barrier
   minGapTiles: 3,           // no single-tile funnel that trivializes the game
   chokepointMaxTiles: 12,   // a pass this narrow or narrower genuinely funnels
-  minChokepoints: 2,        // the map must offer real chokepoints, not just routes
+  minChokepoints: 4,        // the larger map must offer several meaningful funnels
   openFracMin: 0.30,        // not a maze
   openFracMax: 0.66,        // not a featureless field
   minForestFrac: 0.05,
   parallelRouteMedianMin: 2,
-  parallelRouteColumnsWithThreeMin: 3,
+  parallelRouteColumnsWithThreeMin: 10,
 };
 
 // --- player -----------------------------------------------------------------
@@ -179,9 +190,9 @@ export const VISION = {
 
 // --- towers -----------------------------------------------------------------
 export const TOWER = {
-  cost: 100,
-  costPerExisting: 45,      // each tower you already own makes the next dearer:
-                            // a materials sink, and a cap on blanketing the map
+  // D80: the next tower costs 30 more Stone per non-Keep tower already owned.
+  cost: { food: 30, stone: 55 },
+  costStonePerExisting: 30,
   maxHp: 520,
   radius: 0.95,
   minSpacing: 7.0,          // no stacking towers in one tiny area
@@ -196,27 +207,68 @@ export const TOWER = {
   forestClearRadius: Math.sqrt(5),
 
   weapon: { damage: 11, fireRate: 1.6, range: 7.5 },
-  extraction: { radius: 4.5, baseRate: 0.85, normalizer: 30 },
-
   upgrade: {
     maxLevel: 3,
     buildTime: [15, 25, 40],
-    weaponCost: [140, 230, 360],
-    extractionCost: [120, 200, 320],
+    weaponCost: [
+      { stone: 50, gold: 30 },
+      { stone: 90, gold: 70 },
+      { stone: 150, gold: 130 },
+    ],
     weaponDamagePerLevel: 0.45,   // +45% damage per level
     weaponRatePerLevel: 0.18,
     weaponRangePerLevel: 0.8,     // +0.8 tiles per level
-    extractRatePerLevel: 0.55,  // D75: efficiency only; the 4.5-tile footprint never grows
   },
 
-  repair: { hpPerSec: 11, costPerHp: 0.6, occupiedMult: 4.0 },
+  repair: { hpPerSec: 11, costPerHp: 0.35, occupiedMult: 4.0, reach: 2.5 },
+};
+
+// D77: the Keep is the generated starting tower, but has its own footprint and
+// durability. Its weapon and upgrades continue to use TOWER values.
+export const KEEP = {
+  maxHp: 2000,
+  radius: 1.25,
+};
+
+// D80: one-tile, non-blocking economic buildings. Cost escalation for farms
+// is applied by the game from `costFoodPerExisting`.
+export const BUILDINGS = {
+  farm: {
+    type: 'farm', name: 'Farm', cost: { food: 40 }, costFoodPerExisting: 12,
+    buildTime: 8, maxHp: 160, baseRate: 0.55, resource: 'food',
+  },
+  quarry: {
+    type: 'quarry', name: 'Quarry', cost: { food: 50, stone: 15 },
+    buildTime: 10, maxHp: 220, baseRate: 0.45, resource: 'stone', siteRange: 1.5,
+  },
+  mine: {
+    type: 'mine', name: 'Gold Mine', cost: { food: 60, stone: 50 },
+    buildTime: 12, maxHp: 260, baseRate: 0.18, resource: 'gold', siteRange: 1.5,
+  },
+};
+
+export const START_RESOURCES = { food: 150, stone: 280, gold: 0 };
+
+// D82: a blocker (wall segment or non-Keep tower footprint tile) costs
+// breakBias x the distance an enemy could walk in the time it takes to break it.
+export const WALL_PATH = { breakBias: 1.5 };
+
+// D81: walls run tile by tile between two finished tower anchors.
+export const WALL = {
+  maxLength: 13,            // tower centre to tower centre, tiles
+  costStonePerSegment: 6,
+  segmentHp: 260,
+  buildBase: 3.0,           // seconds; a link takes buildBase + buildPerTile x segments
+  buildPerTile: 0.8,
+  buildHpFraction: 0.30,    // every segment blocks from the start, at 30% hp
+  crackAt: [0.66, 0.33],    // visible crack stages
+  breachMessageInterval: 2.0,
 };
 
 // D7/§7: base Occupied Tower bonus, before archetype. Deliberately strong.
 export const OCCUPANCY = {
   damage: 1.5,
   fireRate: 1.35,
-  extraction: 1.5,
   repair: TOWER.repair.occupiedMult,
   construction: 2.5,
   damageTaken: 1.0,
@@ -234,13 +286,17 @@ export const ARCHETYPES = {
     repairCostMult: 0.55,
     detail: ['Repair x6.5 (vs x4)', 'Repair cost x0.55', 'Occupied tower takes 25% less damage', 'Builds x3.6 faster'],
   },
+  // Preserve the long-standing key for saved/UI selections while D80 changes
+  // the archetype's player-facing identity and removes occupancy extraction.
   prospector: {
-    name: 'Prospector',
+    name: 'Steward',
     color: '#ffd166',
-    blurb: 'Occupied tower pulls far more Materials out of the ground.',
-    occupancy: { extraction: 2.6 },
+    blurb: 'Builds farms, quarries and mines more cheaply and quickly.',
+    occupancy: {},
+    buildingCostMult: 0.75,
+    buildingBuildMult: 1.6,
     repairCostMult: 1.0,
-    detail: ['Extraction x2.6 (vs x1.5)', 'Standard weapon and repair bonus'],
+    detail: ['Economic building cost x0.75', 'Economic building construction x1.6', 'Standard weapon and repair bonus'],
   },
   gunner: {
     name: 'Gunner',
@@ -253,25 +309,21 @@ export const ARCHETYPES = {
 };
 
 // --- enemies ----------------------------------------------------------------
-// D76: towerDps is unused since every tower contact became a breach; kept for reference.
 export const ENEMIES = {
   swarm: {
     name: 'Swarm', color: '#c98bd8', radius: 0.34,
-    hp: 30, speed: 3.8, towerDps: 6, playerHit: 32, cost: 4, unlockWave: 1,
-    breachFrac: 0.06,        // D73/D76: of the target tower's max hp, once, on contact
-    role: 'structures',      // D76: commits to a tower and ignores the player's retreat
+    hp: 30, speed: 3.8, structDps: 5, playerAggroRange: 3,
+    playerHit: 32, cost: 4, unlockWave: 1,
   },
   runner: {
     name: 'Runner', color: '#78e08f', radius: 0.30,
-    hp: 46, speed: 5.8, towerDps: 8, playerHit: 38, cost: 7, unlockWave: 2,
-    breachFrac: 0.09,
-    role: 'player',          // D76: hunts the exposed player, drops an abandoned tower
+    hp: 46, speed: 5.8, structDps: 4, playerAggroRange: 6,
+    playerHit: 38, cost: 7, unlockWave: 2,
   },
   heavy: {
     name: 'Heavy', color: '#e8833a', radius: 0.62,
-    hp: 270, speed: 1.7, towerDps: 34, playerHit: 55, cost: 22, unlockWave: 3,
-    breachFrac: 0.25,
-    role: 'structures',
+    hp: 270, speed: 1.7, structDps: 45, playerAggroRange: 1.5,
+    playerHit: 55, cost: 22, unlockWave: 3,
   },
 };
 
@@ -280,6 +332,9 @@ export const ENEMY = {
   playerAttackRange: 0.95,   // enemies en route swipe at a player who gets close
   playerHitCooldown: 1.0,
   separation: 0.55,
+  econAggroRange: 2.0,
+  playerLeash: 4.0,
+  playerGiveUpRangeMult: 1.6,
   // D31: hunters aim where the player is GOING, not where they are. This is
   // what closes circular kiting - a curve is trivial to intercept once the
   // pursuer cuts the corner - without a leash, an aura or a speed buff.
@@ -287,10 +342,9 @@ export const ENEMY = {
   pursuitLeadRange: 12,      // only lead when close enough to actually cut in
 };
 
-// D73: the occupied tower is the endpoint. An enemy that touches it breaches
-// once - burst damage, then it is gone - instead of sieging it over time.
+// D78 keeps the old breach audiovisual vocabulary for sustained structure
+// impacts; these values affect feedback only, never damage or enemy lifetime.
 export const BREACH = {
-  contactGap: 0.25,          // contact = tower radius + enemy radius + this
   floaterMerge: 0.5,         // seconds: close breaches share one BREACH floater
   messageInterval: 3.0,      // seconds between log lines per tower
   shake: 0.35,               // seconds of tower jitter per breach
@@ -305,41 +359,35 @@ export const STUCK = {
   maxRecoveries: 3,
 };
 
-// D5: aggro moves as a rolling commitment, never a synchronized 180.
-export const AGGRO = {
-  // D53: towers have no baseline aggro; the occupied tower or the exposed
-  // player is the one strategic target, so score weights are gone.
-  directPursuitRange: 12,    // beyond this, hunters travel toward the player by road
-  releaseDelayMax: 0.9,      // D76: Runners drop a just-abandoned tower within this
-  retargetMin: 2.0,
-  retargetMax: 4.0,
-};
-
 // --- waves ------------------------------------------------------------------
 export const WAVE = {
-  totalToSurvive: 8,
+  // D83: ten waves; pressure comes from budget, Heavy share, hp and structural
+  // damage - never from speed.
+  totalToSurvive: 10,
   prepFirst: 40,
   prep: 20,
   warning: 7,
   aftermath: 3,
   budgetBase: 40,
-  budgetPerWave: 40,
+  budgetPerWave: 36,
+  budgetAccel: 2,           // extra budget x (wave-1)^2: late waves become formations
+  structScalePerWave: 0.06,    // structural damage grows with the wave
   spawnWindowMin: 14,
   spawnWindowMax: 24,
   maxClusters: 5,
   clusterSpread: 1.4,        // seconds a single cluster takes to come through
   bothSidesFromWave: 4,
   hpScalePerWave: 0.15,      // enemies get steadily tougher, not just more numerous
-  heavyBiasPerWave: 0.30,    // later waves lean on Heavies rather than more Swarms
+  heavyBiasPerWave: 0.40,    // later waves lean on Heavies rather than more Swarms
 };
 
-// D72: the start tower plus two immediate builds (145 + 190), 15 left over.
-export const START_MATERIALS = 350;
-
-// Readability floors for the fixed whole-map view. World-space rings still use
-// the fitted tile scale; only the important entities and their labels/bars floor.
+// D79: camera defaults and D19 readability floors for important entities.
 export const RENDER = {
   baseTilePx: 18,
+  minTilePx: 10,
+  maxTilePx: 28,
+  minimapWidthPx: 260,
+  minimapHeightPx: 130,
   towerMinRadiusPx: 10,
   playerMinRadiusPx: 5,
   enemyMinRadiusPx: 3.5,
@@ -349,42 +397,23 @@ export const RENDER = {
   resourceMarkerMinTilePx: 10,
 };
 
-// The exact extraction-rate thresholds used by both labels and bar glyphs.
-export const RICHNESS = {
-  poorMax: 0.62,
-  moderateMax: 1.18,
-  tiers: [
-    { key: 'poor', name: 'Poor', bars: 1 },
-    { key: 'moderate', name: 'Moderate', bars: 2 },
-    { key: 'rich', name: 'Rich', bars: 3 },
-  ],
-};
-
-export function richnessTierForRate(rate) {
-  return rate < RICHNESS.poorMax ? RICHNESS.tiers[0]
-    : rate < RICHNESS.moderateMax ? RICHNESS.tiers[1]
-    : RICHNESS.tiers[2];
-}
-
 // --- drops ------------------------------------------------------------------
 export const DROP = {
   chance: 0.18,
   lifetime: 16,
   pickupRadius: 0.9,
   effectDuration: 20,
-  categoryWeights: { temporary: 0.70, materials: 0.22, equipment: 0.08 },
-  materialsCache: { name: 'Materials Cache', color: '#ffd166', min: 24, max: 42 },
+  categoryWeights: { temporary: 0.70, supply: 0.22, equipment: 0.08 },
+  supplyCache: { name: 'Supply Cache', color: '#ffd166', min: 24, max: 42, resources: ['food', 'stone'] },
   equipmentCap: 4,
   temporary: {
     repair: { name: 'Repair Kit', color: '#5ecbff', instant: true, healFrac: 0.35, playerHeal: 25 },
     damage: { name: 'Damage +60%', color: '#ff6b6b', mult: 1.6 },
-    extraction: { name: 'Extraction +80%', color: '#ffd166', mult: 1.8 },
     speed: { name: 'Move Speed +45%', color: '#78e08f', mult: 1.45 },
   },
   equipment: {
     reinforcedBarrel: { name: 'Reinforced Barrel', color: '#ffe08a', towerDamage: 1.25 },
     targetingModule: { name: 'Targeting Module', color: '#d8c4ff', towerRange: 1.20 },
-    extractionChip: { name: 'Extraction Chip', color: '#ffd166', extraction: 1.25 },
     armourPlate: { name: 'Armour Plate', color: '#a9c6d9', playerDamageTaken: 0.75 },
     boots: { name: 'Boots', color: '#78e08f', playerSpeed: 1.20 },
     repairRig: { name: 'Repair Rig', color: '#5ecbff', repairCost: 0.60, repairSpeed: 1.40 },
@@ -401,7 +430,8 @@ export const AUDIO = {
   farDistance: 42,
   rateLimits: {
     towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
-    heavyTowerHit: 0.22, breach: 0.12, heavyBreach: 0.2, towerUnderAttack: 2.5, collapsing: 0.75, repair: 0.16, default: 0.08,
+    heavyTowerHit: 0.22, breach: 0.12, heavyBreach: 0.2, towerUnderAttack: 2.5,
+    wallHit: 0.14, heavyWallHit: 0.2, wallBreak: 0.25, collapsing: 0.75, repair: 0.16, default: 0.08,
   },
   limiter: { threshold: -12, ratio: 16 },
   envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
@@ -409,13 +439,14 @@ export const AUDIO = {
     towerFire: [260, .10, 'square'], enemyHit: [430, .045, 'sine'], enemyDeath: [330, .14, 'triangle'],
     towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'],
     breach: [64, .42, 'sawtooth'], heavyBreach: [38, .75, 'sawtooth'], towerDestroy: [56, .72, 'triangle'],
+    wallHit: [92, .16, 'triangle'], heavyWallHit: [44, .34, 'sawtooth'], wallBreak: [34, .9, 'sawtooth'],
     collapsing: [92, .70, 'sawtooth'], playerDamage: [880, .11, 'square'], exposed: [720, .16, 'sawtooth'],
     towerEntry: [145, .18, 'triangle'], constructionStart: [180, .13, 'square'], constructionComplete: [620, .24, 'triangle'],
     repair: [760, .06, 'sine'], upgradeStart: [180, .13, 'square'], upgrade: [720, .18, 'triangle'],
     towerUnderAttack: [105, .32, 'sawtooth'], waveWarning: [185, .40, 'sawtooth'],
     waveStart: [230, .32, 'sawtooth'], finalWave: [155, .48, 'sawtooth'], victory: [660, .38, 'triangle'], playerDeath: [110, .44, 'sawtooth'],
   },
-  dropFrequencies: { temporary: 620, materials: 310, equipment: 880 },
+  dropFrequencies: { temporary: 620, supply: 310, equipment: 880 },
   // D47: positive confirmations RISE in pitch; everything else falls. A falling
   // tone reads as failure, so a descending victory sting says the wrong thing.
   risingCues: ['victory', 'constructionComplete', 'upgrade', 'dropCollect'],

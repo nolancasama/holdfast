@@ -1101,3 +1101,300 @@ replaces prolonged siege; re-choosing the closest tower every retarget
 (zigzag); Euclidean replacement (ranks towers behind cliffs); per-enemy A*;
 keeping the dormant siege path alongside breach (it risked siege DPS and a
 breach from one arrival).
+
+## 2026-10-04 — Fortress rework: Keep, walls, physical economy, larger world
+
+Frozen by the controller before implementation, from the user's fortress
+brief. Numbers marked *start* are starting values: an implementer may tune
+them using the economy/wave simulations, and must record the final values
+here. Everything else is the contract.
+
+### D77 — The start tower becomes the Keep; the Keep is the loss condition
+**Decision:** the generated start tower is the Keep (`t.keep = true`). It keeps
+its position, fires like a tower, can be occupied and takes weapon upgrades.
+It has its own HP (*start* 1400, vs 520 for a tower), a larger radius (*start*
+1.25), a distinct drawing (square bastion, banner) and a `KEEP` label. Defeat is
+the Keep destroyed (`lost/'keep'`) or the player dead (`lost/'died'`, which
+keeps priority). D64's "every tower lost" defeat is retired: secondary towers
+are never required to fall first.
+**Why:** a single, legible heart gives the army a destination and the player
+something to build around.
+**Rejected:** a separate non-shooting Keep object (a needless new entity; the
+start tower already sits in the right place).
+
+**Phase-1 final values:** retained the starts unchanged: Keep 1,400 HP and
+1.25-tile radius. The ordinary tower remains 520 HP / 0.95 radius.
+
+### D78 — Enemies march on the Keep; the player is a target of opportunity
+**Decision:** roles `'player'`/`'structures'`, D53 release, D76 tower
+commitment and the D73 contact breach (attacker removed on contact) are
+retired. Every enemy's strategic goal is the Keep, read from a per-enemy-type
+flow field (D82). Structure attacks are sustained melee: each type has
+`structDps` (*start* Swarm 5, Runner 4, Heavy 45) applied while within attack
+reach. Attacks hit:
+- the Keep, on arrival;
+- a wall segment or tower that blocks the enemy's next field step (D82);
+- an economic building whose edge is within `ENEMY.econAggroRange` (*start*
+  2.0 tiles) of the enemy: it diverts, attacks until the building dies, then
+  resumes the march. Towers are not attacked opportunistically, only when
+  they block.
+
+Player: an enemy diverts to the player only when the player is within its
+`playerAggroRange` (*start* Swarm 3, Runner 6, Heavy 1.5) with line of sight,
+and gives up after `playerLeash` seconds (*start* 4) or when the player is
+beyond 1.6x that range, then returns to the Keep field. A sheltered player
+keeps melee immunity. Runners keep their speed and become breach exploiters,
+not hunters. The breach FX/audio vocabulary (bursts, shockwave rings,
+`breach`/`heavyBreach` cues, merged floaters, tower shake, unseen-attack alarm)
+is kept and reused for structure hits and wall-segment destruction.
+**Why:** the player leaving the fortress must not turn the whole army around.
+**Rejected:** keeping contact breach for the Keep only (two attack models for
+one game); enemies retargeting every economic building on the map.
+
+**Phase-1 final values:** retained `structDps` 5 / 4 / 45 and player aggro
+ranges 3 / 6 / 1.5 for Swarm / Runner / Heavy, with a 4-second leash, 1.6x
+give-up distance and 2-tile economy aggro range. Speeds are unchanged.
+
+### D79 — 208x104 world with a follow camera and minimap (reverses D19)
+**Decision:** `MAP` becomes 208x104 (4x area, not 16x). The fixed whole-map
+view cannot show that legibly (~7px/tile at 1600x900), so a camera returns: it
+follows the player at *start* 18px per tile (mouse wheel and `-`/`=` zoom
+between about 10 and 28), clamped to the map, drawing only tiles in view. The
+D19 entity-size floors stay. A compact minimap (bottom-right, about 260x130
+CSS px) shows explored terrain only (unexplored is black): roads, walls,
+towers, the Keep (distinct), economic buildings, discovered resource sites,
+the player with facing, the camera rectangle, and red edge arrows for the
+incoming side(s) once the wave warning has announced them. It is drawn from a
+cached offscreen layer updated incrementally as tiles become explored, not
+re-rendered from the map every frame. When the Keep is off screen an edge
+arrow on the main view points to it. Terrain generation, roads, fog, spawn
+mouths and validation are re-parameterised for the larger map, not
+stretched: more ridges, gaps, fords and exposure features, more spawn mouths
+per side, and distance-graded resources (D80). Generation must stay practical
+(target median under about 3s per map in Node).
+**Why:** a larger world is what makes expansion and claimed territory mean
+something; 4x area keeps travel tolerable at the current player speed.
+**Rejected:** 16x area; keeping the fit-to-screen view at 208x104.
+
+**Phase-1 final values:** 18 px/tile default zoom, clamped 10-28, and a
+260x130 CSS-pixel target minimap. Warm 20-seed generation measured 880.8 ms
+minimum, 1,935.8 ms median, 3,141.0 ms p90 and 6,609.8 ms maximum; all 20
+maps passed validation and resource geography (19 strict, one relaxed).
+
+### D80 — Food, Stone, Gold from physical buildings; extraction removed
+**Decision:** generic Materials, tower extraction (radius, resource score,
+income, extraction upgrades, occupancy extraction bonus), the deposit
+richness field, Rich jackpots and their markers are removed. Three resources
+replace them, held as `g.res = { food, stone, gold }`.
+
+Sites are generated as discrete, visible map features:
+- **Farmland**: fertile ground on Plain (not road), in blobs, with two tiers
+  (fertile x1.0, rich soil x1.5). A Farm is valid where most of its 3x3 is
+  fertile; output scales by mean fertility. Farms keep 3 tiles apart.
+- **Stone deposits**: rock outcrops, tiers normal/rich (x1.0/x1.6). A Quarry
+  must be within 1.5 tiles of an unclaimed stone site centre; one per site.
+- **Gold deposits**: rarer (*start* 4-7 per map), tiers normal/rich. One Gold
+  Mine per site.
+
+Geography (validated at generation): within about 16 tiles of the Keep,
+fertile land for at least two farms and one modest stone site, and no gold
+closer than about 28 tiles; middle distance carries stronger farmland,
+meaningful stone and the first gold; far territory the best stone and gold.
+Sites under fog are unknown to the player, the HUD and the minimap until
+explored.
+
+Buildings (Farm, Quarry, Gold Mine) are map objects with position, cost,
+construction time, HP, a scaffold state, a visible producing state and
+destruction (rubble; the site is freed). They do not block movement or flow
+fields; they are attacked under D78. Production is automatic while built and
+alive, in every phase, frozen by pause; there is no depletion, no workers, no
+hauling, no population and no upkeep. *Start* values: Farm 0.55 Food/s,
+Quarry 0.45 Stone/s, Mine 0.18 Gold/s (x tier); HP Farm 160, Quarry 220, Mine
+260; build 8 / 10 / 12 s.
+
+Costs, each resource with an identity (*start*): Tower 30 Food + 55 Stone, +30
+Stone per non-Keep tower owned; Farm 40 Food, +12 per farm owned; Quarry 50
+Food + 15 Stone; Gold Mine 60 Food + 50 Stone; Wall 6 Stone per segment;
+Weapon upgrades W1/W2/W3 = 50/90/150 Stone + 30/70/130 Gold (Gold is never
+needed for basic towers or walls); repair 0.35 Stone per HP for every
+structure. Start resources (*start*): 150 Food, 280 Stone, 0 Gold, enough for
+two towers, a farm and two medium walls. An automated economy simulation must
+justify the final values.
+
+Construction stays local (D57): every building is placed at the player's
+build site. Archetype Prospector becomes **Steward**: economic buildings cost
+x0.75 and build x1.6 faster (occupancy has no economic bonus). Drops: the
+Materials Cache becomes a Supply Cache (Food or Stone); the Extraction
+temporary effect and the Extraction Chip are removed.
+**Why:** resources matter when they are infrastructure that can be lost, and
+their location creates the expansion question "can I defend that?".
+**Rejected:** renaming Materials; Wood, population and workers (deferred by
+the brief); depletion.
+
+**Phase-1 final values and simulation evidence:** retained all starts:
+150 Food / 280 Stone / 0 Gold; Tower 30 Food + 55 Stone (+30 Stone per
+non-Keep tower), Farm 40 Food (+12 per owned Farm), Quarry 50 Food + 15 Stone,
+Mine 60 Food + 50 Stone; production 0.55 / 0.45 / 0.18 per second; HP
+160 / 220 / 260; build times 8 / 10 / 12 seconds. The real-code eight-seed
+scripted opening buys two towers, a Farm and a Quarry at 0.0s on every seed.
+The first Mine becomes affordable at 148.4-204.5s (median 204.5s). Median
+Food / Stone / Gold totals at minutes 1-5 are respectively 15.9/150.2/0.0,
+34.2/177.2/0.0, 52.5/204.2/0.0, 10.9/181.2/5.5, and
+29.2/208.2/16.3. This preserves the intended immediately buildable fortress
+opening while making the first Gold expansion a later commitment.
+
+### D81 — Walls run between tower anchors, tile by tile, with postern gates
+**Decision:** a wall link joins two finished towers (the Keep counts),
+centre-to-centre at most `WALL.maxLength` (*start* 13 tiles). Workflow: select
+tower A, press Wall (`X` or the button), click tower B, see the preview
+(tiles, cost, a reason when invalid), confirm. The player must be within
+presence range of A or B to start it (local initiation); construction then
+continues unassisted, with the D57 presence multiplier. The line is a
+4-connected (supercover) tile line between the centres, excluding the two
+tower footprints, so it has no diagonal leaks. Cliff and deep-water tiles on
+the line are skipped (already barriers, not charged). Invalid when either end
+is not a finished tower, the link is too long or a duplicate, or a tile lies
+under another tower, an economic building or an existing wall segment, or
+the player cannot afford it. Walls may cross roads.
+
+Each tile is a segment with its own HP (*start* 260). A link builds as a unit
+over `3 + 0.8 x tiles` seconds, with every segment present and blocking from
+the start and HP rising from 30%, so an unfinished wall is fragile. A
+destroyed segment becomes passable rubble with breach FX and a `Wall
+breached` log; holding Repair at rubble rebuilds it for Stone if no unit stands
+in it. Segments show HP bars when damaged and crack stages at 66% and 33%.
+When an anchor tower falls, its walls stay.
+
+**Traversal:** the segment adjacent to each anchor is a postern gate. It blocks
+enemies exactly like wall (same HP, same path cost), but the player walks
+through it, so the player can always leave or enter at a tower end.
+**LOS:** walls are not terrain and never block sight; friendly towers fire
+over them.
+**Why:** tower placement becomes fortress geometry, and the anchor rule,
+length limit and Stone cost prevent painting mazes.
+**Rejected:** free-form walls; one HP pool per link; open gaps at anchors
+(enemies would stream through).
+
+### D82 — A wall's path cost is the time it takes to break it
+**Decision:** each enemy type has its own Keep flow field. Wall segments and
+non-Keep tower footprints are not impassable in it: entering one costs
+`WALL_PATH.breakBias x (maxHp / structDps(type)) x speed(type)` extra tiles,
+the distance the enemy could have walked in the time the break takes. With
+*start* breakBias 1.5, a Swarm accepts detours of about 300 tiles before
+breaking a full-HP segment and a Heavy only about 15. So walls redirect when a
+route exists, a fully enclosed Keep is attacked instead of leaving enemies
+stuck, and Heavies are the wall breakers. When an enemy's next field step is a
+blocking tile it stops and attacks that segment or tower. Fields recompute
+only when blocking geometry changes (wall link started, segment destroyed or
+rebuilt, tower built or destroyed). They use max HP, not current HP, so damage
+does not thrash them. Movement collision treats wall segments and tower
+footprints as solid for enemies; for the player, walls are solid except at
+posterns. Stuck recovery treats them as impassable.
+**Why:** one principled rule produces the drama the brief asks for: Swarms
+funnel around a wall, a Heavy arrives and smashes it, and the field reroutes
+everyone through the breach.
+**Rejected:** "always attack the nearest wall"; fixed detour thresholds;
+per-enemy A*.
+
+**Phase-1 final value:** retained `breakBias = 1.5`. Only non-Keep tower
+footprints register in the blocker layer in phase 1; walls remain unimplemented.
+
+### D83 — Repair and upgrades are local; pressure is retuned after the fortress works
+**Decision:** repair (hold R) applies only to a structure the player is within
+reach of (*start* 2.5 tiles of its edge, or sheltering in it); repairing a
+selected but distant structure is removed. Upgrades also require the player
+within presence range of the tower. Once walls and pathing work, enemy
+pressure is raised mainly through wave budget, Heavy share, later-wave HP and
+structural damage, not speed (speeds stay 3.8/5.8/1.7). The run lengthens to
+10 waves.
+**Why:** the brief forbids remote repair; walls add defensive power that the
+waves must answer without turning enemies into fast bullet sponges.
+
+**Phase-1 final value:** retained repair reach at 2.5 tiles from a structure's
+edge (or sheltering inside it). The wave count remains eight until phase 2.
+
+## 2026-10-04 — Fortress rework phase 2: walls, break-cost pathing, retune
+
+Implemented by Claude directly at the user's instruction (Codex was
+usage-limited after phase 1). Final values below supersede the *start* values
+above.
+
+### D84 — Wall implementation details (D81 as built)
+**Decision:** as D81, with these specifics. Final values: `WALL.maxLength` 13,
+6 Stone per segment, 260 hp per segment, build time `3 + 0.8 x segments`
+seconds, 30% starting hp; cracks at 66%/33%. Walls start with `X` on the
+selected (or occupied) finished tower, then a click on the target tower or
+Enter; the preview recolours live with the first refusal reason. A destroyed
+segment shows a `BREACH` floater, a shockwave and the `wallBreak` cue; Heavy
+hits use `heavyWallHit`, others `wallHit`. Repair (hold R) works on the
+occupied tower if damaged, else the selected structure if in reach, else the
+nearest damaged structure in reach (walls and rubble included); cyan brackets
+mark the current repair target. Holding R at rubble rebuilds it to 30% hp for
+one segment's Stone, then ordinary repair continues. Movement collision lets
+an entity leave the tile it already stands in, so a wall laid over a unit
+never traps it.
+**Why:** the smallest workflow that keeps tower placement as the geometry.
+**Rejected:** rebuilding rubble over time (an extra state for no new choice).
+
+### D85 — Break cost belongs to the blocker tile; no corner squeezing
+**Decision:** the phase-1 groundwork charged a blocker's break cost on the
+tile beyond it, so a blocker read as cheap to an adjacent enemy and enemies
+beside a wall would attack it even when walking round was cheaper. The cost
+now belongs to the blocker tile itself (its own field value includes the
+break). Diagonal field steps and steering may not pass the corner of any
+blocker, so two diagonally touching blockers cannot leak. Per-type Keep fields
+are keyed by blocker version, Keep tile and map, so a cached field can never be
+read against the wrong board. Enemies divert to an economic building, the
+player, or swipe at the player only along a line no wall segment or tower
+footprint crosses: a wall shelters what is behind it.
+**Why:** walls must redirect when a route is reasonable; the old charge made
+"go around" lose to "attack" on contact.
+**Rejected:** a fixed adjacency rule ("never attack a wall you can walk round").
+
+### D86 — Pressure retune and a tougher Keep (D83 as built)
+**Decision:** ten waves. Wave budget `40 + 36(w-1) + 2(w-1)^2` (wave 10 = 526,
+1.6x the old final wave), Heavy bias 0.40 per wave past unlock (was 0.30),
+structural damage x(1 + 0.06(w-1)) (wave 10 Heavy ~69 dps on structures),
+hp scaling unchanged at +15% per wave, speeds unchanged. The Keep rises to
+2,000 hp (from 1,400): a single late breach became an instant loss, and a
+breach should be a crisis the player can answer by repairing, rebuilding or
+fighting, not the end.
+Evidence, `npm run wave-report` (passive scripted player in the Keep, real
+economy of one farm and one quarry, repairs walls between waves; six seeds):
+- open network (Keep + 2 towers, no walls): falls on wave 5-6.
+- fortress (3-tower ring enclosing the Keep, W1 at wave 4, W2 at wave 7): first
+  breaches on waves 3-6, falls on waves 9-10, won 1 of 6.
+- fortress+ (the same plus 3 outer towers): reaches wave 10 on 4 of 6, won 1.
+Before the retune the fortress won 2 of 3 ten-wave runs losing one segment.
+**Why:** walls added much defensive power; late waves must threaten a
+fortress the player does not keep growing, without fast bullet sponges.
+**Known risk:** the scripted player is passive (no expansion, melee or
+mid-wave rebuilds), so these numbers understate a human; waves 9-10 may still
+be too hard and need hand-play.
+**Rejected:** raising speed; further budget growth (accel 3-4 lost every
+scripted layout by wave 8-9).
+
+### D87 — Design note: walls protect the Keep only when it is inside them
+**Observation, not a rule:** with the Keep as a corner of the fortress (the
+brief's KEEP-B-C triangle), the army simply walks round the walls to the
+Keep's exposed side; the walls then shelter the economy inside, not the Keep.
+Enclosing the Keep needs three towers about 7-7.5 tiles out at 120 degrees
+(towers keep 7 tiles apart; walls reach 13), roughly 30 segments.
+**Why recorded:** it is the main thing a player must learn about fortress
+shape, and the opening cannot afford it immediately (two towers + two short
+walls), which gives the early waves their intended exposure.
+
+### D88 — Larger-map road and test gaps accepted (D79 as built)
+**Decision:** a road repair near the map edge never re-lays a main route's
+boundary entry (edge tile, then mouth), which had stranded a mouth on ALPHA.
+Known gaps on the 20 canonical seeds, asserted as bounds in tests: HOTEL keeps
+one small loop beside the central junction (eight routes converge there);
+TANGO has one boundary-hugging road where deep water meets the east edge;
+readability defects are 0-5 per map (ceiling 6, area x4 and routes x1.6 of the
+old one-per-map). Road analysis budget is 3 s per map (worst measured 2.4 s).
+The preserved-system checks the phase-1 rewrite dropped (98) are restored in
+`test/preserved-tests.js`; checks for retired mechanics (contact breach, D53/
+D76 roles, extraction, Materials, richness, jackpots, the prep bot) stay
+deleted.
+**Why:** the fortress loop is the experiment; full-map road cosmetics matter
+less under a follow camera.

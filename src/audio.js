@@ -2,7 +2,7 @@
 import { AUDIO } from './config.js';
 
 export const AUDIO_PRIORITY = Object.freeze({
-  playerDamage: 10, collapsing: 9, collapsingReminder: 9, heavyBreach: 9, breach: 8, towerUnderAttack: 8, towerDestroy: 8,
+  playerDamage: 10, collapsing: 9, collapsingReminder: 9, heavyBreach: 9, wallBreak: 9, breach: 8, heavyWallHit: 6, wallHit: 4, towerUnderAttack: 8, towerDestroy: 8,
   exposed: 7, towerEntry: 6, waveWarning: 5, heavyTowerHit: 4, upgradeStart: 3,
   towerFire: 3, enemyDeath: 2, enemyHit: 1,
 });
@@ -55,9 +55,9 @@ export function createAudioSystem() {
     const osc = c.createOscillator(); const gain = c.createGain(); const start = c.currentTime;
     const reminder = event.type === 'collapsingReminder'; const kind = reminder ? 'collapsing' : event.type;
     if (reminder) out.gain.value *= AUDIO.collapsingReminderGain;
-    const heavy = kind === 'heavyTowerHit'; const breach = kind === 'breach' || kind === 'heavyBreach';
-    const low = kind === 'towerHit' || heavy || breach || kind === 'towerDestroy' || kind === 'collapsing';
-    if (breach) out.gain.value = 1; // D73: a leak into your own tower is never a distant sound
+    const heavy = kind === 'heavyTowerHit' || kind === 'heavyWallHit'; const breach = kind === 'breach' || kind === 'heavyBreach' || kind === 'wallBreak';
+    const low = kind === 'towerHit' || kind === 'wallHit' || heavy || breach || kind === 'towerDestroy' || kind === 'collapsing';
+    if (breach) out.gain.value = 1; // D78: structure impacts remain prominent at distance
     const dropFreq = AUDIO.dropFrequencies[event.category] || AUDIO.dropFrequencies.temporary;
     const spec = event.type === 'dropSpawn' ? [dropFreq, .16, 'sine']
       : event.type === 'dropCollect' ? [dropFreq * 1.25, .18, 'triangle']

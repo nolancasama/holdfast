@@ -72,7 +72,7 @@ function costFor(map, i, mode, fromI = i) {
   return mode === 'lane' && map.road[i] ? base * ROAD.laneDiscount : base;
 }
 
-export function computeField(map, seeds, mode = 'direct') {
+export function computeField(map, seeds, mode = 'direct', obstacleCosts = null) {
   const dist = new Float32Array(MAP.w * MAP.h).fill(Infinity);
   // D45: each tile is settled exactly once. The heap uses lazy deletion, so a
   // tile can sit in it several times; without this, every stale copy re-relaxed
@@ -100,14 +100,22 @@ export function computeField(map, seeds, mode = 'direct') {
       const ni = idx(nx, ny);
       const cost = costFor(map, ni, mode, i);
       if (!Number.isFinite(cost)) continue;
-      // No corner cutting through a cliff or river bend.
+      // No corner cutting through a cliff or river bend, or past the corner of
+      // a wall segment / tower footprint (D82: walls must have no diagonal leak).
       if (ox !== 0 && oy !== 0) {
-        if (!PASSABLE[map.kind[idx(x + ox, y)]] || !PASSABLE[map.kind[idx(x, y + oy)]]) continue;
+        const c1 = idx(x + ox, y);
+        const c2 = idx(x, y + oy);
+        if (!PASSABLE[map.kind[c1]] || !PASSABLE[map.kind[c2]]) continue;
+        if (obstacleCosts && (obstacleCosts[c1] > 0 || obstacleCosts[c2] > 0)) continue;
       }
       if (settled[ni]) continue;
       // Compare in the same Float32 space the value is stored in, so an equal
       // cost can never register as an improvement through rounding alone.
-      const nd = Math.fround(d + cost * mult);
+      // D82: a blocker's break cost belongs to the blocker tile itself, so its
+      // own field value includes the break. A neighbour then reads it as
+      // expensive and walks round unless breaking really is cheaper.
+      const obstacle = obstacleCosts ? obstacleCosts[ni] || 0 : 0;
+      const nd = Math.fround(d + cost * mult + obstacle);
       if (nd < dist[ni]) {
         dist[ni] = nd;
         heap.push(ni, nd);
@@ -157,7 +165,7 @@ export function findCostPath(map, start, target) {
  * Unit direction that descends the field fastest from a world position.
  * Returns null when the position is stranded (field never reached it).
  */
-export function steer(map, field, x, y) {
+export function steer(map, field, x, y, obstacleCosts = null) {
   const tx = Math.floor(x);
   const ty = Math.floor(y);
   if (!inBounds(tx, ty)) return null;
@@ -173,7 +181,10 @@ export function steer(map, field, x, y) {
     const ni = idx(nx, ny);
     if (!PASSABLE[map.kind[ni]]) continue;
     if (ox !== 0 && oy !== 0) {
-      if (!PASSABLE[map.kind[idx(tx + ox, ty)]] || !PASSABLE[map.kind[idx(tx, ty + oy)]]) continue;
+      const c1 = idx(tx + ox, ty);
+      const c2 = idx(tx, ty + oy);
+      if (!PASSABLE[map.kind[c1]] || !PASSABLE[map.kind[c2]]) continue;
+      if (obstacleCosts && (obstacleCosts[c1] > 0 || obstacleCosts[c2] > 0)) continue;
     }
     const d = field[ni];
     if (d < bestDist) { bestDist = d; best = [nx, ny]; }
@@ -183,5 +194,5 @@ export function steer(map, field, x, y) {
   const dx = best[0] + 0.5 - x;
   const dy = best[1] + 0.5 - y;
   const len = Math.hypot(dx, dy) || 1;
-  return { x: dx / len, y: dy / len };
+  return { x: dx / len, y: dy / len, tx: best[0], ty: best[1], i: idx(best[0], best[1]) };
 }

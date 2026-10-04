@@ -1,14 +1,15 @@
 # Holdfast
 
-A 2D top-down tower-defense / survival **prototype**. It exists to answer one
-question, not to look good:
+A 2D top-down fortress-defense **prototype**. It exists to answer one
+question, not to look good: is building and defending territory fun?
 
-> Explore procedural terrain → place towers → towers automatically harvest and
-> defend → move your avatar between them → your presence makes a tower much
-> stronger *and* makes it the thing everything wants to kill → stay and try to
-> save a failing tower, or abandon it and run.
+> Start with a Keep. Claim useful land. Build a fortress. Protect what makes
+> the fortress worth having. Hold until the walls fail.
 
-Towers are expendable. You are not.
+Explore a 208x104 procedural map for Food, Stone and Gold, raise farms,
+quarries and mines, anchor towers around the Keep and join them with walls.
+Ten waves march on the Keep; walls redirect them into tower fire until a
+Heavy smashes a breach.
 
 ## Run it
 
@@ -33,22 +34,27 @@ npm test                  # headless terrain, pathing, LOS and simulation checks
 | | |
 |---|---|
 | `WASD` / arrows | move |
-| `B` | toggle build mode, then **click** to place |
-| **click** | select a tower |
-| `R` (hold) | repair the selected tower — far faster while you are standing in it |
-| `1` / `2` | weapon / extraction upgrade |
+| `B` | build menu (Tower, Farm, Quarry, Gold Mine); `Enter`/click builds where you stand |
+| **click** | select a tower or building |
+| `X` | wall from the selected tower; click another tower to build it |
+| `R` (hold) | repair what is in reach (or rebuild wall rubble) — costs Stone |
+| `1` | weapon upgrade (at the tower; Stone + Gold) |
+| wheel / `-` `=` | zoom |
 | `Space` | weak melee swing |
-| `Esc` | cancel build mode |
+| `P` | pause |
+| `Esc` | cancel build / wall mode |
 | `F1` | debug panel |
 
-Debug keys: `M` +500 Materials · `N` next wave · `G` spawn a group at the cursor ·
-`K` damage selected tower · `J` destroy it · `P` path overlay · `L` pause
-spawning · `O` regenerate the map.
+Debug keys: `M` resources · `N` next wave · `G` spawn a group at the cursor ·
+`K` damage selected tower · `J` destroy it · `H` path overlay · `V` fog debug ·
+`L` pause spawning · `O` regenerate the map.
+
+Extra reports: `npm run economy-sim` (opening economy), `npm run wave-report`
+(ten-wave pressure against scripted fortresses), `npm run road-report`.
 
 ## Run objective
 
-Survive 8 waves **and** hold a finished tower inside the objective zone, which
-appears on the west or east edge. Dying ends the run; losing towers does not.
+Survive 10 waves. The run is lost if the Keep falls or you die.
 
 ## How it works
 
@@ -59,7 +65,7 @@ appears on the west or east edge. Dying ends the run; losing towers does not.
 | `src/terrain.js` | multi-pass generation, the validation gate, line of sight |
 | `src/flowfield.js` | shared Dijkstra distance fields and steering |
 | `src/game.js` | the whole simulation |
-| `src/render.js` | canvas drawing and the minimap |
+| `src/render.js` | camera-culled canvas drawing and the minimap |
 | `src/ui.js` | DOM HUD |
 | `src/main.js` | bootstrap, input, frame loop, debug handle |
 
@@ -77,13 +83,11 @@ chokepoints; generate-and-check does.
 sight always. Forest blocks it unless the firing tower stands at least one
 elevation band above the trees. There is no "+20% hill damage" anywhere.
 
-**One flow field per target, shared.** Every enemy attacking a given tower reads
-the same Dijkstra field, which is why they funnel through the passes. Press `P`
-to see it.
-
-**Aggro rolls, it does not snap.** An enemy already besieging a tower keeps that
-target until the tower dies. Everyone else re-evaluates on a staggered personal
-timer and only switches past a margin. Abandoning a tower buys real time.
+**One flow field per enemy type, shared, aimed at the Keep.** Walls and tower
+footprints are not impassable in it: each costs the distance the enemy could
+walk in the time it takes to break it. Swarms walk a long way round a wall;
+Heavies smash through after a short detour. Fields recompute only when walls or
+towers change. Press `H` to see one.
 
 Seeds are visible in the HUD and can be typed back in on the start screen, so
 any interesting map can be revisited exactly.

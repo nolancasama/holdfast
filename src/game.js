@@ -1,9 +1,9 @@
 // Simulation. Rendering and DOM live elsewhere; nothing here touches the canvas.
 
 import {
-  MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY, AGGRO,
-  WAVE, START_MATERIALS, DROP, ELEVATION_NAMES, richnessTierForRate, AUDIO,
-  BUILD, VISION, STUCK, BREACH,
+  MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY,
+  WAVE, START_RESOURCES, BUILDINGS, KEEP, WALL_PATH, DROP, ELEVATION_NAMES, AUDIO,
+  BUILD, VISION, STUCK, BREACH, WALL,
 } from './config.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
@@ -18,9 +18,9 @@ export const PLAYER_TARGET_ID = 'player';
 
 // ---------------------------------------------------------------------------
 
-export function createGame(seedString, archetypeKey) {
+export function createGame(seedString, archetypeKey, mapOverride = null) {
   const seed = seedString || randomSeed();
-  const map = generateMap(seed);
+  const map = mapOverride || generateMap(seed);
   const arch = ARCHETYPES[archetypeKey] || ARCHETYPES.gunner;
 
   const g = {
@@ -29,7 +29,7 @@ export function createGame(seedString, archetypeKey) {
     status: 'playing',
     lossCause: null,
     paused: false,
-    materials: START_MATERIALS,
+    res: { ...START_RESOURCES },
     phase: 'prep',
     phaseLeft: WAVE.prepFirst,
     wave: 1,
@@ -41,19 +41,24 @@ export function createGame(seedString, archetypeKey) {
       meleeCd: 0, hurtCd: 0, facing: { x: 0, y: 1 },
     },
     effects: {}, equipment: [],
-    towers: [], enemies: [], drops: [],
+    towers: [], buildings: [], walls: [], enemies: [], drops: [],
     tracers: [], particles: [], floaters: [], shockwaves: [],
-    nextTowerId: 1, nextEnemyId: 1,
-    selected: null, buildMode: false,
+    nextTowerId: 1, nextBuildingId: 1, nextWallId: 1, nextEnemyId: 1,
+    selected: null, selectedBuildingId: null, buildMode: false, buildType: 'tower',
+    wallMode: null,
     cursor: { x: map.start.x, y: map.start.y },
     occupiedTowerId: null,
     shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
     input: { mx: 0, my: 0, melee: false, repair: false },
-    playerField: null, playerFieldAt: -99, playerLaneField: null, playerLaneFieldAt: -99,
+    playerField: null, playerFieldAt: -99,
+    blockerGrid: new Array(MAP.w * MAP.h).fill(null),
+    blockerVersion: 0,
+    keepFields: Object.create(null),
     log: [], audioEvents: [],
     stats: {
-      kills: 0, towersLost: 0, materialsEarned: 0, wavesCleared: 0,
+      kills: 0, towersLost: 0, resourcesEarned: { food: 0, stone: 0, gold: 0 }, wavesCleared: 0,
       breaches: 0, breachesByType: { swarm: 0, runner: 0, heavy: 0 }, breachDamage: 0,
+      keepFieldRecomputes: 0, wallsBuilt: 0, wallSegmentsLost: 0, wallSegmentsRebuilt: 0,
       stuckDetections: 0, stuckRecoveries: 0, stuckDespawns: 0,
     },
     debug: { showPaths: false, showFog: false, spawnPaused: false, open: false, stuckEpisodes: [] },
@@ -65,8 +70,9 @@ export function createGame(seedString, archetypeKey) {
     fogCache: { map, playerTile: null, towerSignature: null, towerTiles: new Map() },
   };
 
-  const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true);
+  const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true, true);
   start.hp = start.maxHp;
+  g.keepId = start.id;
   recomputeVisibility(g, true);
   say(g, `Seed ${seed} — survive ${WAVE.totalToSurvive} waves.`);
   return g;
@@ -192,19 +198,6 @@ export function visibilityState(g) {
 // Towers
 // ---------------------------------------------------------------------------
 
-/** Sum of resource density inside the extraction radius, normalised to ~1.0 typical. */
-export function resourceScoreAt(map, x, y, radius) {
-  let sum = 0;
-  for (let ty = Math.floor(y - radius); ty <= Math.ceil(y + radius); ty++) {
-    for (let tx = Math.floor(x - radius); tx <= Math.ceil(x + radius); tx++) {
-      if (!inBounds(tx, ty)) continue;
-      if (Math.hypot(tx + 0.5 - x, ty + 0.5 - y) > radius) continue;
-      sum += map.res[idx(tx, ty)];
-    }
-  }
-  return sum / TOWER.extraction.normalizer;
-}
-
 /** Fraction of tiles in weapon range this site can actually see (D3 line of sight). */
 export function coverageAt(map, x, y, range) {
   let seen = 0;
@@ -221,37 +214,130 @@ export function coverageAt(map, x, y, range) {
   return total ? seen / total : 0;
 }
 
-/** Towers get dearer the more you already own, so sprawl has a real price. */
+/** D80: each resource keeps its identity; tower sprawl escalates Stone only. */
 export function towerCost(g) {
-  return TOWER.cost + TOWER.costPerExisting * g.towers.length;
+  const count = g.towers.filter((t) => !t.keep).length;
+  return {
+    food: TOWER.cost.food,
+    stone: TOWER.cost.stone + TOWER.costStonePerExisting * count,
+    gold: 0,
+  };
 }
 
-export function canPlaceAt(g, x, y) {
-  const reasons = [];
-  isTerrainBuildable(g.map, x, y, reasons);
+function normalizeBuildType(type) {
+  return type === 'goldMine' || type === 'gold-mine' ? 'mine' : (type || 'tower');
+}
 
-  for (const t of g.towers) {
-    if (Math.hypot(t.x - x, t.y - y) < TOWER.minSpacing) {
-      reasons.push(`too close to another tower (${TOWER.minSpacing} tiles apart)`);
-      break;
+function stewardCostMult(g, type) {
+  return type !== 'tower' && g.arch.buildingCostMult ? g.arch.buildingCostMult : 1;
+}
+
+function buildCost(g, type) {
+  if (type === 'tower') return towerCost(g);
+  const def = BUILDINGS[type];
+  const cost = { ...def.cost };
+  if (type === 'farm') cost.food += def.costFoodPerExisting
+    * g.buildings.filter((b) => b.type === 'farm' && !b.destroyed).length;
+  const mult = stewardCostMult(g, type);
+  return {
+    food: Math.ceil((cost.food || 0) * mult),
+    stone: Math.ceil((cost.stone || 0) * mult),
+    gold: Math.ceil((cost.gold || 0) * mult),
+  };
+}
+
+function canAfford(g, cost) {
+  return ['food', 'stone', 'gold'].every((key) => g.res[key] >= (cost[key] || 0));
+}
+
+function costLabel(cost) {
+  return ['food', 'stone', 'gold'].filter((key) => cost[key])
+    .map((key) => `${cost[key]} ${key[0].toUpperCase()}${key.slice(1)}`).join(', ');
+}
+
+function activeSiteClaim(g, siteId) {
+  return g.buildings.find((b) => !b.destroyed && b.siteId === siteId) || null;
+}
+
+function farmQuality(map, x, y) {
+  let fertile = 0;
+  let sum = 0;
+  let total = 0;
+  const tx = Math.floor(x);
+  const ty = Math.floor(y);
+  for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+    if (!inBounds(tx + ox, ty + oy)) continue;
+    total++;
+    const value = map.fertility?.[idx(tx + ox, ty + oy)] || 0;
+    if (value > 0) fertile++;
+    sum += value;
+  }
+  return { fertile, total, mean: total ? sum / total : 0 };
+}
+
+function nearestOpenSite(g, type, x, y) {
+  const sites = type === 'quarry' ? g.map.stoneSites : g.map.goldSites;
+  let best = null;
+  let bestD = Infinity;
+  for (const site of sites || []) {
+    if (activeSiteClaim(g, site.id)) continue;
+    const d = Math.hypot(site.x - x, site.y - y);
+    if (d <= BUILDINGS[type].siteRange && d < bestD) { best = site; bestD = d; }
+  }
+  return best;
+}
+
+export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
+  const type = normalizeBuildType(buildType);
+  const reasons = [];
+  const cost = buildCost(g, type);
+  let site = null;
+  let rate = 0;
+  let fertility = null;
+
+  if (type === 'tower') {
+    isTerrainBuildable(g.map, x, y, reasons);
+    for (const t of g.towers) {
+      if (Math.hypot(t.x - x, t.y - y) < TOWER.minSpacing) {
+        reasons.push(`too close to another tower (${TOWER.minSpacing} tiles apart)`);
+        break;
+      }
     }
+  } else if (!BUILDINGS[type]) {
+    reasons.push('unknown building');
+  } else if (!isPassable(g.map, Math.floor(x), Math.floor(y))) {
+    reasons.push('impassable ground');
+  } else if (g.towers.some((t) => Math.hypot(t.x - x, t.y - y) < t.radius + 0.8)
+      || g.buildings.some((b) => !b.destroyed && Math.hypot(b.x - x, b.y - y) < 1.0)) {
+    reasons.push('site is occupied');
+  } else if (type === 'farm') {
+    const quality = farmQuality(g.map, x, y);
+    fertility = quality.mean;
+    if (quality.fertile < 5) reasons.push('not fertile enough (need most of the 3x3)');
+    if (g.buildings.some((b) => b.type === 'farm' && !b.destroyed
+        && Math.hypot(b.x - x, b.y - y) < BUILDINGS.farm.minSpacing)) {
+      reasons.push(`too close to another farm (${BUILDINGS.farm.minSpacing} tiles apart)`);
+    }
+    rate = BUILDINGS.farm.baseRate * quality.mean;
+  } else {
+    site = nearestOpenSite(g, type, x, y);
+    if (!site) reasons.push(type === 'quarry' ? 'no unclaimed stone site in reach' : 'no unclaimed gold site in reach');
+    rate = site ? BUILDINGS[type].baseRate * site.mult : 0;
   }
 
   const unique = [...new Set(reasons)];
-  const cost = towerCost(g);
-  if (g.materials < cost) unique.push(`need ${cost} Materials`);
-
-  const eRadius = TOWER.extraction.radius;
-  const income = resourceScoreAt(g.map, x, y, eRadius) * TOWER.extraction.baseRate;
+  if (!canAfford(g, cost)) unique.push(`need ${costLabel(cost)}`);
   const terrain = kindAt(g.map, Math.floor(x), Math.floor(y));
   const elev = elevAt(g.map, Math.floor(x), Math.floor(y));
   return {
     ok: unique.length === 0,
     reasons: unique,
+    type,
     cost,
-    income,
-    richness: richnessTierForRate(income),
-    coverage: coverageAt(g.map, x, y, TOWER.weapon.range),
+    rate,
+    fertility,
+    site,
+    coverage: type === 'tower' ? coverageAt(g.map, x, y, TOWER.weapon.range) : null,
     terrain,
     elev,
     elevationName: terrain === T.CLIFF ? 'Cliff' : ELEVATION_NAMES[elev],
@@ -259,7 +345,7 @@ export function canPlaceAt(g, x, y) {
 }
 
 /** Nearest buildable tile centre the player can physically reach to build. */
-export function playerBuildSite(g) {
+export function playerBuildSite(g, buildType = g.buildType || 'tower') {
   const candidates = [];
   for (let ty = Math.floor(g.player.y - BUILD.reach); ty <= Math.floor(g.player.y + BUILD.reach); ty++) {
     for (let tx = Math.floor(g.player.x - BUILD.reach); tx <= Math.floor(g.player.x + BUILD.reach); tx++) {
@@ -272,59 +358,82 @@ export function playerBuildSite(g) {
   }
   candidates.sort((a, b) => a.distance - b.distance || a.y - b.y || a.x - b.x);
   for (const candidate of candidates) {
-    const check = canPlaceAt(g, candidate.x, candidate.y);
+    const check = canPlaceAt(g, candidate.x, candidate.y, buildType);
     if (check.ok) return { x: candidate.x, y: candidate.y, check };
   }
   const x = Math.floor(g.player.x) + 0.5;
   const y = Math.floor(g.player.y) + 0.5;
-  return { x, y, check: canPlaceAt(g, x, y) };
+  return { x, y, check: canPlaceAt(g, x, y, buildType) };
 }
 
-function placeTower(g, x, y, instant = false) {
+function placeTower(g, x, y, instant = false, keep = false) {
+  const radius = keep ? KEEP.radius : TOWER.radius;
+  const maxHp = keep ? KEEP.maxHp : TOWER.maxHp;
   const t = {
     id: g.nextTowerId++,
     x, y,
-    hp: TOWER.maxHp * (instant ? 1 : TOWER.buildHpFraction),
-    maxHp: TOWER.maxHp,
+    keep,
+    radius,
+    hp: maxHp * (instant ? 1 : TOWER.buildHpFraction),
+    maxHp,
     built: instant,
     progress: instant ? 1 : 0,
-    wLevel: 0, eLevel: 0,
+    wLevel: 0,
     upgrade: null,
     shotCd: 0, targetId: null, retargetIn: 0,
     flash: 0, smoke: 0,
     unseenHitAt: null,
-    field: null,
-    resourceScore: resourceScoreAt(g.map, x, y, TOWER.extraction.radius),
   };
   g.towers.push(t);
   if (clearTowerForest(g.map, x, y)) {
     // Forest -> plain changes movement cost and every LOS-derived view. Keep
     // placement validation on the original terrain, then invalidate only after
     // the tower has been accepted and the clearing has actually changed tiles.
-    for (const tower of g.towers) tower.field = null;
+    invalidateKeepFields(g);
     g.playerField = null;
     g.playerFieldAt = -99;
-    g.playerLaneField = null;
-    g.playerLaneFieldAt = -99;
     recomputeVisibility(g, true);
   }
+  if (!keep) registerTowerBlocker(g, t);
   return t;
 }
 
-export function tryBuild(g, x, y) {
-  const check = canPlaceAt(g, x, y);
+function placeBuilding(g, x, y, type, check) {
+  const def = BUILDINGS[type];
+  const b = {
+    id: g.nextBuildingId++, type, x, y,
+    hp: def.maxHp * (def.buildHpFraction ?? TOWER.buildHpFraction), maxHp: def.maxHp,
+    built: false, progress: 0, destroyed: false,
+    rate: check.rate, siteId: check.site?.id ?? null,
+    flash: 0, unseenHitAt: null,
+  };
+  g.buildings.push(b);
+  return b;
+}
+
+export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
+  const type = normalizeBuildType(buildType);
+  const check = canPlaceAt(g, x, y, type);
   if (g.paused) return { ...check, ok: false, reason: 'paused', reasons: [...check.reasons, 'paused'] };
   if (Math.hypot(g.player.x - x, g.player.y - y) > BUILD.reach + 1e-6) {
     const reason = 'stand at the site to build';
     return { ...check, ok: false, reason, reasons: [...check.reasons, reason] };
   }
   if (!check.ok) return check;
-  g.materials -= check.cost;
-  const t = placeTower(g, x, y, false);
-  g.selected = t.id;
+  for (const key of ['food', 'stone', 'gold']) g.res[key] -= check.cost[key] || 0;
+  if (type === 'tower') {
+    const t = placeTower(g, x, y, false);
+    g.selected = t.id;
+    g.selectedBuildingId = null;
+  } else {
+    const b = placeBuilding(g, x, y, type, check);
+    g.selectedBuildingId = b.id;
+    g.selected = null;
+  }
   say(g, 'Construction started.');
-  emitAudioEvent(g, 'constructionStart', t);
-  return check;
+  emitAudioEvent(g, 'constructionStart', { x, y });
+  return { ...check, structure: type === 'tower'
+    ? g.towers[g.towers.length - 1] : g.buildings[g.buildings.length - 1] };
 }
 
 export function occupancyMults(g) {
@@ -332,7 +441,8 @@ export function occupancyMults(g) {
 }
 
 export function constructionRateMult(g, t) {
-  return dist(g.player, t) <= PLAYER.presenceRadius ? occupancyMults(g).construction : 1;
+  const nearby = dist(g.player, t) <= PLAYER.presenceRadius ? occupancyMults(g).construction : 1;
+  return nearby * (t.type && g.arch.buildingBuildMult ? g.arch.buildingBuildMult : 1);
 }
 
 export function upgradeRateMult(g, t) {
@@ -341,38 +451,35 @@ export function upgradeRateMult(g, t) {
 
 export function towerStats(g, t) {
   const occupied = g.occupiedTowerId === t.id;
-  const m = occupied ? occupancyMults(g) : { damage: 1, fireRate: 1, extraction: 1, damageTaken: 1 };
+  const m = occupied ? occupancyMults(g) : { damage: 1, fireRate: 1, damageTaken: 1 };
   const u = TOWER.upgrade;
   const dmgBoost = g.effects.damage ? DROP.temporary.damage.mult : 1;
-  const extBoost = g.effects.extraction ? DROP.temporary.extraction.mult : 1;
   const barrel = hasEquipment(g, 'reinforcedBarrel') ? DROP.equipment.reinforcedBarrel.towerDamage : 1;
   const module = hasEquipment(g, 'targetingModule') ? DROP.equipment.targetingModule.towerRange : 1;
-  const chip = hasEquipment(g, 'extractionChip') ? DROP.equipment.extractionChip.extraction : 1;
   return {
     occupied,
     damage: TOWER.weapon.damage * (1 + u.weaponDamagePerLevel * t.wLevel) * m.damage * dmgBoost * barrel,
     fireRate: TOWER.weapon.fireRate * (1 + u.weaponRatePerLevel * t.wLevel) * m.fireRate,
     range: (TOWER.weapon.range + u.weaponRangePerLevel * t.wLevel) * module,
-    extractRadius: TOWER.extraction.radius, // D75: upgrades raise the rate, never the footprint
-    income: t.resourceScore * TOWER.extraction.baseRate
-            * (1 + u.extractRatePerLevel * t.eLevel) * m.extraction * extBoost * chip,
     damageTaken: m.damageTaken,
   };
 }
 
-export function upgradeCost(t, which) {
-  const level = which === 'weapon' ? t.wLevel : t.eLevel;
+export function upgradeCost(t, which = 'weapon') {
+  if (which !== 'weapon') return null;
+  const level = t.wLevel;
   if (level >= TOWER.upgrade.maxLevel) return null;
-  return (which === 'weapon' ? TOWER.upgrade.weaponCost : TOWER.upgrade.extractionCost)[level];
+  return { ...TOWER.upgrade.weaponCost[level] };
 }
 
 export function tryUpgrade(g, t, which) {
   if (g.paused) return false;
-  if (which !== 'weapon' && which !== 'extraction') return false;
+  if (which !== 'weapon') return false;
   const cost = upgradeCost(t, which);
-  if (cost === null || g.materials < cost || !t.built || t.upgrade) return false;
-  g.materials -= cost;
-  const level = which === 'weapon' ? t.wLevel : t.eLevel;
+  if (cost === null || !canAfford(g, cost) || !t.built || t.upgrade) return false;
+  if (dist(g.player, t) > PLAYER.presenceRadius) return false;
+  for (const key of ['food', 'stone', 'gold']) g.res[key] -= cost[key] || 0;
+  const level = t.wLevel;
   t.upgrade = { which, toLevel: level + 1, progress: 0, duration: TOWER.upgrade.buildTime[level] };
   emitAudioEvent(g, 'upgradeStart', t);
   return true;
@@ -403,27 +510,279 @@ function hasEquipment(g, key) {
   return g.equipment.includes(key);
 }
 
-function towerField(g, t) {
-  if (!t.field) t.field = computeField(g.map, [idx(clampTx(t.x), clampTy(t.y))], 'lane');
-  return t.field;
-}
 const clampTx = (x) => clamp(Math.floor(x), 0, MAP.w - 1);
 const clampTy = (y) => clamp(Math.floor(y), 0, MAP.h - 1);
+
+function towerFootprintTiles(t) {
+  const out = [];
+  const minX = Math.max(0, Math.floor(t.x - t.radius - 0.5));
+  const maxX = Math.min(MAP.w - 1, Math.floor(t.x + t.radius + 0.5));
+  const minY = Math.max(0, Math.floor(t.y - t.radius - 0.5));
+  const maxY = Math.min(MAP.h - 1, Math.floor(t.y + t.radius + 0.5));
+  for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) {
+    const nx = clamp(t.x, tx, tx + 1);
+    const ny = clamp(t.y, ty, ty + 1);
+    if (Math.hypot(nx - t.x, ny - t.y) <= t.radius + 1e-6) out.push(idx(tx, ty));
+  }
+  return out;
+}
+
+function invalidateKeepFields(g) {
+  g.blockerVersion++;
+  g.keepFields = Object.create(null);
+}
+
+function registerTowerBlocker(g, t) {
+  if (t.keep) return;
+  t.blockerTiles = towerFootprintTiles(t);
+  for (const i of t.blockerTiles) g.blockerGrid[i] = { kind: 'tower', id: t.id, structure: t, maxHp: t.maxHp };
+  invalidateKeepFields(g);
+}
+
+function unregisterTowerBlocker(g, t) {
+  if (t.keep) return;
+  for (const i of t.blockerTiles || towerFootprintTiles(t)) {
+    if (g.blockerGrid[i]?.structure === t) g.blockerGrid[i] = null;
+  }
+  invalidateKeepFields(g);
+}
+
+function keepTower(g) {
+  return g.towers.find((t) => t.id === g.keepId) || null;
+}
+
+function keepField(g, type) {
+  const keep = keepTower(g);
+  if (!keep) return null;
+  const goal = idx(clampTx(keep.x), clampTy(keep.y));
+  const cached = g.keepFields[type];
+  // Blocker geometry is the only thing that changes in play; the goal and map
+  // keys just make a cached field impossible to read against the wrong board.
+  if (cached && cached.version === g.blockerVersion && cached.goal === goal && cached.map === g.map) return cached.field;
+  const def = ENEMIES[type];
+  const obstacleCosts = new Float32Array(MAP.w * MAP.h);
+  for (let i = 0; i < g.blockerGrid.length; i++) {
+    const blocker = g.blockerGrid[i];
+    if (blocker) obstacleCosts[i] = WALL_PATH.breakBias * (blocker.maxHp / def.structDps) * def.speed;
+  }
+  const field = computeField(g.map, [goal], 'lane', obstacleCosts);
+  g.keepFields[type] = { version: g.blockerVersion, goal, map: g.map, field, obstacleCosts };
+  g.stats.keepFieldRecomputes++;
+  return field;
+}
+
+function keepObstacles(g, type) {
+  const cached = g.keepFields[type];
+  return cached && cached.version === g.blockerVersion && cached.map === g.map ? cached.obstacleCosts : null;
+}
+
+// ---------------------------------------------------------------------------
+// Walls (D81)
+// ---------------------------------------------------------------------------
+
+/**
+ * 4-connected (supercover) tile walk from one point to another. Every step
+ * changes x or y, never both, so consecutive tiles share an edge and the line
+ * has no diagonal gap an 8-connected mover could slip through.
+ */
+export function supercoverLine(x0, y0, x1, y1) {
+  let tx = Math.floor(x0);
+  let ty = Math.floor(y0);
+  const endX = Math.floor(x1);
+  const endY = Math.floor(y1);
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const stepX = Math.sign(dx);
+  const stepY = Math.sign(dy);
+  const tDeltaX = stepX ? Math.abs(1 / dx) : Infinity;
+  const tDeltaY = stepY ? Math.abs(1 / dy) : Infinity;
+  let tMaxX = stepX > 0 ? (tx + 1 - x0) / dx : stepX < 0 ? (x0 - tx) / -dx : Infinity;
+  let tMaxY = stepY > 0 ? (ty + 1 - y0) / dy : stepY < 0 ? (y0 - ty) / -dy : Infinity;
+  const tiles = [{ x: tx, y: ty }];
+  for (let guard = 0; guard < 4 * (MAP.w + MAP.h) && (tx !== endX || ty !== endY); guard++) {
+    // Ties step x first; either choice keeps the walk 4-connected.
+    if (tMaxX <= tMaxY) { tx += stepX; tMaxX += tDeltaX; } else { ty += stepY; tMaxY += tDeltaY; }
+    tiles.push({ x: tx, y: ty });
+  }
+  return tiles;
+}
+
+function wallLinkExists(g, aId, bId) {
+  return g.walls.some((w) => (w.a === aId && w.b === bId) || (w.a === bId && w.b === aId));
+}
+
+/** Everything the wall preview needs: tiles, segments, cost and refusal reasons. */
+export function wallPlan(g, aId, bId) {
+  const a = g.towers.find((t) => t.id === aId);
+  const b = g.towers.find((t) => t.id === bId);
+  const reasons = [];
+  const result = { ok: false, reasons, a: aId, b: bId, tiles: [], segments: [], skipped: 0, length: 0,
+    cost: { food: 0, stone: 0, gold: 0 } };
+  if (!a || !b) { reasons.push('choose two towers'); return result; }
+  if (a === b) { reasons.push('choose a different tower'); return result; }
+  if (!a.built || !b.built) reasons.push('both towers must be finished');
+  result.length = dist(a, b);
+  if (result.length > WALL.maxLength + 1e-6) reasons.push(`too long (${result.length.toFixed(1)} > ${WALL.maxLength} tiles)`);
+  if (wallLinkExists(g, aId, bId)) reasons.push('these towers are already joined');
+
+  const footprints = new Set([...towerFootprintTiles(a), ...towerFootprintTiles(b)]);
+  for (const tile of supercoverLine(a.x, a.y, b.x, b.y)) {
+    if (!inBounds(tile.x, tile.y)) continue;
+    const i = idx(tile.x, tile.y);
+    if (footprints.has(i)) continue;
+    result.tiles.push(tile);
+    // Cliffs and deep water are already barriers: skipped, never charged.
+    if (!isPassable(g.map, tile.x, tile.y)) { result.skipped++; continue; }
+    const blocker = g.blockerGrid[i];
+    if (blocker?.kind === 'wall') reasons.push('crosses an existing wall');
+    else if (blocker?.kind === 'tower') reasons.push('crosses another tower');
+    if (g.towers.some((t) => t !== a && t !== b && towerFootprintTiles(t).includes(i))) reasons.push('crosses another tower');
+    if (g.buildings.some((o) => !o.destroyed && Math.floor(o.x) === tile.x && Math.floor(o.y) === tile.y)) {
+      reasons.push('crosses an economic building');
+    }
+    result.segments.push(tile);
+  }
+  if (!result.segments.length && !reasons.length) reasons.push('nothing to build between these towers');
+  result.cost = { food: 0, stone: WALL.costStonePerSegment * result.segments.length, gold: 0 };
+  const unique = [...new Set(reasons)];
+  if (!canAfford(g, result.cost)) unique.push(`need ${costLabel(result.cost)}`);
+  result.reasons = unique;
+  result.ok = unique.length === 0;
+  return result;
+}
+
+function registerWallSegment(g, seg) {
+  g.blockerGrid[seg.i] = { kind: 'wall', id: seg.id, structure: seg, maxHp: seg.maxHp };
+}
+
+/** D81: start a wall link. The player must be at one of its towers. */
+export function tryBuildWall(g, aId, bId) {
+  const plan = wallPlan(g, aId, bId);
+  if (g.paused) return { ...plan, ok: false, reasons: [...plan.reasons, 'paused'] };
+  const a = g.towers.find((t) => t.id === aId);
+  const b = g.towers.find((t) => t.id === bId);
+  const near = [a, b].some((t) => t && dist(g.player, t) <= PLAYER.presenceRadius + t.radius);
+  if (!near) {
+    const reason = 'stand at one of the two towers to start the wall';
+    return { ...plan, ok: false, reasons: [...plan.reasons, reason] };
+  }
+  if (!plan.ok) return plan;
+  g.res.stone -= plan.cost.stone;
+  const link = {
+    id: g.nextWallId++, a: aId, b: bId,
+    built: false, progress: 0,
+    duration: WALL.buildBase + WALL.buildPerTile * plan.segments.length,
+    segments: [],
+  };
+  plan.segments.forEach((tile, k) => {
+    const seg = {
+      id: `w${link.id}:${k}`, wall: true, linkId: link.id,
+      tx: tile.x, ty: tile.y, i: idx(tile.x, tile.y), x: tile.x + 0.5, y: tile.y + 0.5,
+      radius: 0.5, maxHp: WALL.segmentHp, hp: WALL.segmentHp * WALL.buildHpFraction,
+      // The segment next to each anchor is a postern: enemy-solid, player-open.
+      gate: k === 0 || k === plan.segments.length - 1,
+      destroyed: false, flash: 0, shake: 0, unseenHitAt: null,
+    };
+    link.segments.push(seg);
+    registerWallSegment(g, seg);
+  });
+  g.walls.push(link);
+  invalidateKeepFields(g);
+  g.stats.wallsBuilt++;
+  say(g, `Wall started: ${plan.segments.length} segments.`);
+  emitAudioEvent(g, 'constructionStart', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  return { ...plan, link };
+}
+
+export function wallSegments(g) {
+  return g.walls.flatMap((w) => w.segments);
+}
+
+function wallSegmentAt(g, i) {
+  const blocker = g.blockerGrid[i];
+  return blocker?.kind === 'wall' ? blocker.structure : null;
+}
+
+function updateWalls(g, dt) {
+  for (const link of g.walls) {
+    for (const seg of link.segments) {
+      seg.flash = Math.max(0, seg.flash - dt * 3);
+      if (seg.shake > 0) seg.shake = Math.max(0, seg.shake - dt);
+      if (!seg.destroyed && seg.hp <= 0) destroyWallSegment(g, seg);
+    }
+    if (link.built) continue;
+    const near = link.segments.some((s) => dist(g.player, s) <= PLAYER.presenceRadius)
+      || [link.a, link.b].some((id) => { const t = g.towers.find((o) => o.id === id); return t && dist(g.player, t) <= PLAYER.presenceRadius; });
+    const rate = (near ? occupancyMults(g).construction : 1) / link.duration;
+    const before = link.progress;
+    link.progress = Math.min(1, link.progress + rate * dt);
+    const gain = (link.progress - before) * WALL.segmentHp * (1 - WALL.buildHpFraction);
+    for (const seg of link.segments) if (!seg.destroyed) seg.hp = Math.min(seg.maxHp, seg.hp + gain);
+    if (link.progress >= 1) {
+      link.built = true;
+      for (const seg of link.segments) if (!seg.destroyed && seg.maxHp - seg.hp < 1e-6 * seg.maxHp) seg.hp = seg.maxHp;
+      say(g, 'Wall complete.');
+      const mid = link.segments[Math.floor(link.segments.length / 2)];
+      emitAudioEvent(g, 'constructionComplete', mid || g.player);
+    }
+  }
+}
+
+function destroyWallSegment(g, seg, attacker = null) {
+  if (seg.destroyed) return;
+  seg.destroyed = true;
+  seg.hp = 0;
+  if (g.blockerGrid[seg.i]?.structure === seg) g.blockerGrid[seg.i] = null;
+  invalidateKeepFields(g);
+  g.stats.wallSegmentsLost++;
+  for (const e of g.enemies) if (e.blockerTargetId === seg.id) e.blockerTargetId = null;
+  const heavy = attacker?.type === 'heavy';
+  burst(g, seg.x, seg.y, '#9a9387', 26, 6);
+  burst(g, seg.x, seg.y, '#ffb347', 14, 5);
+  g.shockwaves.push({ x: seg.x, y: seg.y, t: 0, life: BREACH.ring.life * 1.4,
+    radius: BREACH.ring.heavyRadius, color: heavy ? '#ff7a2e' : '#ffb347' });
+  floater(g, seg.x, seg.y - 1.1, 'BREACH', '#ff7a2e');
+  emitAudioEvent(g, 'wallBreak', seg);
+  if (!Number.isFinite(g.wallBreachSaidAt) || g.time - g.wallBreachSaidAt >= WALL.breachMessageInterval) {
+    g.wallBreachSaidAt = g.time;
+    say(g, heavy ? 'A Heavy smashed through the wall. Wall breached!' : 'Wall breached!');
+  }
+}
+
+/** D81: rubble is rebuilt in place for one segment's Stone if nothing stands in it. */
+function rebuildWallSegment(g, seg) {
+  if (!seg.destroyed) return false;
+  if (g.res.stone < WALL.costStonePerSegment) return false;
+  const occupied = [g.player, ...g.enemies].some((u) => Math.floor(u.x) === seg.tx && Math.floor(u.y) === seg.ty);
+  if (occupied) return false;
+  g.res.stone -= WALL.costStonePerSegment;
+  seg.destroyed = false;
+  seg.hp = seg.maxHp * WALL.buildHpFraction;
+  registerWallSegment(g, seg);
+  invalidateKeepFields(g);
+  g.stats.wallSegmentsRebuilt++;
+  burst(g, seg.x, seg.y, '#5ecbff', 8, 2);
+  emitAudioEvent(g, 'constructionStart', seg);
+  return true;
+}
+
+export function wallState(g) {
+  return g.walls.map((w) => ({
+    id: w.id, a: w.a, b: w.b, built: w.built, progress: w.progress, duration: w.duration,
+    segments: w.segments.map((s) => ({ id: s.id, tx: s.tx, ty: s.ty, hp: s.hp, maxHp: s.maxHp,
+      gate: s.gate, destroyed: s.destroyed })),
+  }));
+}
 
 function destroyTower(g, t) {
   emitAudioEvent(g, 'towerDestroy', t);
   g.lastTowerDestroyAt = g.time;
   t.upgrade = null;
+  unregisterTowerBlocker(g, t);
   g.towers = g.towers.filter((o) => o !== t);
   g.stats.towersLost++;
   if (g.selected === t.id) g.selected = null;
-  for (const e of g.enemies) {
-    if (e.targetId !== t.id) continue;
-    // D76: a structure hunter moves on to the nearest surviving tower by path
-    // cost; everyone else re-reads the situation on the next update.
-    setTarget(e, null);
-    if (isStructureHunter(e)) setTarget(e, nearestReachableTower(g, e)?.id ?? null);
-  }
+  for (const e of g.enemies) if (e.blockerTargetId === t.id) e.blockerTargetId = null;
 
   for (let i = 0; i < 46; i++) {
     const a = Math.random() * Math.PI * 2;
@@ -445,71 +804,114 @@ function destroyTower(g, t) {
   }
 }
 
-/** D73: the distance at which an enemy touches its target tower and breaches. */
-export function breachContact(e) {
-  return TOWER.radius + e.def.radius + BREACH.contactGap;
+function destroyBuilding(g, b) {
+  if (b.destroyed) return;
+  b.destroyed = true;
+  b.built = false;
+  b.hp = 0;
+  b.progress = 0;
+  b.destroyedAt = g.time;
+  if (g.selectedBuildingId === b.id) g.selectedBuildingId = null;
+  for (const e of g.enemies) if (e.econTargetId === b.id) e.econTargetId = null;
+  say(g, `${BUILDINGS[b.type].name} destroyed.`);
+  emitAudioEvent(g, 'towerDestroy', b);
+  burst(g, b.x, b.y, '#8a8f98', 24, 5);
 }
 
-/**
- * D73/D76: an enemy that reaches its target tower - occupied, abandoned or
- * unfinished - hits it once and is gone. It is a leak, not a kill: no kill
- * credit, no drop, no death cue. A lethal breach goes through the ordinary
- * destroyTower path.
- */
-function breachTower(g, e, t) {
-  e.breached = true;
-  g.enemies = g.enemies.filter((o) => o !== e);
+function structureRadius(s) {
+  return s.radius ?? BUILDINGS[s.type]?.radius ?? 0.55;
+}
 
-  const dmg = (e.def.breachFrac ?? 0) * t.maxHp * towerStats(g, t).damageTaken;
-  const before = t.hp / t.maxHp;
-  t.hp -= dmg;
-  t.flash = 1;
-  t.shake = BREACH.shake;
-  // An abandoned tower is usually breached out of sight; raise the alarm the
-  // old siege raised so the player knows what they left behind is falling.
+function structureReach(e, structure) {
+  return structureRadius(structure) + ENEMY.attackRange + e.def.radius;
+}
+
+/** D78: sustained structural damage, retaining the old breach feedback vocabulary. */
+function structureName(g, structure) {
+  if (structure.wall) return 'the wall';
+  if (structure.type) return `the ${BUILDINGS[structure.type].name}`;
+  return structure.keep ? 'the Keep' : `tower #${structure.id}`;
+}
+
+function destroyStructure(g, structure, attacker) {
+  if (structure.wall) destroyWallSegment(g, structure, attacker);
+  else if (structure.type) destroyBuilding(g, structure);
+  else destroyTower(g, structure);
+}
+
+/** D78: sustained structural damage, retaining the old breach feedback vocabulary. */
+function attackStructure(g, e, structure, dt) {
+  const isTower = !structure.type && !structure.wall;
+  const damageTaken = isTower ? towerStats(g, structure).damageTaken : 1;
+  const dmg = e.def.structDps * (e.structMult || 1) * damageTaken * dt;
+  const before = structure.hp / structure.maxHp;
+  const newEpisode = !Number.isFinite(structure.lastHitAt) || g.time - structure.lastHitAt >= 6;
+  structure.lastHitAt = g.time;
+  structure.hp -= dmg;
+  structure.flash = 1;
+  structure.shake = BREACH.shake;
+  // An abandoned structure is usually attacked out of sight; raise the alarm
+  // so the player knows what they left behind is falling.
   if (!isPointVisible(g, e.x, e.y)) {
-    if (!Number.isFinite(t.unseenHitAt) || g.time - t.unseenHitAt >= 5) say(g, `Tower #${t.id} UNDER ATTACK.`);
-    t.unseenHitAt = g.time;
-    emitAudioEvent(g, 'towerUnderAttack', t);
+    if (!Number.isFinite(structure.unseenHitAt) || g.time - structure.unseenHitAt >= 5) {
+      const name = structureName(g, structure);
+      say(g, `${name[0].toUpperCase()}${name.slice(1)} is UNDER ATTACK.`);
+    }
+    structure.unseenHitAt = g.time;
+    emitAudioEvent(g, 'towerUnderAttack', structure);
   }
-  g.stats.breaches++;
-  g.stats.breachesByType[e.type] = (g.stats.breachesByType[e.type] || 0) + 1;
   g.stats.breachDamage += dmg;
+  e.pendingStructDmg = (e.pendingStructDmg || 0) + dmg;
 
-  // Impact where the enemy meets the wall, on its own bearing.
-  const a = Math.atan2(e.y - t.y, e.x - t.x);
-  const ix = t.x + Math.cos(a) * TOWER.radius;
-  const iy = t.y + Math.sin(a) * TOWER.radius;
-  const heavy = e.type === 'heavy';
-  burst(g, ix, iy, e.def.color, heavy ? 22 : 12, heavy ? 7 : 5);
-  burst(g, ix, iy, '#ffb347', heavy ? 18 : 9, heavy ? 6 : 4.5);
-  burst(g, ix, iy, '#ffffff', heavy ? 8 : 4, 3);
-  g.shockwaves.push({ x: ix, y: iy, t: 0, life: BREACH.ring.life,
-    radius: heavy ? BREACH.ring.heavyRadius : BREACH.ring.radius, color: heavy ? '#ff7a2e' : '#ffb347' });
-  emitAudioEvent(g, heavy ? 'heavyBreach' : 'breach', { x: ix, y: iy, enemyType: e.type });
+  e.structureFxCd = Math.max(0, (e.structureFxCd || 0) - dt);
+  if (e.structureFxCd <= 0) {
+    e.structureFxCd = e.type === 'heavy' ? 0.34 : 0.55;
+    g.stats.breaches++;
+    g.stats.breachesByType[e.type] = (g.stats.breachesByType[e.type] || 0) + 1;
+    const r = structureRadius(structure);
+    const a = Math.atan2(e.y - structure.y, e.x - structure.x);
+    const ix = structure.x + Math.cos(a) * r;
+    const iy = structure.y + Math.sin(a) * r;
+    const heavy = e.type === 'heavy';
+    burst(g, ix, iy, structure.wall ? '#b9b0a0' : e.def.color, heavy ? 22 : 12, heavy ? 7 : 5);
+    burst(g, ix, iy, '#ffb347', heavy ? 18 : 9, heavy ? 6 : 4.5);
+    burst(g, ix, iy, '#ffffff', heavy ? 8 : 4, 3);
+    g.shockwaves.push({ x: ix, y: iy, t: 0, life: BREACH.ring.life,
+      radius: (heavy ? BREACH.ring.heavyRadius : BREACH.ring.radius) * (structure.wall ? 0.6 : 1),
+      color: heavy ? '#ff7a2e' : '#ffb347' });
+    const cue = structure.wall ? (heavy ? 'heavyWallHit' : 'wallHit') : (heavy ? 'heavyBreach' : 'breach');
+    emitAudioEvent(g, cue, { x: ix, y: iy, enemyType: e.type });
 
-  // Close breaches share one floater so a cluster reads as one number.
-  const merge = g.floaters.find((f) => f.breachTowerId === t.id && g.time - f.breachAt < BREACH.floaterMerge);
-  if (merge) {
-    merge.breachDamage += dmg;
-    merge.breachAt = g.time;
-    merge.t = 0;
-    merge.text = `BREACH -${Math.round(merge.breachDamage)}`;
-  } else {
-    // Above the OCCUPIED label, which sits just over the tower's hp bar.
-    floater(g, t.x, t.y - 2.9, `BREACH -${Math.round(dmg)}`, '#ff5a3c');
-    Object.assign(g.floaters[g.floaters.length - 1], { breachTowerId: t.id, breachAt: g.time, breachDamage: dmg });
+    // Close hits on one structure share one merged damage floater.
+    const shown = e.pendingStructDmg;
+    e.pendingStructDmg = 0;
+    const structureKey = `${structure.wall ? 'w' : isTower ? 't' : 'b'}:${structure.id}`;
+    const merge = g.floaters.find((f) => f.breachStructureId === structureKey && g.time - f.breachAt < BREACH.floaterMerge);
+    if (merge) {
+      merge.breachDamage += shown;
+      merge.breachAt = g.time;
+      merge.t = 0;
+      merge.text = `-${Math.round(merge.breachDamage)}`;
+    } else {
+      floater(g, structure.x, structure.y - r - 0.7, `-${Math.max(1, Math.round(shown))}`, '#ff5a3c');
+      Object.assign(g.floaters[g.floaters.length - 1], { breachStructureId: structureKey, breachAt: g.time, breachDamage: shown });
+    }
   }
-  if (!Number.isFinite(t.breachSaidAt) || g.time - t.breachSaidAt >= BREACH.messageInterval) {
-    t.breachSaidAt = g.time;
-    say(g, `Breach! ${e.def.name || 'An enemy'} got through to tower #${t.id}.`);
+  // One log line when an attack on a structure begins, not one per blow.
+  if (newEpisode && !structure.wall) say(g, `${e.def.name || 'An enemy'} is striking ${structureName(g, structure)}.`);
+  else if (structure.wall) {
+    const link = g.walls.find((w) => w.id === structure.linkId);
+    if (link && (!Number.isFinite(link.hitSaidAt) || g.time - link.hitSaidAt >= 8)) {
+      link.hitSaidAt = g.time;
+      say(g, `${e.def.name || 'An enemy'} is battering the wall.`);
+    }
   }
 
-  if (before >= TOWER.collapsingAt && t.hp / t.maxHp < TOWER.collapsingAt) {
-    say(g, 'A tower is COLLAPSING.');
-    emitAudioEvent(g, 'collapsing', t);
+  if (isTower && before >= TOWER.collapsingAt && structure.hp / structure.maxHp < TOWER.collapsingAt) {
+    say(g, structure.keep ? 'The Keep is COLLAPSING.' : 'A tower is COLLAPSING.');
+    emitAudioEvent(g, 'collapsing', structure);
   }
-  if (t.hp <= 0) destroyTower(g, t);
+  if (structure.hp <= 0) destroyStructure(g, structure, e);
 }
 
 // ---------------------------------------------------------------------------
@@ -591,12 +993,11 @@ function updatePlayer(g, dt) {
       g.shelter.towerId = best.id;
       g.shelter.progress = 0;
       g.occupiedTowerId = null;
-      g.selected = best.id;
+      if (g.selectedBuildingId === null) g.selected = best.id;
     }
     g.shelter.progress = Math.min(g.shelter.required, g.shelter.progress + dt);
     g.occupiedTowerId = g.shelter.progress >= g.shelter.required ? best.id : null;
   }
-  if (previousTowerId !== null && g.occupiedTowerId !== previousTowerId) releaseTowerAggro(g, previousTowerId);
   if (wasSheltered && g.occupiedTowerId === null && g.phase === 'combat') emitAudioEvent(g, 'exposed', p);
   if (!wasSheltered && g.occupiedTowerId !== null) emitAudioEvent(g, 'towerEntry', p);
 
@@ -626,9 +1027,31 @@ function updatePlayer(g, dt) {
  */
 function moveWithCollision(g, ent, dx, dy, radius) {
   const probe = Math.min(radius, 0.3);
+  const enemy = !!ent.def;
+  // D81/D82: walls and tower footprints are solid for enemies; walls except
+  // posterns are solid for the player. The tile an entity already stands in
+  // never blocks it, so nothing is trapped when a wall is laid over it.
+  const here = idx(clampTx(ent.x), clampTy(ent.y));
+  const structureBlocks = (tx, ty) => {
+    if (!inBounds(tx, ty)) return false;
+    const i = idx(tx, ty);
+    if (i === here) return false;
+    const blocker = g.blockerGrid[i];
+    if (!blocker) return false;
+    if (enemy) return true;
+    return blocker.kind === 'wall' && !blocker.structure.gate;
+  };
   const tryAxis = (nx, ny) => {
     for (const [ox, oy] of [[probe, 0], [-probe, 0], [0, probe], [0, -probe]]) {
-      if (!isPassable(g.map, Math.floor(nx + ox), Math.floor(ny + oy))) return false;
+      const tx = Math.floor(nx + ox);
+      const ty = Math.floor(ny + oy);
+      if (!isPassable(g.map, tx, ty)) return false;
+      if (structureBlocks(tx, ty)) return false;
+    }
+    if (ent.def) {
+      for (const tower of g.towers) {
+        if (Math.hypot(nx - tower.x, ny - tower.y) < radius + tower.radius) return false;
+      }
     }
     return true;
   };
@@ -666,20 +1089,15 @@ function updateTowers(g, dt) {
         + dt * upgradeRateMult(g, t) / t.upgrade.duration);
       if (t.upgrade.progress >= 1) {
         const { which, toLevel } = t.upgrade;
-        if (which === 'weapon') t.wLevel = toLevel;
-        else t.eLevel = toLevel; // D75: same footprint, same resourceScore; only the rate rises
+        t.wLevel = toLevel;
         t.upgrade = null;
-        const short = which === 'weapon' ? 'W' : 'E';
-        say(g, `${which === 'weapon' ? 'Weapon' : 'Extraction'} upgrade complete.`);
-        floater(g, t.x, t.y - 1.2, `${short}${toLevel} ONLINE`, '#5ecbff');
+        say(g, 'Weapon upgrade complete.');
+        floater(g, t.x, t.y - 1.2, `W${toLevel} ONLINE`, '#5ecbff');
         emitAudioEvent(g, 'upgrade', t);
       }
     }
 
     const s = towerStats(g, t);
-    const gained = s.income * dt;
-    g.materials += gained;
-    g.stats.materialsEarned += gained;
 
     t.shotCd -= dt;
     t.retargetIn -= dt;
@@ -721,6 +1139,33 @@ function updateTowers(g, dt) {
   }
 }
 
+function updateBuildings(g, dt) {
+  for (const b of g.buildings) {
+    b.flash = Math.max(0, (b.flash || 0) - dt * 3);
+    if (b.destroyed) continue;
+    if (b.hp <= 0) { destroyBuilding(g, b); continue; }
+    const def = BUILDINGS[b.type];
+    if (!b.built) {
+      const rate = constructionRateMult(g, b) / def.buildTime;
+      const before = b.progress;
+      b.progress = Math.min(1, b.progress + rate * dt);
+      const startFraction = def.buildHpFraction ?? TOWER.buildHpFraction;
+      b.hp = Math.min(b.maxHp, b.hp + (b.progress - before) * b.maxHp * (1 - startFraction));
+      if (b.progress >= 1) {
+        b.built = true;
+        b.hp = b.maxHp;
+        say(g, `${def.name} producing.`);
+        emitAudioEvent(g, 'constructionComplete', b);
+      }
+      continue;
+    }
+    const key = def.resource;
+    const gained = b.rate * dt;
+    g.res[key] += gained;
+    g.stats.resourcesEarned[key] += gained;
+  }
+}
+
 /** Prefer whatever is chewing on this tower, then the closest thing it can see. */
 function acquireTarget(g, t, range) {
   let best = null;
@@ -728,7 +1173,7 @@ function acquireTarget(g, t, range) {
   for (const e of g.enemies) {
     const d = dist(e, t);
     if (d > range) continue;
-    const key = (e.targetId === t.id && e.sieging ? 0 : 1000) + d;
+    const key = (e.blockerTargetId === t.id ? 0 : 1000) + d;
     if (key >= bestKey) continue;
     if (!hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) continue;
     bestKey = key;
@@ -748,15 +1193,16 @@ function spawnEnemy(g, typeKey, side, pointSeed) {
   const hpScale = 1 + WAVE.hpScalePerWave * (g.wave - 1);
   const e = {
     id: g.nextEnemyId++, type: typeKey, def, side,
+    structMult: 1 + WAVE.structScalePerWave * (g.wave - 1),
     x: p.x + 0.5, y: p.y + 0.5,
     hp: def.hp * hpScale, maxHp: def.hp * hpScale,
-    targetId: null, sieging: false, siegeAngle: 0,
-    retargetIn: AGGRO.retargetMin + Math.random() * (AGGRO.retargetMax - AGGRO.retargetMin),
+    targetId: g.keepId, strategicTargetId: g.keepId,
+    econTargetId: null, blockerTargetId: null,
+    playerAggroUntil: 0, playerAggroCooldownUntil: 0,
     hitCd: 0, flash: 0, stuckOrigin: 'spawn',
   };
-  retarget(g, e);
-  const target = enemyTargetField(g, e);
-  const spawn = validSpawnPosition(g, e, p, target?.field);
+  const field = keepField(g, e.type);
+  const spawn = validSpawnPosition(g, e, p, field);
   if (!spawn) return null;
   e.x = spawn.x;
   e.y = spawn.y;
@@ -787,115 +1233,40 @@ export function spawnGroupAt(g, x, y, typeKey, count) {
     g.enemies.push({
       id: g.nextEnemyId++, type: typeKey, def, side: 'debug',
       x: x + (Math.random() - 0.5) * 3, y: y + (Math.random() - 0.5) * 3,
-      hp: def.hp, maxHp: def.hp, targetId: null, sieging: false, siegeAngle: 0,
-      retargetIn: Math.random() * 2, hitCd: 0, flash: 0, stuckOrigin: 'spawn',
+      hp: def.hp, maxHp: def.hp, targetId: g.keepId, strategicTargetId: g.keepId,
+      econTargetId: null, blockerTargetId: null, playerAggroUntil: 0, playerAggroCooldownUntil: 0,
+      hitCd: 0, flash: 0, stuckOrigin: 'spawn',
     });
   }
 }
 
-/** D76: Swarm and Heavy hunt the tower network; the Runner hunts the player. */
-export function isStructureHunter(e) {
-  return ENEMIES[e.type]?.role === 'structures';
-}
-
-/**
- * D5/D76: a structure hunter is committed to whatever tower it has selected,
- * from the moment it selects it. Any other enemy is committed only if it was
- * already sieging when the D73/D76 breach replaced siege (legacy state).
- */
-function committedTo(e, t) {
-  return !!t && (isStructureHunter(e) || e.sieging || e.siegedId === t.id);
-}
-
-/** D76: path cost from the enemy to the tower on that tower's own lane field. */
-function towerPathCost(g, e, t) {
-  return fieldValueAt(towerField(g, t), e.x, e.y);
-}
-
-/** D76: the tower (finished or not) with the lowest finite path cost, if any. */
-function nearestReachableTower(g, e, exclude = null) {
-  let best = null;
-  let bestCost = Infinity;
-  for (const t of g.towers) {
-    if (t === exclude) continue;
-    const cost = towerPathCost(g, e, t);
-    if (cost < bestCost) { bestCost = cost; best = t; }
-  }
-  return best;
-}
-
-/**
- * D53: a tower target is held only while the player occupies it or this enemy
- * is committed to it. For a Runner an unoccupied tower is never a strategic target.
- */
-function staleTowerTarget(g, e, t) {
-  return !!t && t.id !== g.occupiedTowerId && !committedTo(e, t);
-}
-
-function setTarget(e, id) {
-  if (id !== e.targetId) { e.targetId = id; e.sieging = false; e.siegedId = null; }
-}
-
-/**
- * D76: a structure hunter keeps its tower until that tower is gone or its path
- * is. Choosing afresh, it takes the occupied tower when it can reach it, and
- * otherwise the nearest tower by path cost. With no reachable tower at all it
- * falls back to the player so it never stands idle holding the wave open.
- */
-function retargetStructureHunter(g, e) {
-  const current = g.towers.find((t) => t.id === e.targetId) || null;
-  if (current && Number.isFinite(towerPathCost(g, e, current))) return;
-  let next = null;
-  if (!current) {
-    const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
-    if (occupied && Number.isFinite(towerPathCost(g, e, occupied))) next = occupied;
-  }
-  next ||= nearestReachableTower(g, e, current);
-  // An unreachable reading with nowhere better to go keeps the commitment;
-  // stuck recovery owns getting it back onto the field.
-  if (!next && current) return;
-  setTarget(e, next ? next.id : PLAYER_TARGET_ID);
-}
-
-/**
- * D5/D53/D76: a structure hunter holds its tower (see above). A Runner already
- * committed keeps its target until that tower dies; otherwise it takes the one
- * strategic target the current state offers - the occupied tower, or the
- * exposed player - on a personal staggered timer, so aggro rolls over
- * gradually rather than the map turning as one.
- */
 function retarget(g, e) {
-  if (isStructureHunter(e)) { retargetStructureHunter(g, e); return; }
-  const currentTower = g.towers.find((t) => t.id === e.targetId) || null;
-  if (committedTo(e, currentTower)) return;
-  const occupied = g.towers.find((t) => t.id === g.occupiedTowerId) || null;
-  setTarget(e, occupied ? occupied.id : PLAYER_TARGET_ID);
-}
-
-/**
- * D53/D76: the player has just left a tower. Runners still merely heading for
- * it lose it as a target soon - each on a short random delay, so they peel away
- * rather than turn in unison. Structure hunters are committed and stay.
- */
-function releaseTowerAggro(g, towerId) {
-  for (const e of g.enemies) {
-    if (e.targetId !== towerId || committedTo(e, g.towers.find((t) => t.id === towerId))) continue;
-    e.retargetIn = Math.min(e.retargetIn, Math.random() * AGGRO.releaseDelayMax);
+  const p = g.player;
+  const d = dist(e, p);
+  const hunting = e.targetId === PLAYER_TARGET_ID;
+  const mustReturn = g.occupiedTowerId !== null
+    || d > e.def.playerAggroRange * ENEMY.playerGiveUpRangeMult
+    || (hunting && g.time >= e.playerAggroUntil)
+    || (hunting && !structureClearLine(g, e, p));
+  if (hunting && mustReturn) {
+    e.targetId = g.keepId;
+    e.playerAggroCooldownUntil = g.time + 0.75;
+    clearProgressEpisode(e);
+  }
+  if (e.targetId !== PLAYER_TARGET_ID && g.occupiedTowerId === null
+      && g.time >= e.playerAggroCooldownUntil
+      && d <= e.def.playerAggroRange
+      && hasLineOfSight(g.map, e.x, e.y, p.x, p.y)
+      && structureClearLine(g, e, p)) {
+    e.targetId = PLAYER_TARGET_ID;
+    e.playerAggroUntil = g.time + ENEMY.playerLeash;
+    e.econTargetId = null;
+    clearProgressEpisode(e);
   }
 }
 
-/** D53: near hunters close in directly; distant ones travel toward the player by road. */
 export function isHunting(g, e) {
-  return e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null
-    && dist(e, g.player) <= AGGRO.directPursuitRange;
-}
-
-function playerLaneField(g) {
-  if (g.time - g.playerLaneFieldAt > 0.5 || !g.playerLaneField) {
-    g.playerLaneFieldAt = g.time;
-    g.playerLaneField = computeField(g.map, [idx(clampTx(g.player.x), clampTy(g.player.y))], 'lane');
-  }
-  return g.playerLaneField;
+  return e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null;
 }
 
 function playerField(g) {
@@ -912,46 +1283,53 @@ function fieldValueAt(field, x, y) {
   return field && inBounds(tx, ty) ? field[idx(tx, ty)] : Infinity;
 }
 
-function enemyTargetField(g, e, resolved = null, directPursuit = null) {
-  resolved ||= g.towers.find((t) => t.id === e.targetId) || null;
-  if (resolved) return { field: towerField(g, resolved), key: `tower:${resolved.id}` };
-  if (e.targetId !== PLAYER_TARGET_ID || g.occupiedTowerId !== null) return null;
-  const direct = directPursuit ?? dist(e, g.player) <= AGGRO.directPursuitRange;
-  return direct
-    ? { field: playerField(g), key: 'player:direct' }
-    : { field: playerLaneField(g), key: 'player:lane' };
-}
-
 function safeNormTo(g, from, to, field) {
   return Number.isFinite(fieldValueAt(field, from.x, from.y))
     && hasClearWalk(g.map, from.x, from.y, to.x, to.y) ? normTo(from, to) : null;
+}
+
+/** True when no wall segment or tower footprint lies on the straight line. */
+export function structureClearLine(g, a, b) {
+  const steps = Math.max(1, Math.ceil(dist(a, b) / 0.25));
+  const start = idx(clampTx(a.x), clampTy(a.y));
+  const end = idx(clampTx(b.x), clampTy(b.y));
+  for (let k = 1; k < steps; k++) {
+    const x = a.x + (b.x - a.x) * k / steps;
+    const y = a.y + (b.y - a.y) * k / steps;
+    const i = idx(clampTx(x), clampTy(y));
+    if (i !== start && i !== end && g.blockerGrid[i]) return false;
+  }
+  return hasClearWalk(g.map, a.x, a.y, b.x, b.y);
+}
+
+function nearbyEconomyTarget(g, e) {
+  const current = g.buildings.find((b) => b.id === e.econTargetId && !b.destroyed) || null;
+  if (current && structureClearLine(g, e, current)) return current;
+  let best = null;
+  let bestD = Infinity;
+  for (const b of g.buildings) {
+    if (b.destroyed) continue;
+    const edge = dist(e, b) - structureRadius(b) - e.def.radius;
+    // A wall between them protects the building (D78: walls shelter economy).
+    if (edge <= ENEMY.econAggroRange && edge < bestD && structureClearLine(g, e, b)) { best = b; bestD = edge; }
+  }
+  e.econTargetId = best?.id ?? null;
+  return best;
 }
 
 function updateEnemies(g, dt) {
   const p = g.player;
 
   for (const e of [...g.enemies]) {
-    if (e.breached) continue;
     e.flash = Math.max(0, e.flash - dt * 4);
     e.hitCd = Math.max(0, e.hitCd - dt);
-    e.retargetIn -= dt;
-    if (e.retargetIn <= 0) {
-      e.retargetIn = AGGRO.retargetMin + Math.random() * (AGGRO.retargetMax - AGGRO.retargetMin);
-      retarget(g, e);
-    }
-
-    if (e.targetId !== null && !g.towers.some((t) => t.id === e.targetId)) {
-      if (e.targetId !== PLAYER_TARGET_ID || g.occupiedTowerId !== null) {
-        e.targetId = null;
-        e.sieging = false;
-      }
-    }
-    if (e.targetId === null) retarget(g, e);
+    retarget(g, e);
+    if (e.targetId !== PLAYER_TARGET_ID) e.targetId = g.keepId;
 
     // Opportunistic swipe at a player who wanders into reach, wherever it is headed.
     const dPlayer = dist(e, p);
     if (g.occupiedTowerId === null && dPlayer <= ENEMY.playerAttackRange + e.def.radius
-        && e.hitCd <= 0 && p.hurtCd <= 0) {
+        && e.hitCd <= 0 && p.hurtCd <= 0 && structureClearLine(g, e, p)) {
       e.hitCd = ENEMY.playerHitCooldown;
       const armour = hasEquipment(g, 'armourPlate') ? DROP.equipment.armourPlate.playerDamageTaken : 1;
       const playerDamage = e.def.playerHit * armour;
@@ -962,46 +1340,42 @@ function updateEnemies(g, dt) {
       burst(g, p.x, p.y, '#ff6b6b', 5, 2.5);
     }
 
-    let resolved = g.towers.find((t) => t.id === e.targetId) || null;
-    // D53: an enemy reaching a tower it no longer has reason to attack re-reads
-    // the situation instead of starting a siege there.
-    if (staleTowerTarget(g, e, resolved)
-        && dist(e, resolved) <= TOWER.radius + ENEMY.attackRange + e.def.radius) {
-      retarget(g, e);
-      resolved = g.towers.find((t) => t.id === e.targetId) || null;
-    }
-    const huntingPlayer = e.targetId === PLAYER_TARGET_ID && g.occupiedTowerId === null;
-    const directPursuit = huntingPlayer && dPlayer <= AGGRO.directPursuitRange;
+    const keep = keepTower(g);
+    const huntingPlayer = isHunting(g, e);
     const playerGoalKey = `${clampTx(p.x)},${clampTy(p.y)}`;
+    const econ = huntingPlayer ? null : nearbyEconomyTarget(g, e);
     let aim = null;
     let motionField = null;
     let motionFieldKey = null;
-    let reach = 0;
+    let attacking = false;
 
-    if (resolved) {
-      // D73/D76: every tower an enemy still holds as a target - occupied,
-      // abandoned or unfinished - is an endpoint. Keep closing (and taking
-      // fire) until actual contact, then breach once. Nothing sieges over
-      // time any more; a legacy besieger closes in and breaches like the rest.
-      e.sieging = false;
-      reach = breachContact(e);
-      if (dist(e, resolved) <= reach) { breachTower(g, e, resolved); continue; }
-      motionField = towerField(g, resolved);
-      motionFieldKey = `tower:${resolved.id}`;
-      aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, resolved, motionField);
-    } else if (directPursuit) {
+    if (huntingPlayer) {
       motionField = playerField(g);
       motionFieldKey = `player:direct:${playerGoalKey}`;
       aim = interceptAim(g, e, p) || steer(g.map, motionField, e.x, e.y)
         || safeNormTo(g, e, p, motionField);
-    } else if (huntingPlayer) {
-      motionField = playerLaneField(g);
-      motionFieldKey = `player:lane:${playerGoalKey}`;
-      aim = steer(g.map, motionField, e.x, e.y);
-      if (!aim) {
-        motionField = playerField(g);
-        motionFieldKey = `player:direct:${playerGoalKey}`;
-        aim = steer(g.map, motionField, e.x, e.y) || safeNormTo(g, e, p, motionField);
+    } else if (econ) {
+      motionFieldKey = `econ:${econ.id}`;
+      if (dist(e, econ) <= structureReach(e, econ)) {
+        attackStructure(g, e, econ, dt);
+        attacking = true;
+      } else aim = normTo(e, econ);
+    } else if (keep) {
+      motionField = keepField(g, e.type);
+      motionFieldKey = `keep:${e.type}:${g.blockerVersion}`;
+      if (dist(e, keep) <= structureReach(e, keep)) {
+        attackStructure(g, e, keep, dt);
+        attacking = true;
+      } else {
+        aim = steer(g.map, motionField, e.x, e.y, keepObstacles(g, e.type)) || safeNormTo(g, e, keep, motionField);
+        const blocker = aim?.i !== undefined ? g.blockerGrid[aim.i] : null;
+        if (blocker) {
+          e.blockerTargetId = blocker.id;
+          if (dist(e, blocker.structure) <= structureReach(e, blocker.structure)) {
+            attackStructure(g, e, blocker.structure, dt);
+            attacking = true;
+          }
+        } else e.blockerTargetId = null;
       }
     }
 
@@ -1027,7 +1401,7 @@ function updateEnemies(g, dt) {
     const l = Math.hypot(vx, vy);
     const px = e.x;
     const py = e.y;
-    if (l > 0.01) moveWithCollision(g, e, (vx / l) * speed * dt, (vy / l) * speed * dt, e.def.radius);
+    if (!attacking && l > 0.01) moveWithCollision(g, e, (vx / l) * speed * dt, (vy / l) * speed * dt, e.def.radius);
     if (Math.hypot(e.x - px, e.y - py) > 1e-6) {
       const separationStrength = Math.hypot(sx, sy) * 1.6;
       e.stuckOrigin = separationStrength > (aim ? 1 : 0) ? 'separation push'
@@ -1036,12 +1410,11 @@ function updateEnemies(g, dt) {
 
     // Last-resort unstick. An enemy that cannot make progress and is not
     // besieging anything would otherwise hold the wave open forever.
-    if (!e.sieging && Math.hypot(e.x - px, e.y - py) < speed * dt * 0.2) {
+    if (!attacking && Math.hypot(e.x - px, e.y - py) < speed * dt * 0.2) {
       e.stuck = (e.stuck || 0) + dt;
-      if (e.stuck > 1.5 && (resolved || huntingPlayer)) {
-        const field = resolved ? towerField(g, resolved) : directPursuit ? playerField(g) : playerLaneField(g);
-        const nudge = bestNeighbourTile(g, field, e.x, e.y);
-        recordStuckEpisode(g, e, field, 'nudge', !!nudge);
+      if (e.stuck > 1.5 && motionField) {
+        const nudge = bestNeighbourTile(g, motionField, e.x, e.y);
+        recordStuckEpisode(g, e, motionField, 'nudge', !!nudge);
         if (nudge) { e.x = nudge.x; e.y = nudge.y; }
         e.stuck = 0;
       }
@@ -1050,10 +1423,9 @@ function updateEnemies(g, dt) {
     }
 
 
-    const inTowerReach = resolved && dist(e, resolved) <= reach;
     const inPlayerReach = huntingPlayer && dPlayer <= ENEMY.playerAttackRange + e.def.radius;
     if (trackEnemyProgress(g, e, motionField, motionFieldKey,
-      !!motionField && !e.sieging && !inTowerReach && !inPlayerReach)) continue;
+      !!motionField && !attacking && !inPlayerReach)) continue;
   }
 }
 
@@ -1067,7 +1439,7 @@ function bestNeighbourTile(g, field, x, y) {
     for (let ox = -1; ox <= 1; ox++) {
       const nx = tx + ox;
       const ny = ty + oy;
-      if (!inBounds(nx, ny) || !isPassable(g.map, nx, ny)) continue;
+      if (!inBounds(nx, ny) || !isPassable(g.map, nx, ny) || g.blockerGrid[idx(nx, ny)]) continue;
       const d = field[idx(nx, ny)];
       if (d < bestD) { bestD = d; best = { x: nx + 0.5, y: ny + 0.5 }; }
     }
@@ -1076,11 +1448,12 @@ function bestNeighbourTile(g, field, x, y) {
 }
 
 function enemyFitsTile(g, e, tx, ty) {
-  if (!inBounds(tx, ty) || !isPassable(g.map, tx, ty)) return false;
+  if (!inBounds(tx, ty) || !isPassable(g.map, tx, ty) || g.blockerGrid[idx(tx, ty)]) return false;
   if (e.def.radius <= 0.5) return true;
   for (let oy = -1; oy <= 1; oy++) {
     for (let ox = -1; ox <= 1; ox++) {
-      if (!inBounds(tx + ox, ty + oy) || !isPassable(g.map, tx + ox, ty + oy)) return false;
+      if (!inBounds(tx + ox, ty + oy) || !isPassable(g.map, tx + ox, ty + oy)
+          || g.blockerGrid[idx(tx + ox, ty + oy)]) return false;
     }
   }
   return true;
@@ -1286,22 +1659,15 @@ export function equipmentState(g) {
   };
 }
 
-export function depositRichness(map, deposit) {
-  const d = typeof deposit === 'number' ? map.deposits[deposit] : deposit;
-  if (!d) return null;
-  const tier = richnessTierForRate(d.income);
-  return { tier: tier.key, name: tier.name, bars: tier.bars, income: d.income };
-}
-
 export function spawnDrop(g, x, y, forcedCategory = null, forcedKey = null) {
   const unavailable = g.equipment.length >= DROP.equipmentCap;
   const weights = DROP.categoryWeights;
   let category = forcedCategory;
   if (!category) {
-    const total = weights.temporary + weights.materials + (unavailable ? 0 : weights.equipment);
+    const total = weights.temporary + weights.supply + (unavailable ? 0 : weights.equipment);
     let roll = Math.random() * total;
     category = (roll -= weights.temporary) < 0 ? 'temporary'
-      : (roll -= weights.materials) < 0 ? 'materials' : 'equipment';
+      : (roll -= weights.supply) < 0 ? 'supply' : 'equipment';
   }
 
   if (category === 'equipment') {
@@ -1315,11 +1681,12 @@ export function spawnDrop(g, x, y, forcedCategory = null, forcedKey = null) {
       return;
     }
   }
-  if (category === 'materials') {
-    const def = DROP.materialsCache;
+  if (category === 'supply') {
+    const def = DROP.supplyCache;
     const amount = Math.round(def.min + Math.random() * (def.max - def.min));
-    g.drops.push({ category, key: 'materials', def, amount, x, y, t: 0 });
-    emitAudioEvent(g, 'dropSpawn', { x, y, category, key: 'materials' });
+    const resource = Math.random() < 0.5 ? 'food' : 'stone';
+    g.drops.push({ category, key: resource, resource, def, amount, x, y, t: 0 });
+    emitAudioEvent(g, 'dropSpawn', { x, y, category, key: resource });
     return;
   }
   const keys = Object.keys(DROP.temporary);
@@ -1334,10 +1701,10 @@ export function collectDrop(g, d) {
     if (!grantEquipment(g, d.key)) return false;
     floater(g, g.player.x, g.player.y - 1, d.def.name, d.def.color);
     say(g, `${d.def.name} equipped for this run.`);
-  } else if (d.category === 'materials') {
-    g.materials += d.amount;
-    g.stats.materialsEarned += d.amount;
-    floater(g, g.player.x, g.player.y - 1, `+${d.amount} Materials`, d.def.color);
+  } else if (d.category === 'supply') {
+    g.res[d.resource] += d.amount;
+    g.stats.resourcesEarned[d.resource] += d.amount;
+    floater(g, g.player.x, g.player.y - 1, `+${d.amount} ${d.resource}`, d.def.color);
   } else if (d.def.instant) {
     // Patches up the tower you are holding AND you. After a collapse this is
     // the thing worth sprinting into the open for.
@@ -1378,7 +1745,8 @@ function updateDrops(g, dt) {
 // ---------------------------------------------------------------------------
 
 function rollWave(g) {
-  let budget = WAVE.budgetBase + WAVE.budgetPerWave * (g.wave - 1);
+  const w = g.wave - 1;
+  let budget = WAVE.budgetBase + WAVE.budgetPerWave * w + WAVE.budgetAccel * w * w;
   const available = Object.entries(ENEMIES).filter(([, d]) => g.wave >= d.unlockWave);
   const sides = g.wave >= WAVE.bothSidesFromWave && Math.random() < 0.55
     ? ['west', 'east']
@@ -1493,8 +1861,9 @@ export function dangerState(g) {
 }
 
 export function towerAlarmState(g) {
-  return g.towers.map((t) => ({
+  return [...g.towers, ...g.buildings.filter((b) => !b.destroyed)].map((t) => ({
     id: t.id,
+    kind: t.type ? 'building' : 'tower',
     active: Number.isFinite(t.unseenHitAt) && g.time - t.unseenHitAt < 1.5,
   }));
 }
@@ -1511,26 +1880,94 @@ export function endState(g) {
   return { status: g.status, lossCause: g.lossCause || null };
 }
 
+export function keepState(g) {
+  const keep = keepTower(g);
+  return keep ? { id: keep.id, x: keep.x, y: keep.y, hp: keep.hp, maxHp: keep.maxHp,
+    built: keep.built, occupied: g.occupiedTowerId === keep.id } : null;
+}
+
+export function resourceState(g) {
+  const rates = { food: 0, stone: 0, gold: 0 };
+  for (const b of g.buildings) {
+    if (b.destroyed || !b.built) continue;
+    rates[BUILDINGS[b.type].resource] += b.rate;
+  }
+  return { totals: { ...g.res }, rates };
+}
+
+export function buildingState(g) {
+  return g.buildings.map((b) => ({
+    id: b.id, type: b.type, x: b.x, y: b.y, hp: b.hp, maxHp: b.maxHp,
+    built: b.built, progress: b.progress, destroyed: b.destroyed, rate: b.rate, siteId: b.siteId,
+  }));
+}
+
+export function resourceSitesState(g) {
+  return (g.map.sites || []).filter((site) => isPointVisible(g, site.x, site.y)
+    || isTileExplored(g, Math.floor(site.x), Math.floor(site.y)))
+    .map((site) => ({ ...site, claimed: !!activeSiteClaim(g, site.id) }));
+}
+
+export function keepFieldState(g) {
+  return {
+    blockerVersion: g.blockerVersion,
+    recomputes: g.stats.keepFieldRecomputes,
+    cachedTypes: Object.keys(g.keepFields),
+    blockers: g.blockerGrid.reduce((n, b) => n + (b ? 1 : 0), 0),
+  };
+}
+
+/** Read-only acceptance surface for the cached per-type D82 field. */
+export function enemyKeepField(g, type) {
+  return keepField(g, type);
+}
+
 // ---------------------------------------------------------------------------
 // Repair
 // ---------------------------------------------------------------------------
 
+function inRepairReach(g, s) {
+  if (!s.wall && !s.type && g.occupiedTowerId === s.id) return true;
+  return dist(g.player, s) - structureRadius(s) <= TOWER.repair.reach;
+}
+
+/** D83: the structure Repair would work on right now, or null. Never remote. */
+export function repairTarget(g) {
+  // Half an hp of slack: float build steps must not read as damage.
+  const needs = (s) => s && (s.destroyed ? !!s.wall : s.hp < s.maxHp - 0.5);
+  const occupied = g.towers.find((o) => o.id === g.occupiedTowerId);
+  if (needs(occupied)) return occupied;
+  const selected = g.towers.find((o) => o.id === g.selected)
+    || g.buildings.find((b) => b.id === g.selectedBuildingId && !b.destroyed);
+  if (needs(selected) && inRepairReach(g, selected)) return selected;
+  let best = null;
+  let bestD = Infinity;
+  const candidates = [...g.towers, ...g.buildings.filter((b) => !b.destroyed), ...wallSegments(g)];
+  for (const s of candidates) {
+    if (!needs(s) || !inRepairReach(g, s)) continue;
+    const d = dist(g.player, s) - structureRadius(s);
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  return best;
+}
+
 function updateRepair(g, dt) {
   if (!g.input.repair) return;
-  const t = g.towers.find((o) => o.id === (g.occupiedTowerId ?? g.selected));
-  if (!t || t.hp >= t.maxHp || !t.built) return;
+  const t = repairTarget(g);
+  if (!t) return;
+  if (t.wall && t.destroyed) { rebuildWallSegment(g, t); return; }
 
   const occ = occupancyMults(g);
   const rig = hasEquipment(g, 'repairRig') ? DROP.equipment.repairRig.repairSpeed : 1;
-  const rate = TOWER.repair.hpPerSec * (g.occupiedTowerId === t.id ? occ.repair : 1) * rig;
+  const rate = TOWER.repair.hpPerSec * (g.occupiedTowerId === t.id && !t.type && !t.wall ? occ.repair : 1) * rig;
   const perHp = repairCostPerHp(g);
   let hp = rate * dt;
   const cost = hp * perHp;
-  if (cost > g.materials) hp = g.materials / perHp;
+  if (cost > g.res.stone) hp = g.res.stone / perHp;
   hp = Math.min(hp, t.maxHp - t.hp);
   if (hp <= 0) return;
   t.hp += hp;
-  g.materials -= hp * perHp;
+  g.res.stone -= hp * perHp;
   if (Math.random() < 0.25) burst(g, t.x, t.y - 0.5, '#5ecbff', 2, 1.5);
   emitAudioEvent(g, 'repair', t);
 }
@@ -1574,10 +2011,10 @@ function resolveEndState(g) {
     g.lossCause = 'died';
     emitAudioEvent(g, 'playerDeath', g.player);
     say(g, 'You died. Run over.');
-  } else if (g.towers.length === 0) {
+  } else if (!keepTower(g)) {
     g.status = 'lost';
-    g.lossCause = 'towers';
-    say(g, 'All towers destroyed. Position lost.');
+    g.lossCause = 'keep';
+    say(g, 'The Keep has fallen. Position lost.');
     if (g.lastTowerDestroyAt !== g.time) emitAudioEvent(g, 'towerDestroy', g.player);
   }
 }
@@ -1590,6 +2027,8 @@ export function update(g, dt, { ignorePause = false } = {}) {
   updatePlayer(g, dt);
   updateRepair(g, dt);
   updateTowers(g, dt);
+  updateBuildings(g, dt);
+  updateWalls(g, dt);
   recomputeVisibility(g);
   updateEnemies(g, dt);
   updateDrops(g, dt);

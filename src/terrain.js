@@ -1,7 +1,7 @@
 // D1/D2: terrain is authored by algorithm in deliberate passes, then validated
 // and thrown away if it does not produce the tactical shape the prototype needs.
 
-import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, VALID, ROAD, TOWER, EXPOSURE_GEN, READABILITY, richnessTierForRate,
+import { MAP, T, PASSABLE, MOVE_COST, ELEV_BANDS, GEN, RESOURCE_GEN, VALID, ROAD, TOWER, KEEP, EXPOSURE_GEN, READABILITY,
          BLOCKS_SIGHT_ALWAYS, BLOCKS_SIGHT_UNLESS_ABOVE } from './config.js';
 import { hashString, makeRng, makeNoise2D, fbm, randInt, shuffle } from './rng.js';
 import { findCostPath } from './flowfield.js';
@@ -117,7 +117,7 @@ function spreadRanges(rng, count, minH, maxH, minSep) {
 
 function chooseBarrierColumns(rng) {
   // Spread across the map but never through the centre, where the start tower sits.
-  const fractions = [0.13, 0.20, 0.27, 0.34, 0.66, 0.73, 0.80, 0.87];
+  const fractions = [0.09, 0.17, 0.25, 0.33, 0.41, 0.59, 0.67, 0.75, 0.83, 0.91];
   const candidates = shuffle(rng, fractions).map((f) => Math.round(f * MAP.w));
 
   // The river is claimed first so every map reliably has one; ridges then keep
@@ -127,8 +127,8 @@ function chooseBarrierColumns(rng) {
   const ridges = [];
   for (const c of candidates.slice(1)) {
     if (ridges.length >= ridgeCount) break;
-    if (Math.abs(c - river) < 14) continue;
-    if (ridges.every((r) => Math.abs(r - c) >= 11)) ridges.push(c);
+    if (Math.abs(c - river) < 22) continue;
+    if (ridges.every((r) => Math.abs(r - c) >= 17)) ridges.push(c);
   }
   return { ridges, river };
 }
@@ -139,7 +139,7 @@ function stampRidges(map, rng, columns) {
     const xs = wanderingLine(rng, cx, GEN.ridges.wander);
     const thickness = randInt(rng, GEN.ridges.thicknessMin, GEN.ridges.thicknessMax);
     // Deliberate gaps: at least two, so the ridge is a chokepoint and not a wall.
-    const gapCount = rng() < 0.28 ? 3 : 2;
+    const gapCount = rng() < 0.58 ? 4 : 3;
     const gaps = spreadRanges(rng, gapCount, GEN.ridgeGap.min, GEN.ridgeGap.max, GEN.ridgeGap.minSeparation);
 
     for (let y = 0; y < MAP.h; y++) {
@@ -167,7 +167,7 @@ function stampRiver(map, rng, cx) {
   const xs = wanderingLine(rng, cx, GEN.river.wander);
   const width = randInt(rng, GEN.river.widthMin, GEN.river.widthMax);
   const fords = spreadRanges(rng, randInt(rng, GEN.fords.min, GEN.fords.max),
-                             GEN.fords.heightMin, GEN.fords.heightMax, 6);
+                             GEN.fords.heightMin, GEN.fords.heightMax, GEN.fords.minSeparation);
 
   for (let y = 0; y < MAP.h; y++) {
     const isFord = fords.some((f) => y >= f.y0 && y < f.y1);
@@ -253,189 +253,216 @@ function clearArea(map, cx, cy, r, kind = T.PLAIN, elev = 1) {
   }
 }
 
-/** Tiles inside a deposit kernel, with its (1 - d/r)^1.4 falloff weight. */
-function kernelCells(cx, cy, radius) {
-  const cells = [];
+/** D80: a Farm uses the mean of its complete 3x3, and needs a majority fertile. */
+export function farmSiteInfo(map, x, y) {
+  const cx = Math.floor(x);
+  const cy = Math.floor(y);
+  let fertileTiles = 0;
+  let sum = 0;
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      if (!inBounds(cx + ox, cy + oy)) continue;
+      const fertility = map.fertility?.[idx(cx + ox, cy + oy)] || 0;
+      if (fertility > 0) fertileTiles++;
+      sum += fertility;
+    }
+  }
+  return { valid: fertileTiles >= 5, fertileTiles, mean: sum / 9 };
+}
+
+function resourceDistance(map, x, y) {
+  return Math.hypot(x - (map.start.x + 0.5), y - (map.start.y + 0.5));
+}
+
+function resourceTileOK(map, x, y) {
+  return inBounds(x, y) && PASSABLE[map.kind[idx(x, y)]] && !map.road[idx(x, y)];
+}
+
+function farmCentreOK(map, x, y) {
+  let usable = 0;
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      const tx = x + ox;
+      const ty = y + oy;
+      if (inBounds(tx, ty) && map.kind[idx(tx, ty)] === T.PLAIN && !map.road[idx(tx, ty)]) usable++;
+    }
+  }
+  return usable >= 7;
+}
+
+function findResourceTile(map, rng, predicate, separatedFrom = [], minSeparation = 0) {
+  const margin = RESOURCE_GEN.siteEdgeMargin;
+  const separated = (x, y) => separatedFrom.every((s) => Math.hypot(x + 0.5 - s.x, y + 0.5 - s.y) >= minSeparation);
+  for (let tries = 0; tries < 700; tries++) {
+    const x = randInt(rng, margin, MAP.w - margin - 1);
+    const y = randInt(rng, margin, MAP.h - margin - 1);
+    if (separated(x, y) && predicate(x, y)) return { x, y };
+  }
+  // Deterministic fallback means geography guarantees do not depend on lucky
+  // rejection sampling in a crowded map.
+  const candidates = [];
+  for (let y = margin; y < MAP.h - margin; y++) {
+    for (let x = margin; x < MAP.w - margin; x++) {
+      if (separated(x, y) && predicate(x, y)) candidates.push({ x, y });
+    }
+  }
+  return candidates.length ? candidates[Math.floor(rng() * candidates.length)] : null;
+}
+
+function stampFarmland(map, cx, cy, radius, tier, mult) {
+  const site = {
+    id: `farmland-${map.farmland.length}`, type: 'farmland',
+    x: cx + 0.5, y: cy + 0.5, r: radius, tier, mult,
+  };
+  map.farmland.push(site);
   for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
     for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
-      if (!inBounds(x, y)) continue;
-      const distance = Math.hypot(x - cx, y - cy);
-      if (distance > radius) continue;
-      cells.push({ i: idx(x, y), kernel: (1 - distance / radius) ** 1.4 });
+      if (!inBounds(x, y) || Math.hypot(x - cx, y - cy) > radius) continue;
+      const i = idx(x, y);
+      // Farmland is readable cultivated Plain, never a road or another biome.
+      if (map.kind[i] === T.PLAIN && !map.road[i]) map.fertility[i] = Math.max(map.fertility[i], mult);
     }
   }
-  return cells;
+  return site;
 }
 
-/** Fraction of the 5x5 tile centres around (x, y) where a tower could stand. */
-function openFraction(map, x, y) {
-  let open = 0;
-  for (let oy = -2; oy <= 2; oy++) {
-    for (let ox = -2; ox <= 2; ox++) {
-      if (inBounds(x + ox, y + oy) && isTerrainBuildable(map, x + ox + 0.5, y + oy + 0.5)) open++;
-    }
-  }
-  return open / 25;
+function addPointSite(list, type, x, y, tier, mult) {
+  const site = { id: `${type}-${list.length}`, type, x: x + 0.5, y: y + 0.5, tier, mult };
+  list.push(site);
+  return site;
 }
 
-/**
- * D68/D74: add a deposit kernel on top of the current map, with the peak found
- * by a monotone binary search so a tower at tile (siteX, siteY) earns exactly
- * `target` base Materials/s, including overlap and the per-tile 1.8 cap.
- */
-function solveKernelPeak(map, deposit, siteX, siteY, target) {
-  const cells = kernelCells(deposit.x, deposit.y, deposit.r);
-  const slot = new Map(cells.map((cell, n) => [cell.i, n]));
-  const base = cells.map((cell) => map.res[cell.i]);
-  const radius = TOWER.extraction.radius;
-  const incomeAt = (peak) => {
-    let sum = 0;
-    for (let y = Math.floor(siteY + 0.5 - radius); y <= Math.ceil(siteY + 0.5 + radius); y++) {
-      for (let x = Math.floor(siteX + 0.5 - radius); x <= Math.ceil(siteX + 0.5 + radius); x++) {
-        if (!inBounds(x, y) || Math.hypot(x - siteX, y - siteY) > radius) continue;
-        const n = slot.get(idx(x, y));
-        sum += n === undefined ? map.res[idx(x, y)] : Math.min(1.8, base[n] + peak * cells[n].kernel);
-      }
-    }
-    return (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
-  };
-  let lo = 0;
-  let hi = 1;
-  while (incomeAt(hi) < target && hi < 16) hi *= 2;
-  for (let pass = 0; pass < 32; pass++) {
-    const mid = (lo + hi) * 0.5;
-    if (incomeAt(mid) < target) lo = mid;
-    else hi = mid;
+/** D80: replace continuous Materials richness with distance-graded features. */
+function placeResourceSites(map, rng) {
+  map.fertility = new Float32Array(MAP.w * MAP.h);
+  map.farmland = [];
+  map.stoneSites = [];
+  map.goldSites = [];
+  const F = RESOURCE_GEN.farmland;
+  const S = RESOURCE_GEN.stone;
+  const G = RESOURCE_GEN.gold;
+
+  // Two modest, separated fields are guaranteed inside the Keep's local area.
+  for (let n = 0; n < F.minNearFarms; n++) {
+    const q = findResourceTile(map, rng, (x, y) => {
+      const d = resourceDistance(map, x + 0.5, y + 0.5);
+      return d >= F.nearCentreMin && d <= RESOURCE_GEN.nearRadius && farmCentreOK(map, x, y);
+    }, map.farmland, F.minSeparation);
+    if (q) stampFarmland(map, q.x, q.y, 4, 'fertile', F.fertile);
   }
-  const peak = (lo + hi) * 0.5;
-  cells.forEach((cell, n) => { map.res[cell.i] = Math.min(1.8, base[n] + peak * cell.kernel); });
-  return peak;
+
+  // The first expansion band always contains a visibly stronger field.
+  const middleFarm = findResourceTile(map, rng, (x, y) => {
+    const d = resourceDistance(map, x + 0.5, y + 0.5);
+    return d >= F.richFrom && d <= RESOURCE_GEN.middleRadius && farmCentreOK(map, x, y);
+  }, map.farmland, F.minSeparation);
+  if (middleFarm) stampFarmland(map, middleFarm.x, middleFarm.y, 4, 'rich', F.rich);
+
+  const farmTarget = randInt(rng, F.minBlobs, F.maxBlobs);
+  while (map.farmland.length < farmTarget) {
+    const q = findResourceTile(map, rng, (x, y) => farmCentreOK(map, x, y), map.farmland, F.minSeparation);
+    if (!q) break;
+    const d = resourceDistance(map, q.x + 0.5, q.y + 0.5);
+    const richChance = d >= RESOURCE_GEN.middleRadius ? F.richChanceFar : F.richChanceMiddle;
+    const rich = d >= F.richFrom && rng() < richChance;
+    stampFarmland(map, q.x, q.y, randInt(rng, F.radiusMin, F.radiusMax),
+      rich ? 'rich' : 'fertile', rich ? F.rich : F.fertile);
+  }
+
+  // A modest stone outcrop is always reachable from the Keep's opening area.
+  for (let n = 0; n < S.minNear; n++) {
+    const q = findResourceTile(map, rng, (x, y) => {
+      const d = resourceDistance(map, x + 0.5, y + 0.5);
+      return d >= S.nearCentreMin && d <= RESOURCE_GEN.nearRadius && resourceTileOK(map, x, y);
+    }, map.stoneSites, S.minSeparation);
+    if (q) addPointSite(map.stoneSites, 'stone', q.x, q.y, 'normal', S.normal);
+  }
+  const stoneTarget = randInt(rng, S.min, S.max);
+  const middleStone = findResourceTile(map, rng, (x, y) => {
+    const d = resourceDistance(map, x + 0.5, y + 0.5);
+    return d > RESOURCE_GEN.nearRadius && d <= RESOURCE_GEN.middleRadius && resourceTileOK(map, x, y);
+  }, map.stoneSites, S.minSeparation);
+  if (middleStone) addPointSite(map.stoneSites, 'stone', middleStone.x, middleStone.y, 'normal', S.normal);
+  // Seed the far band with the best stone before filling intermediate sites.
+  const farStone = findResourceTile(map, rng, (x, y) => resourceTileOK(map, x, y)
+    && resourceDistance(map, x + 0.5, y + 0.5) >= RESOURCE_GEN.farRadius,
+  map.stoneSites, S.minSeparation);
+  if (farStone) addPointSite(map.stoneSites, 'stone', farStone.x, farStone.y, 'rich', S.rich);
+  while (map.stoneSites.length < stoneTarget) {
+    const q = findResourceTile(map, rng, (x, y) => resourceTileOK(map, x, y), map.stoneSites, S.minSeparation);
+    if (!q) break;
+    const rich = resourceDistance(map, q.x + 0.5, q.y + 0.5) >= S.richFrom && rng() < 0.72;
+    addPointSite(map.stoneSites, 'stone', q.x, q.y, rich ? 'rich' : 'normal', rich ? S.rich : S.normal);
+  }
+
+  const goldTarget = randInt(rng, G.min, G.max);
+  // The first gold is in the middle band; another rich site is guaranteed far
+  // away. No gold exists in the Keep's 28-tile safety region.
+  const middleGold = findResourceTile(map, rng, (x, y) => {
+    const d = resourceDistance(map, x + 0.5, y + 0.5);
+    return d >= RESOURCE_GEN.goldExclusionRadius && d <= RESOURCE_GEN.middleRadius && resourceTileOK(map, x, y);
+  }, map.goldSites, G.minSeparation);
+  if (middleGold) addPointSite(map.goldSites, 'gold', middleGold.x, middleGold.y, 'normal', G.normal);
+  const farGold = findResourceTile(map, rng, (x, y) => resourceTileOK(map, x, y)
+    && resourceDistance(map, x + 0.5, y + 0.5) >= RESOURCE_GEN.farRadius,
+  map.goldSites, G.minSeparation);
+  if (farGold) addPointSite(map.goldSites, 'gold', farGold.x, farGold.y, 'rich', G.rich);
+  while (map.goldSites.length < goldTarget) {
+    const q = findResourceTile(map, rng, (x, y) => resourceTileOK(map, x, y)
+      && resourceDistance(map, x + 0.5, y + 0.5) >= RESOURCE_GEN.goldExclusionRadius,
+    map.goldSites, G.minSeparation);
+    if (!q) break;
+    const rich = resourceDistance(map, q.x + 0.5, q.y + 0.5) >= G.richFrom && rng() < 0.78;
+    addPointSite(map.goldSites, 'gold', q.x, q.y, rich ? 'rich' : 'normal', rich ? G.rich : G.normal);
+  }
+  map.sites = [...map.farmland, ...map.stoneSites, ...map.goldSites];
 }
 
-/** D9: resource richness is placed as discrete deposits so the player can see it. */
-function placeDeposits(map, rng, start) {
-  const deposits = [];
-  // D74: seams combine by max, so overlapping background seams never stack.
-  const add = (cx, cy, radius, peak, apply = true) => {
-    const deposit = { x: cx, y: cy, r: radius, peak };
-    deposits.push(deposit);
-    if (!apply) return deposit;
-    for (const cell of kernelCells(cx, cy, radius)) {
-      map.res[cell.i] = Math.max(map.res[cell.i], Math.min(1.8, peak * cell.kernel));
+/** The generation-side D80 contract, also useful to tests/debug surfaces. */
+export function validateResourceGeography(map) {
+  const problems = [];
+  if (!map.fertility || !map.stoneSites || !map.goldSites) return { ok: true, problems, skipped: true };
+  const sx = map.start.x + 0.5;
+  const sy = map.start.y + 0.5;
+  const viable = [];
+  for (let y = 1; y < MAP.h - 1; y++) {
+    for (let x = 1; x < MAP.w - 1; x++) {
+      if (Math.hypot(x + 0.5 - sx, y + 0.5 - sy) > RESOURCE_GEN.nearRadius) continue;
+      if (!farmSiteInfo(map, x + 0.5, y + 0.5).valid) continue;
+      if (viable.every((q) => Math.hypot(q.x - x, q.y - y) >= 3)) viable.push({ x, y });
     }
-    return deposit;
+  }
+  const nearStone = map.stoneSites.filter((s) => Math.hypot(s.x - sx, s.y - sy) <= RESOURCE_GEN.nearRadius
+    && s.tier === 'normal').length;
+  const nearGold = map.goldSites.filter((s) => Math.hypot(s.x - sx, s.y - sy) < RESOURCE_GEN.goldExclusionRadius).length;
+  const middleGold = map.goldSites.filter((s) => {
+    const d = Math.hypot(s.x - sx, s.y - sy);
+    return d >= RESOURCE_GEN.goldExclusionRadius && d <= RESOURCE_GEN.middleRadius;
+  }).length;
+  const farStone = map.stoneSites.filter((s) => s.tier === 'rich'
+    && Math.hypot(s.x - sx, s.y - sy) >= RESOURCE_GEN.farRadius).length;
+  const farGold = map.goldSites.filter((s) => s.tier === 'rich'
+    && Math.hypot(s.x - sx, s.y - sy) >= RESOURCE_GEN.farRadius).length;
+  const middleRichFarmland = map.farmland.filter((s) => {
+    const d = Math.hypot(s.x - sx, s.y - sy);
+    return s.tier === 'rich' && d >= RESOURCE_GEN.farmland.richFrom && d <= RESOURCE_GEN.middleRadius;
+  }).length;
+  const middleStone = map.stoneSites.filter((s) => {
+    const d = Math.hypot(s.x - sx, s.y - sy);
+    return d > RESOURCE_GEN.nearRadius && d <= RESOURCE_GEN.middleRadius;
+  }).length;
+  if (viable.length < RESOURCE_GEN.farmland.minNearFarms) problems.push(`only ${viable.length} near-Keep farm sites`);
+  if (nearStone < RESOURCE_GEN.stone.minNear) problems.push('no modest stone site near the Keep');
+  if (nearGold) problems.push(`${nearGold} gold site(s) inside the Keep exclusion`);
+  if (!middleRichFarmland) problems.push('no rich farmland in the middle distance');
+  if (!middleStone) problems.push('no stone site in the middle distance');
+  if (!middleGold) problems.push('no gold site in the middle distance');
+  if (!farStone) problems.push('no rich stone in far territory');
+  if (!farGold) problems.push('no rich gold in far territory');
+  return {
+    ok: problems.length === 0, problems, viableNearFarms: viable.length,
+    nearStone, nearGold, middleRichFarmland, middleStone, middleGold, farStone, farGold,
   };
-  // Rich seams skew away from the safe centre and obvious road chokepoints.
-  // This creates economic temptation without manufacturing a defensible site.
-  const awkwardness = (x, y) => {
-    const fromStart = Math.hypot(x - start.x, y - start.y);
-    const centreDistance = Math.min(1, fromStart / (MAP.w * GEN.deposits.distanceMapFraction));
-    let nearestRoad = GEN.deposits.roadDistanceNormalizer;
-    for (let oy = -GEN.deposits.roadSearchRadius; oy <= GEN.deposits.roadSearchRadius; oy++) {
-      for (let ox = -GEN.deposits.roadSearchRadius; ox <= GEN.deposits.roadSearchRadius; ox++) {
-        const nx = x + ox;
-        const ny = y + oy;
-        if (inBounds(nx, ny) && map.road[idx(nx, ny)]) nearestRoad = Math.min(nearestRoad, Math.hypot(ox, oy));
-      }
-    }
-    return Math.min(1, centreDistance * GEN.deposits.distanceWeight
-      + (nearestRoad / GEN.deposits.roadDistanceNormalizer) * GEN.deposits.roadDistanceWeight);
-  };
-
-  const n = randInt(rng, GEN.deposits.min, GEN.deposits.max);
-  // Consume the same seeded centre rolls before the remote seams, but defer
-  // this blob until every other deposit and the ambient floor are present.
-  const startDeposit = add(
-    start.x + (rng() - 0.5) * 6,
-    start.y + (rng() - 0.5) * 6,
-    5,
-    0,
-    false,
-  );
-  startDeposit.start = true;
-
-  // D74: Rich is authored, not emergent. A few separated jackpots are sited
-  // first on open, buildable, awkward ground; seams keep clear of them so each
-  // jackpot's own falloff is its Moderate halo and its Rich core stays small.
-  // Their peaks are solved for centre income once every seam is down.
-  const rich = GEN.deposits.rich;
-  const jackpotCount = randInt(rng, rich.min, rich.max);
-  const jackpots = [];
-  for (let k = 0; k < jackpotCount; k++) {
-    let best = null;
-    for (let c = 0; c < rich.candidates; c++) {
-      const x = randInt(rng, 4, MAP.w - 5);
-      const y = randInt(rng, 3, MAP.h - 4);
-      const jitter = rng();
-      if (Math.hypot(x - start.x, y - start.y) < rich.minFromStart) continue;
-      if (jackpots.some((j) => Math.hypot(x - j.x, y - j.y) < rich.minSeparation)) continue;
-      if (!isTerrainBuildable(map, x + 0.5, y + 0.5) || openFraction(map, x, y) < rich.openNeighbourhood) continue;
-      const score = awkwardness(x, y) * GEN.deposits.awkwardnessWeight + jitter * GEN.deposits.randomWeight;
-      if (!best || score > best.score) best = { x, y, score };
-    }
-    if (!best) break;
-    const jackpot = add(best.x, best.y, rich.radius, 0, false);
-    jackpot.rich = true;
-    jackpot.target = rich.targetMin + (rich.targetMax - rich.targetMin) * rng();
-    jackpots.push(jackpot);
-  }
-
-  let placed = 0;
-  let tries = 0;
-  while (placed < n && tries++ < n * 40) {
-    const x = randInt(rng, 4, MAP.w - 5);
-    const y = randInt(rng, 3, MAP.h - 4);
-    if (!isPassable(map, x, y)) continue;
-    if (jackpots.some((j) => Math.hypot(x - j.x, y - j.y) < rich.seamClearance)) continue;
-    // Keep the safe starting area mediocre; richer authored seams begin where
-    // expansion exposes the player to real travel and defence tradeoffs.
-    const fromStart = Math.hypot(x - start.x, y - start.y);
-    if (fromStart < GEN.deposits.startExclusionRadius
-        || (fromStart < GEN.deposits.startBufferRadius && rng() < GEN.deposits.startBufferRejectChance)) continue;
-    const awkward = awkwardness(x, y);
-    const peakSpan = GEN.deposits.peakMax - GEN.deposits.peakMin;
-    const peak = GEN.deposits.peakMin + peakSpan * Math.min(1,
-      awkward * GEN.deposits.awkwardnessWeight + rng() * GEN.deposits.randomWeight);
-    add(x, y, randInt(rng, GEN.deposits.radiusMin, GEN.deposits.radiusMax), peak);
-    placed++;
-  }
-
-  // Ambient floor: poor ground still pays a trickle, so the economic choice is
-  // "how good is this site" rather than "is there anything here at all".
-  for (let i = 0; i < map.res.length; i++) {
-    if (PASSABLE[map.kind[i]]) map.res[i] = Math.min(1.8, map.res[i] + GEN.ambientResource);
-  }
-
-  for (const jackpot of jackpots) {
-    jackpot.peak = solveKernelPeak(map, jackpot, jackpot.x, jackpot.y, jackpot.target);
-  }
-
-  // D68: deterministically solve the deferred start blob against the actual
-  // generated tower site. The monotone binary search accounts for overlap with
-  // remote seams and the per-tile 1.8 cap without moving any rich seam closer.
-  startDeposit.peak = solveKernelPeak(map, startDeposit, start.x, start.y, GEN.deposits.startIncomeTarget);
-  // The start marker represents the calibrated extraction site, not the
-  // jittered kernel centre (whose local preview can differ from the tower).
-  startDeposit.markerX = start.x;
-  startDeposit.markerY = start.y;
-
-  for (const d of deposits) {
-    let sum = 0;
-    const radius = TOWER.extraction.radius;
-    // The authored start-region marker describes the starting tower site; a
-    // jittered blob centroid can otherwise label the same calibrated region Rich.
-    const cx = d.markerX ?? d.x;
-    const cy = d.markerY ?? d.y;
-    for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++) {
-      for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++) {
-        if (!inBounds(x, y) || Math.hypot(x - cx, y - cy) > radius) continue;
-        sum += map.res[idx(x, y)];
-      }
-    }
-    d.income = (sum / TOWER.extraction.normalizer) * TOWER.extraction.baseRate;
-    d.richness = richnessTierForRate(d.income).key;
-  }
-  return deposits;
 }
 
 /** D69: towers grade only nearby forest; every other map layer is immutable. */
@@ -661,21 +688,25 @@ function buildRoadNetwork(map, rng) {
     for (let routeIndex = 0; routeIndex < routeCount; routeIndex++) {
       const mouthIndex = routeIndex % mouths.length;
       const mouth = mouths[mouthIndex];
-      const alternate = routeIndex >= mouths.length;
-      const forcedWaypoint = alternate ? parallelWaypoint(map, mouth, side, routeIndex - mouths.length + 1) : -1;
+      const duplicateMouth = routeIndex >= mouths.length;
+      const keepSeparate = routeIndex > 0;
+      const forcedWaypoint = duplicateMouth ? parallelWaypoint(map, mouth, side, routeIndex - mouths.length + 1) : -1;
       const stops = [...routeWaypoints(map, rng, mouth, side), centreI];
       if (forcedWaypoint >= 0) stops.unshift(forcedWaypoint);
       // D54/D55: a primary route enters from the boundary; an alternate from
       // the same mouth shares that entry trunk and forks off a few tiles in,
       // so the edge shows one road that splits rather than a splay of strands.
-      const route = alternate
+      const route = duplicateMouth
         ? primaryPaths[mouthIndex].slice(0, ROAD.entryTrunkLength + 1)
         : entryPath(map, mouth, side);
       carveRoadPath(map, route);
       let from = route[route.length - 1];
       for (let legIndex = 0; legIndex < stops.length; legIndex++) {
         const to = stops[legIndex];
-        map.roadAvoid = alternate && legIndex === 0
+        // D79: every additional mouth holds a distinct outer approach before
+        // cheap-road merging takes over. On the larger map, treating only
+        // duplicate-mouth routes as alternates collapsed four mouths into one.
+        map.roadAvoid = keepSeparate && legIndex === 0
           ? markRoadAvoidance(map, side, from).map((v, i) => v | edgeAvoid[i]) : edgeAvoid;
         const leg = findCostPath(map, from, to);
         map.roadAvoid = null;
@@ -684,7 +715,7 @@ function buildRoadNetwork(map, rng) {
         route.push(...leg.slice(1));
         from = to;
       }
-      if (!alternate) primaryPaths[mouthIndex] = route;
+      if (!duplicateMouth) primaryPaths[mouthIndex] = route;
       map.roadRoutes.push({ side, mouth: { ...mouth }, path: route });
     }
   }
@@ -848,7 +879,9 @@ function mergeKnottedPaths(map) {
         let k1 = -1;
         for (let k = 0; k < p.length; k++) if (near(p[k])) { if (k0 < 0) k0 = k; k1 = k; }
         if (k0 < 0 || k1 - k0 < 2) continue;
-        k0 = Math.max(0, k0 - 2);
+        // D54: a main route's boundary entry (edge tile, then its mouth) is
+        // never re-laid, so a repair near the edge cannot strand the mouth.
+        k0 = Math.max(n < map.roadRoutes.length ? 1 : 0, k0 - 2);
         k1 = Math.min(p.length - 1, k1 + 2);
         const forbidden = new Set();
         for (let k = k0 + 1; k < k1; k++) if (usage.get(p[k]) === 1) forbidden.add(p[k]);
@@ -916,10 +949,10 @@ function measureParallelRoadRoutes(map) {
 
 function keepStartTowerOffRoad(map, start) {
   const footprintClear = (cx, cy) => {
-    for (let y = Math.floor(cy - TOWER.radius); y <= Math.ceil(cy + TOWER.radius); y++) {
-      for (let x = Math.floor(cx - TOWER.radius); x <= Math.ceil(cx + TOWER.radius); x++) {
+    for (let y = Math.floor(cy - KEEP.radius); y <= Math.ceil(cy + KEEP.radius); y++) {
+      for (let x = Math.floor(cx - KEEP.radius); x <= Math.ceil(cx + KEEP.radius); x++) {
         if (!inBounds(x, y)) return false;
-        if (Math.hypot(x + 0.5 - cx, y + 0.5 - cy) > TOWER.radius + 0.3) continue;
+        if (Math.hypot(x + 0.5 - cx, y + 0.5 - cy) > KEEP.radius + 0.3) continue;
         if (!PASSABLE[map.kind[idx(x, y)]] || map.road[idx(x, y)]) return false;
       }
     }
@@ -946,7 +979,6 @@ function buildMap(rng) {
     h: MAP.h,
     kind: new Uint8Array(size),
     elev: new Uint8Array(size),
-    res: new Float32Array(size),
     road: new Uint8Array(size),
     terrainVersion: 0,
   };
@@ -992,7 +1024,7 @@ function buildMap(rng) {
 function finishMap(map, rng) {
   map.exposureFeatures = [];
   if (validateMap(map).ok) authorExposureFeatures(map, rng);
-  map.deposits = placeDeposits(map, rng, map.start);
+  placeResourceSites(map, rng);
   return map;
 }
 
@@ -1409,6 +1441,8 @@ export function validateMap(map, relaxed = false) {
   if (!relaxed && forestFrac < VALID.minForestFrac) problems.push(`not enough cover (forest ${forestFrac.toFixed(2)})`);
   if (marsh === 0) problems.push('no marsh survived road grading');
   if (contestedFrac < 0.30) problems.push(`battlefield too fragmented (${contestedFrac.toFixed(2)})`);
+  const resources = validateResourceGeography(map);
+  if (!resources.ok) problems.push(...resources.problems);
 
   return {
     ok: problems.length === 0,
@@ -1416,6 +1450,7 @@ export function validateMap(map, relaxed = false) {
     barriers: barrierReport,
     openFrac, forestFrac, waterFrac: water / map.kind.length, contestedFrac, chokepoints,
     parallelRoutes, columnsWithThree,
+    resources,
     reachW, reachE,
   };
 }
@@ -1424,16 +1459,21 @@ export function validateMap(map, relaxed = false) {
 function findSpawns(map, report) {
   const gather = (x, reach) => {
     const points = [];
-    let run = [];
-    for (let y = 0; y <= MAP.h; y++) {
-      const ok = y < MAP.h && isPassable(map, x, y) && reach[idx(x, y)];
-      if (ok) run.push(y);
-      else {
-        if (run.length >= 2) points.push({ x, y: run[(run.length / 2) | 0] });
-        run = [];
+    // D79: the larger edge gets several authored mouths even when its entire
+    // length happens to be one connected passable run.
+    for (let n = 0; n < ROAD.mouthsPerSide; n++) {
+      const target = Math.round(((n + 0.5) / ROAD.mouthsPerSide) * (MAP.h - 1));
+      let best = -1;
+      let bestDistance = Infinity;
+      for (let y = 2; y < MAP.h - 2; y++) {
+        if (!isPassable(map, x, y) || !reach[idx(x, y)]) continue;
+        if (points.some((p) => Math.abs(p.y - y) < ROAD.mouthMinSeparation)) continue;
+        const distance = Math.abs(y - target);
+        if (distance < bestDistance) { best = y; bestDistance = distance; }
       }
+      if (best >= 0) points.push({ x, y: best });
     }
-    return points;
+    return points.sort((a, b) => a.y - b.y);
   };
   let west = gather(1, report.reachW);
   let east = gather(MAP.w - 2, report.reachE);
@@ -1446,7 +1486,6 @@ function findSpawns(map, report) {
 export function generateMap(seedString) {
   const base = hashString(String(seedString));
   let lastMap = null;
-  let lastReport = null;
   // D55: a valid map whose roads still carry knots or readability defects is
   // kept, and a few more attempts look for a clean one. The least-defective
   // valid map wins if none turns up; a strict map is never traded for relaxing.
@@ -1472,7 +1511,6 @@ export function generateMap(seedString) {
     const map = buildMap(rng);
     const report = validateMap(map, relaxed);
     lastMap = { map, rng, relaxed };
-    lastReport = report;
     if (report.ok) {
       const defects = analyseRoadKnots(map).count + analyseRoadReadability(map).count;
       const candidate = { map, rng, relaxed, defects };
@@ -1488,7 +1526,7 @@ export function generateMap(seedString) {
   lastMap.seed = String(seedString);
   lastMap.attempts = GEN.maxRelaxedAttempts;
   lastMap.relaxed = true;
-  lastMap.report = lastReport;
+  lastMap.report = validateMap(lastMap, true);
   return lastMap;
 }
 
