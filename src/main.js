@@ -1,16 +1,16 @@
 // Bootstrap, input, and the frame loop.
 
-import { MAP, TOWER, ENEMIES, RENDER } from './config.js';
+import { MAP, TOWER, PLAYER, ENEMIES, RENDER } from './config.js';
 import { randomSeed } from './terrain.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade,
-  forceNextWave, spawnGroupAt,
+  forceNextWave, startWaveEarly, spawnGroupAt,
   towerStats, dangerState, setPaused, pauseState, equipmentState,
   drainAudioEvents, playerBuildSite,
   isTileVisible, isTileExplored, isPointVisible, visibilityState,
   upgradeState, towerAlarmState, stuckState, endState,
   keepState, resourceState, buildingState, resourceSitesState, keepFieldState, enemyKeepField,
-  autoWallPlan, towerConnectivity, towerMinRange, wallState, repairTarget,
+  wallPlan, tryBuildWall, towerConnectivity, towerMinRange, wallState, repairTarget,
   assignGarrison, garrisonState, nestState,
 } from './game.js';
 import { createAudioSystem } from './audio.js';
@@ -140,12 +140,14 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'F1') { e.preventDefault(); toggleDebug(); return; }
   if ((e.code === 'Minus' || e.code === 'NumpadSubtract') && !e.repeat) { setZoom(view.zoom - 2); return; }
   if ((e.code === 'Equal' || e.code === 'NumpadAdd') && !e.repeat) { setZoom(view.zoom + 2); return; }
-  if (e.code === 'Escape') { setBuildMode(false); return; }
+  if (e.code === 'Escape') { cancelBuildStep(); return; }
   if (e.code === 'KeyV' && !e.repeat) { game.debug.showFog = !game.debug.showFog; return; }
   if (game.paused) return;
 
   switch (e.code) {
     case 'KeyB': setBuildMode(!game.buildMode); break;
+    case 'KeyX': if (!e.repeat) setBuildMode(true, 'wall'); break;
+    case 'KeyT': if (!e.repeat) startWaveEarly(game); break;
     case 'Enter': confirmBuild(); break;
     case 'Digit1': upgradeSelected('weapon'); break;
     case 'KeyG': garrisonSelected(e.shiftKey ? -1 : 1); break;
@@ -180,16 +182,14 @@ canvas.addEventListener('mousedown', (e) => {
   audio.gesture();
   if (!game || game.status !== 'playing') return;
   e.preventDefault();
-  if (e.button !== 0) {
-    if (e.button === 2) setBuildMode(false);
-    return;
-  }
+  if (e.button !== 0) return;
   const rect = canvas.getBoundingClientRect();
   const w = screenToWorld(view, e.clientX - rect.left, e.clientY - rect.top);
   game.cursor = w;
 
   if (game.buildMode && !game.paused) {
-    confirmBuild();
+    if (game.buildType === 'wall') selectWallAnchor(w);
+    else confirmBuild();
     return;
   }
   let best = null;
@@ -215,12 +215,17 @@ canvas.addEventListener('mousedown', (e) => {
     game.selectedBuilding = null;
   }
 });
-canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); setBuildMode(false); });
+canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); cancelBuildStep(); });
 
 function setBuildMode(on, type = game?.buildType || 'tower') {
   if (on && game.paused) return;
+  const changedType = game.buildType !== type;
   game.buildMode = on;
   game.buildType = type;
+  if (!on || changedType) {
+    game.wallAnchorA = null;
+    game.wallAnchorB = null;
+  }
   lastBuildPlayerTile = '';
   if (on) refreshBuildCheck(true);
   else {
@@ -238,12 +243,24 @@ function refreshBuildCheck(force = false) {
   }
   const key = [
     Math.floor(game.player.x), Math.floor(game.player.y), game.buildType || 'tower',
+    game.wallAnchorA ?? '', game.wallAnchorB ?? '',
     game.blockerVersion || 0, game.towers.length, game.walls?.length || 0,
     // Whole units: a fractional trickle must not re-plan walls every frame.
     Math.floor(game.res?.stone || 0), Math.floor(game.res?.gold || 0),
   ].join('|');
   if (!force && key === lastBuildPlayerTile) return;
   lastBuildPlayerTile = key;
+  if (game.buildType === 'wall') {
+    game.buildSite = null;
+    if (game.wallAnchorA == null || game.wallAnchorB == null) { game.buildCheck = null; return; }
+    const plan = wallPlan(game, game.wallAnchorA, game.wallAnchorB);
+    const anchors = game.towers.filter((tower) => tower.id === game.wallAnchorA || tower.id === game.wallAnchorB);
+    const near = anchors.some((tower) => Math.hypot(game.player.x - tower.x, game.player.y - tower.y)
+      <= PLAYER.presenceRadius + tower.radius);
+    game.buildCheck = near ? plan : { ...plan, ok: false,
+      reasons: [...(plan.reasons || []), 'stand at one of the two towers to start the wall'] };
+    return;
+  }
   game.buildSite = playerBuildSite(game, game.buildType || 'tower');
   game.buildCheck = game.buildSite.check;
 }
@@ -251,10 +268,49 @@ function refreshBuildCheck(force = false) {
 function confirmBuild() {
   if (!game || game.paused || !game.buildMode) return;
   refreshBuildCheck(true);
+  if (game.buildType === 'wall') {
+    if (game.wallAnchorA == null || game.wallAnchorB == null) return;
+    const result = tryBuildWall(game, game.wallAnchorA, game.wallAnchorB);
+    if (result.ok) setBuildMode(false);
+    return;
+  }
   const site = game.buildSite;
   if (!site) return;
   const res = tryBuild(game, site.x, site.y, game.buildType || 'tower');
   if (res.ok) setBuildMode(false);
+}
+
+function wallAnchorAt(point) {
+  let best = null;
+  let bestDistance = TOWER.radius + 0.9;
+  for (const tower of game.towers) {
+    if (!tower.built || tower.hp <= 0 || tower.destroyed) continue;
+    const distance = Math.hypot(tower.x - point.x, tower.y - point.y);
+    if (distance < bestDistance) { best = tower; bestDistance = distance; }
+  }
+  return best;
+}
+
+function selectWallAnchor(point) {
+  const anchor = wallAnchorAt(point);
+  if (!anchor) return;
+  if (game.wallAnchorA == null) game.wallAnchorA = anchor.id;
+  else if (anchor.id !== game.wallAnchorA) game.wallAnchorB = anchor.id;
+  lastBuildPlayerTile = '';
+  refreshBuildCheck(true);
+}
+
+function cancelBuildStep() {
+  if (!game?.buildMode) return;
+  if (game.buildType === 'wall' && game.wallAnchorB != null) {
+    game.wallAnchorB = null;
+    game.buildCheck = null;
+    lastBuildPlayerTile = '';
+  } else if (game.buildType === 'wall' && game.wallAnchorA != null) {
+    game.wallAnchorA = null;
+    game.buildCheck = null;
+    lastBuildPlayerTile = '';
+  } else setBuildMode(false);
 }
 
 /** D91: instant garrison change on the selected (or occupied) tower. */
@@ -318,6 +374,7 @@ function debugKill() {
 }
 
 $('pause-toggle').onclick = togglePause;
+$('start-wave').onclick = () => { if (!game.paused) startWaveEarly(game); };
 $('d-mat').onclick = () => { if (!game.paused) addDebugResources(); };
 $('d-wave').onclick = () => { if (!game.paused) forceNextWave(game); };
 $('d-spawn').onclick = () => { if (!game.paused) debugSpawn(); };
@@ -333,6 +390,7 @@ $('d-pause').onclick = () => {
 $('d-regen').onclick = () => startRun(randomSeed(), game.archetypeKey);
 $('build-toggle').onclick = () => { if (!game.paused) setBuildMode(!game.buildMode); };
 $('build-tower').onclick = () => setBuildMode(true, 'tower');
+$('build-wall').onclick = () => setBuildMode(true, 'wall');
 $('build-farm').onclick = () => setBuildMode(true, 'farm');
 $('build-quarry').onclick = () => setBuildMode(true, 'quarry');
 $('build-mine').onclick = () => setBuildMode(true, 'mine');
@@ -372,7 +430,9 @@ window.holdfast = {
       return field ? new Float32Array(field) : null;
     },
     cameraState: () => ({ ...view }),
-    autoWallPlan: (x, y) => autoWallPlan(game, x, y),
+    wallPlan: (aId, bId) => wallPlan(game, aId, bId),
+    tryBuildWall: (aId, bId) => tryBuildWall(game, aId, bId),
+    startWaveEarly: () => startWaveEarly(game),
     garrisonState: () => garrisonState(game),
     assignGarrison: (tower, delta) => assignGarrison(game, tower, delta),
     nestState: () => nestState(game),

@@ -1,12 +1,11 @@
-// Fortress checks: the retained wall/path/repair system (D81-D85) plus
-// automatic tower links, coalesced fields and tower blind spots (D89-D93).
+// Fortress checks: manual walls, coalesced fields and tower blind spots.
 
 import { MAP, T, PLAYER, WALL, WALL_PATH, ENEMIES, TOWER, KEEP } from '../src/config.js';
 import { idx } from '../src/terrain.js';
 import {
   update, canPlaceAt, tryBuild, wallPlan, tryBuildWall, wallSegments, supercoverLine,
   enemyKeepField, keepFieldState, spawnGroupAt, buildingState, towerStats, repairTarget,
-  stuckState, structureClearLine, autoWallPlan, towerConnectivity, towerMinRange,
+  stuckState, structureClearLine, towerConnectivity, towerMinRange,
   flushKeepFieldRecomputes,
 } from '../src/game.js';
 
@@ -17,33 +16,18 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     g.player.x = x; g.player.y = y;
     const r = tryBuild(g, x, y, 'tower');
     assert(r.ok, `tower refused at ${x},${y}: ${r.reasons.join('; ')}`);
-    // These are low-level D81-D85 fixtures. D89 creates links as part of
-    // tryBuild, so remove those links before explicitly arranging the wall
-    // under test. D89 behavior uses autoTower below and never calls this.
-    for (const link of g.walls) for (const s of link.segments) {
-      if (g.blockerGrid[s.i]?.structure === s) g.blockerGrid[s.i] = null;
-    }
-    g.walls.length = 0;
-    g.blockerVersion++;
-    g.keepFields = Object.create(null);
     return r.structure;
   }
 
-  function autoTower(g, x, y) {
+  function placedTower(g, x, y) {
     g.player.x = x; g.player.y = y;
     const r = tryBuild(g, x, y, 'tower');
-    assert(r.ok, `automatic tower refused at ${x},${y}: ${(r.reasons || []).join('; ')}`);
+    assert(r.ok, `tower refused at ${x},${y}: ${(r.reasons || []).join('; ')}`);
     return { tower: r.structure, result: r };
   }
 
-  const stoneOf = (value) => typeof value === 'number' ? value : (value?.stone || 0);
   const presentSegments = (g, link) => link.segments.filter((s) => !s.destroyed
     && g.blockerGrid[s.i]?.structure === s);
-
-  function properlyCrosses(a, b, c, d) {
-    const orient = (p, q, r) => Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
-    return orient(a, b, c) * orient(a, b, d) < 0 && orient(c, d, a) * orient(c, d, b) < 0;
-  }
 
   function finish(g, ...towers) {
     for (const t of towers) { t.built = true; t.progress = 1; t.hp = t.maxHp; }
@@ -59,8 +43,14 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
   function completeWalls(g) {
     for (const link of g.walls) {
       link.built = true; link.progress = 1;
-      for (const s of link.segments) if (!s.destroyed) s.hp = s.maxHp;
+      for (const s of link.segments) if (!s.destroyed) {
+        s.present = true;
+        s.hp = s.maxHp;
+        g.blockerGrid[s.i] = { kind: 'wall', id: s.id, structure: s, maxHp: s.maxHp };
+      }
     }
+    g.blockerVersion++;
+    g.keepFields = Object.create(null);
   }
 
   /** Keep + four corner towers + four walls: a closed ring around the Keep. */
@@ -126,181 +116,35 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
 
   const fieldAt = (field, x, y) => field[idx(Math.floor(x), Math.floor(y))];
 
-  // --- D89 automatic links ---------------------------------------------------
+  // --- D98 manual walls ------------------------------------------------------
 
-  check('D89 Keep is an anchor and the first nearby tower links to it', () => {
+  check('D98 tower placement charges only the tower and creates no walls', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const plan = autoWallPlan(g, k.x + 8, k.y);
-    assert(plan.links.length === 1 && plan.links[0].anchorId === k.id,
-      `Keep was not selected: ${JSON.stringify(plan.links)}`);
-    assert(plan.status === 'connected', `near-Keep status ${plan.status}`);
     const before = g.res.stone;
-    const { tower: a } = autoTower(g, k.x + 8, k.y);
-    assert(g.walls.length === 1 && g.walls[0].a === k.id && g.walls[0].b === a.id,
-      'tower placement did not create its Keep link');
-    assert(before - g.res.stone === stoneOf(plan.total), 'preview total did not equal charged Stone');
-    assert(towerConnectivity(g, k) === 'keep' && towerConnectivity(g, a) === 'connected',
-      'initial connectivity state is wrong');
+    const expected = canPlaceAt(g, k.x + 8, k.y, 'tower').cost.stone;
+    const a = tower(g, k.x + 8, k.y);
+    assert(a && g.walls.length === 0, 'tower placement created a wall');
+    assert(before - g.res.stone === expected, 'tower placement charged more than towerCost');
+    assert(towerConnectivity(g, a) === 'outpost', 'unwalled tower is not an outpost');
   });
 
-  check('D89 an isolated outpost beyond 13 tiles pays tower cost only', () => {
+  check('D98 manual wall grows from anchor and connects its tower', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const x = k.x + WALL.maxLength + 7;
-    const plan = autoWallPlan(g, x, k.y);
-    assert(plan.links.length === 0 && plan.status === 'outpost', `not an outpost: ${JSON.stringify(plan)}`);
-    assert(stoneOf(plan.wallCost) === 0 && stoneOf(plan.total) === stoneOf(plan.towerCost), 'outpost charged for walls');
+    const a = tower(g, k.x + 10, k.y); finish(g, a);
+    const plan = wallPlan(g, k.id, a.id);
     const before = g.res.stone;
-    const { tower: outpost } = autoTower(g, x, k.y);
-    assert(g.walls.length === 0 && before - g.res.stone === stoneOf(plan.towerCost), 'outpost build cost/link mismatch');
-    assert(towerConnectivity(g, outpost) === 'outpost', 'isolated tower is not marked outpost');
-  });
-
-  check('D89 second link closes the KEEP-A-B triangle and never exceeds two links', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    const { tower: a } = autoTower(g, k.x + 7, k.y);
-    const bx = k.x + 3.5; const by = k.y + 6.2;
-    const plan = autoWallPlan(g, bx, by);
-    assert(plan.links.length === 2, `triangle planned ${plan.links.length} links`);
-    assert(new Set(plan.links.map((l) => l.anchorId)).has(k.id)
-      && new Set(plan.links.map((l) => l.anchorId)).has(a.id), 'triangle did not choose Keep and A');
-    const { tower: b } = autoTower(g, bx, by);
-    const made = g.walls.filter((w) => w.b === b.id || w.newTowerId === b.id);
-    assert(made.length === 2, `tower B made ${made.length} links`);
-  });
-
-  check('D89 an intermediate tower bridges an outpost into the Keep component', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    const { tower: outpost } = autoTower(g, k.x + 20, k.y);
-    assert(towerConnectivity(g, outpost) === 'outpost', 'fixture tower is not isolated');
-    const plan = autoWallPlan(g, k.x + 10.5, k.y);
-    assert(plan.status === 'bridges' && plan.links.length === 2,
-      `bridge plan ${plan.status}/${plan.links.length}`);
-    assert(new Set(plan.links.map((l) => l.anchorId)).has(k.id)
-      && new Set(plan.links.map((l) => l.anchorId)).has(outpost.id), 'bridge did not join both components');
-    const { tower: bridge } = autoTower(g, k.x + 10.5, k.y);
-    assert(towerConnectivity(g, bridge) === 'connected' && towerConnectivity(g, outpost) === 'connected',
-      'bridge did not update connectivity');
-    bridge.hp = -1;
-    update(g, 0.01);
-    assert(towerConnectivity(g, outpost) === 'outpost', 'tower death did not split connectivity');
-  });
-
-  check('D89 crossing, duplicate and nest-footprint candidates are rejected', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    const n = tower(g, k.x + 6, k.y - 6);
-    const s = tower(g, k.x + 6, k.y + 6);
-    finish(g, n, s);
-    wall(g, n, s);
-    const crossing = autoWallPlan(g, k.x + 12, k.y);
-    assert(!crossing.links.some((l) => l.anchorId === k.id), 'properly crossing link to Keep was accepted');
-    assert(wallPlan(g, s.id, n.id).reasons.includes('these towers are already joined'), 'duplicate link accepted');
-
-    const g2 = gameOn(); rich(g2);
-    const k2 = g2.towers[0];
-    g2.nests = [{ id: 99, x: k2.x + 4.5, y: k2.y, radius: 1.1, hp: 1400 }];
-    const nested = autoWallPlan(g2, k2.x + 8, k2.y);
-    assert(!nested.links.some((l) => l.anchorId === k2.id), 'line through a future nest footprint was accepted');
-  });
-
-  check('D89 anchor degree caps exclude a saturated Keep', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    const anchors = [];
-    for (let n = 0; n < WALL.maxDegree.keep; n++) {
-      const a = n * Math.PI * 2 / WALL.maxDegree.keep;
-      anchors.push(tower(g, k.x + Math.cos(a) * 8, k.y + Math.sin(a) * 8));
-    }
-    finish(g, ...anchors);
-    // Empty graph links isolate the degree rule from segment overlap; the
-    // planner reads the same live endpoint graph used by real links.
-    g.walls.push(...anchors.map((a, n) => ({ id: 1000 + n, a: k.id, b: a.id,
-      aPos: { x: k.x, y: k.y }, bPos: { x: a.x, y: a.y }, segments: [], built: true })));
-    const plan = autoWallPlan(g, k.x + 12, k.y);
-    assert(!plan.links.some((l) => l.anchorId === k.id), 'saturated Keep accepted another link');
-  });
-
-  check('D89 preview cost matches charge; optional link drops before required refusal', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    autoTower(g, k.x + 7, k.y);
-    const x = k.x + 3.5; const y = k.y + 6.2;
-    const full = autoWallPlan(g, x, y);
-    assert(full.links.length === 2, 'fixture has no optional second link');
-    const firstOnly = stoneOf(full.towerCost) + stoneOf(full.links[0].cost);
-    g.res.stone = firstOnly;
-    const dropped = autoWallPlan(g, x, y);
-    assert(dropped.droppedOptional && dropped.links.length === 1, 'unaffordable optional link was not dropped');
-    assert(canPlaceAt(g, x, y, 'tower').ok, 'placement preview refused affordable tower plus required link');
-    const before = g.res.stone;
-    autoTower(g, x, y);
-    assert(before - g.res.stone === stoneOf(dropped.total), 'dropped-link preview did not equal charge');
-
-    const g2 = gameOn(); rich(g2);
-    const k2 = g2.towers[0];
-    const required = autoWallPlan(g2, k2.x + 8, k2.y);
-    g2.res.stone = stoneOf(required.towerCost) + stoneOf(required.links[0].cost) - 1;
-    const refused = autoWallPlan(g2, k2.x + 8, k2.y);
-    const placement = canPlaceAt(g2, k2.x + 8, k2.y, 'tower');
-    assert(refused.reason && /stone/i.test(refused.reason), `missing Stone shortfall: ${refused.reason}`);
-    assert(!placement.ok && placement.reasons.some((r) => /stone/i.test(r)), 'canPlaceAt disagreed with required-link refusal');
-  });
-
-  check('D89 automatic segments appear progressively and unfinished work cancels with its tower', () => {
-    const fixture = () => {
-      const g = gameOn(); rich(g);
-      const k = g.towers[0];
-      const { tower: a } = autoTower(g, k.x + 10, k.y);
-      const link = g.walls.find((w) => w.b === a.id || w.newTowerId === a.id);
-      g.player.x = k.x - 30; g.player.y = k.y;
-      return { g, a, link };
-    };
-    {
-      const { g, link } = fixture();
-      const total = link.segments.length;
-      assert(presentSegments(g, link).length < total, 'all planned segments blocked immediately');
-      update(g, link.duration * 0.55);
-      const middle = presentSegments(g, link);
-      assert(middle.length > 0 && middle.length < total, `non-progressive segment count ${middle.length}/${total}`);
-      assert(middle.every((s) => s.hp >= s.maxHp * WALL.buildHpFraction), 'appearing segment began below build hp');
-      run(g, link.duration + 0.5);
-      assert(presentSegments(g, link).length === total, 'wall did not finish all planned segments');
-    }
-    {
-      const { g, a, link } = fixture();
-      update(g, link.duration * 0.55);
-      const built = presentSegments(g, link).length;
-      assert(built > 0 && built < link.segments.length, 'cancellation fixture did not partly build');
-      a.hp = -1;
-      update(g, 0.01);
-      const afterDeath = presentSegments(g, link).length;
-      run(g, link.duration * 2);
-      assert(afterDeath === built && presentSegments(g, link).length === built,
-        'unbuilt segments continued after the new tower died');
-    }
-  });
-
-  check('D89 close tower spaghetti stays at two created links and has no proper crossings', () => {
-    const g = gameOn(); rich(g);
-    const k = g.towers[0];
-    const offsets = [[7, 0], [3.5, 6.2], [-3.5, 6.2], [-7, 0], [-3.5, -6.2], [3.5, -6.2],
-      [10.5, 6.2], [10.5, -6.2], [0, 12.4]];
-    const placed = offsets.map(([x, y]) => autoTower(g, k.x + x, k.y + y).tower);
-    for (const t of placed) {
-      const made = g.walls.filter((w) => (w.newTowerId ?? w.b) === t.id);
-      assert(made.length <= 2, `tower ${t.id} created ${made.length} links`);
-    }
-    for (let i = 0; i < g.walls.length; i++) for (let j = i + 1; j < g.walls.length; j++) {
-      const a = g.walls[i]; const b = g.walls[j];
-      if (a.a === b.a || a.a === b.b || a.b === b.a || a.b === b.b) continue;
-      const a0 = g.towers.find((t) => t.id === a.a); const a1 = g.towers.find((t) => t.id === a.b);
-      const b0 = g.towers.find((t) => t.id === b.a); const b1 = g.towers.find((t) => t.id === b.b);
-      assert(!properlyCrosses(a0, a1, b0, b1), `links ${a.id} and ${b.id} cross`);
-    }
+    const link = wall(g, k, a);
+    assert(g.res.stone === before - plan.cost.stone, 'manual wall charge differs from preview');
+    assert(link.segments.every((s) => !s.present), 'manual wall appeared all at once');
+    g.player.x = k.x - 30; g.player.y = k.y;
+    update(g, link.duration * 0.45);
+    const present = presentSegments(g, link);
+    assert(present.length > 0 && present.length < link.segments.length, 'manual wall did not grow progressively');
+    run(g, link.duration + 0.5);
+    assert(link.built && presentSegments(g, link).length === link.segments.length, 'manual wall did not finish');
+    assert(towerConnectivity(g, a) === 'connected', 'manual wall did not update connectivity');
   });
 
   // --- D81 validity -----------------------------------------------------------
@@ -394,16 +238,19 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     assert(!r.ok && r.reasons.some((x) => x.startsWith('need')), 'unaffordable wall started');
   });
 
-  check('D81 an unfinished wall blocks at once and is fragile', () => {
+  check('D98 an unfinished wall grows segment by segment and is fragile', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
     const a = tower(g, k.x + 10, k.y); finish(g, a);
     const link = wall(g, k, a);
     assert(!link.built, 'wall finished instantly');
-    for (const s of link.segments) {
-      assert(g.blockerGrid[s.i]?.structure === s, 'unfinished segment is not a blocker');
-      assert(Math.abs(s.hp - WALL.segmentHp * WALL.buildHpFraction) < 1e-9, 'unfinished segment hp');
-    }
+    assert(link.segments.every((s) => !s.present && !g.blockerGrid[s.i]), 'planned segments blocked before appearing');
+    g.player.x = k.x - 30; g.player.y = k.y;
+    update(g, link.duration / (link.segments.length * 2));
+    const started = link.segments.filter((s) => s.present);
+    assert(started.length === 1, `expected one growing segment, got ${started.length}`);
+    assert(g.blockerGrid[started[0].i]?.structure === started[0], 'appearing segment is not a blocker');
+    assert(started[0].hp >= WALL.segmentHp * WALL.buildHpFraction, 'appearing segment hp below build fraction');
     g.player.x = k.x - 30;
     run(g, link.duration + 0.5, 1 / 60);
     assert(link.built && link.segments.every((s) => s.hp === s.maxHp), 'wall did not finish unassisted at exactly full hp');
@@ -567,9 +414,9 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     const k = g.towers[0];
     const old = Object.fromEntries(['swarm', 'runner', 'heavy'].map((type) => [type, enemyKeepField(g, type)]));
     const before = keepFieldState(g).recomputes;
-    autoTower(g, k.x + 20, k.y);
-    autoTower(g, k.x - 20, k.y);
-    autoTower(g, k.x, k.y + 20);
+    placedTower(g, k.x + 20, k.y);
+    placedTower(g, k.x - 20, k.y);
+    placedTower(g, k.x, k.y + 20);
     assert(keepFieldState(g).recomputes === before, 'geometry rebuilt a field synchronously');
     assert(enemyKeepField(g, 'swarm') === old.swarm, 'enemy did not keep reading the previous field');
     // Idle fields react on the next frame (a breach reroutes at once), one type per frame.
@@ -581,7 +428,7 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     assert(keepFieldState(g).recomputes === before + 3, 'third frame did not rebuild the final type');
     assert(!keepFieldState(g).dirty, 'fields still dirty after all types rebuilt');
     // A change during the busy spell waits out the interval after the last rebuild.
-    autoTower(g, k.x, k.y - 20);
+    placedTower(g, k.x, k.y - 20);
     update(g, 0.01);
     assert(keepFieldState(g).recomputes === before + 3, 'busy-spell change rebuilt before the interval');
     update(g, WALL_PATH.recomputeInterval);
@@ -592,7 +439,7 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
   check('D93 tower and Keep minimum ranges are fixed across weapon upgrades', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const { tower: a } = autoTower(g, k.x + 7, k.y);
+    const { tower: a } = placedTower(g, k.x + 7, k.y);
     assert(towerMinRange(g, k) === KEEP.minRange, 'Keep minimum range is wrong');
     assert(towerMinRange(g, a) === TOWER.weapon.minRange, 'tower minimum range is wrong');
     a.wLevel = TOWER.upgrade.maxLevel;
@@ -602,8 +449,8 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
   check('D93 a tower is silent at its base while its partner covers the blind spot', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const { tower: a } = autoTower(g, k.x + 7, k.y);
-    const { tower: b } = autoTower(g, k.x + 7, k.y + 7);
+    const { tower: a } = placedTower(g, k.x + 7, k.y);
+    const { tower: b } = placedTower(g, k.x + 7, k.y + 7);
     finish(g, a, b);
     silenceTowers(g);
     const e = enemy(g, 'heavy', a.x + 1, a.y, 500);

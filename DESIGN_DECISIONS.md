@@ -1616,3 +1616,40 @@ the numbers); north/south invasion roads (waves still come from west/east
 only; adding sides is a wave-design change); roads to resource sites
 (exploration should still leave the road); smoothing curves (straight
 segments read well at tile scale and keep validation exact).
+
+---
+
+## 2026-10-05 — Expansion pacing and deliberate walls
+
+### D97 — Expansion pacing
+**Decision:** every assault is preceded by a mandatory, finite expansion
+countdown: 120 seconds before wave 1 and 90 seconds between later waves. The
+final 15 seconds are the existing `warning` phase and are included in those
+totals, not added to them. The wave direction and pending spawns are rolled at
+the start of expansion so the incoming side is known throughout. Clearing a
+wave produces a 4-second aftermath before the next expansion. `START NEXT
+WAVE` may shorten either expansion or warning to a 4-second readiness window;
+waiting and starting early award no resources or score. The minimap always
+draws the road network, the Keep (outlined) and all player structures, even
+outside explored terrain, so the way home is readable when the warning starts;
+at 5 s the warning cue repeats once and the HUD pulses harder.
+**Why:** long, predictable expansion makes exploration, construction and the
+return-to-Keep gamble meaningful while retaining a firm deadline. Early
+starting lets a prepared player skip dead time without turning readiness into
+an economy choice.
+**Rejected:** an unlimited Ready button, because waiting forever permits an
+infinite economy exploit; teleporting the player home, because it removes the
+return gamble.
+
+### D98 — Manual walls, supersedes D89 automatic walls
+**Decision:** walls are a deliberate `Build Wall` action between two finished
+anchors (the Keep or a Tower). The player selects both anchors, reviews the
+tile/segment line, Stone cost, connectivity and any refusal reason, then
+confirms construction. The D81/D89 segment rules, grow-from-anchor visuals,
+repair/destruction behaviour and coalesced D90/D95 flow-field invalidation
+remain. Tower placement buys and constructs only the Tower.
+**Why:** fortress geometry and Stone spending should be explicit player
+choices. Separating towers from links makes the cost and intended defensive
+shape legible before either commitment.
+**Rejected:** automatic links on Tower placement, because they spend Stone the
+player did not choose to spend.

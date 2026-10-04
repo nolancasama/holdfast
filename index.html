@@ -46,7 +46,7 @@
 
   /* ---- top bar ---- */
   #topbar {
-    position: absolute; top: 0; left: 0; right: 0;
+    position: absolute; top: 96px; left: 0; right: 0;
     display: flex; gap: 2px; padding: 8px; pointer-events: none; flex-wrap: wrap;
   }
   .chip {
@@ -56,11 +56,28 @@
   .chip b { color: var(--gold); font-weight: 700; }
   #pause-toggle { pointer-events: auto; width: auto; margin: 0; padding: 5px 10px; text-align: center; }
   #pause-toggle.on { color: #171208; background: var(--gold); border-color: var(--gold); font-weight: 700; }
-  .chip.phase-combat { border-color: var(--red); }
-  .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
-  .chip.phase-prep { border-color: var(--green); }
+  .phase-block {
+    position: absolute; z-index: 4; top: 8px; left: 50%; transform: translateX(-50%);
+    min-width: 278px; padding: 7px 14px; text-align: center;
+    background: rgba(10,13,18,0.94); border: 2px solid var(--green); border-radius: 7px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.65); pointer-events: none;
+  }
+  #hud-phase { display: block; font-size: 18px; line-height: 1.1; font-weight: 800; letter-spacing: 0.12em; }
+  #hud-timer { display: block; font-size: 15px; color: var(--gold); font-weight: 700; }
+  #hud-wave, #hud-incoming { font-size: 12px; color: var(--text); }
+  #hud-incoming { font-weight: 700; color: var(--red); }
+  #hud-wave::after { content: ' · '; color: var(--dim); }
+  #start-wave { width: auto; margin: 5px auto 0; padding: 3px 9px; text-align: center; pointer-events: auto; }
+  #start-wave[hidden] { display: none; }
+  .phase-block.phase-warning { color: var(--red); border-color: var(--red); animation: warning-pulse 1.2s ease-in-out infinite alternate; }
+  .phase-block.phase-warning.urgent { animation: urgent-pulse 0.38s ease-in-out infinite alternate; }
+  .phase-block.phase-combat { border-color: var(--red); }
+  .phase-block.phase-aftermath { border-color: var(--gold); }
+  .phase-block.paused { border-color: var(--gold); animation: none; }
   #hud-tower-alarm { color: var(--red); border-color: var(--red); font-weight: 700; animation: pulse 0.45s infinite alternate; }
   @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
+  @keyframes warning-pulse { from { box-shadow: 0 2px 12px rgba(0,0,0,.65); } to { box-shadow: 0 0 18px rgba(255,70,70,.46); } }
+  @keyframes urgent-pulse { from { transform: translateX(-50%) scale(1); } to { transform: translateX(-50%) scale(1.045); box-shadow: 0 0 24px rgba(255,55,55,.72); } }
 
   /* ---- event log ---- */
   #log {
@@ -130,7 +147,7 @@
   .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
   .start:hover { background: #ffe08a; }
 
-  @media (prefers-reduced-motion: reduce) { .chip.phase-warning, #hud-tower-alarm { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .phase-block.phase-warning, #hud-tower-alarm { animation: none; } }
   button:focus-visible, .start:focus-visible, .seedrow input:focus-visible {
     outline: 2px solid var(--gold); outline-offset: 2px;
   }
@@ -161,12 +178,18 @@
   <div id="stage">
     <canvas id="game"></canvas>
 
+    <div class="phase-block phase-prep" id="hud-phase-chip">
+      <span id="hud-phase">EXPANSION</span>
+      <span id="hud-timer">NEXT ASSAULT 02:00</span>
+      <span id="hud-wave">WAVE 1</span><span id="hud-incoming">Incoming: UNKNOWN</span>
+      <button id="start-wave">START NEXT WAVE [T]</button>
+    </div>
+
     <div id="topbar">
       <div class="chip" title="Food supports soldiers: garrisoned / supported">Garrison <b id="hud-food">0/0</b> <span class="muted" id="hud-food-rate">fed by farms</span></div>
       <div class="chip" id="hud-deficit" hidden>SUPPLY DEFICIT</div>
       <div class="chip">Stone <b id="hud-stone">0</b> <span class="muted" id="hud-stone-rate">+0.00/s</span></div>
       <div class="chip">Gold <b id="hud-gold">0</b> <span class="muted" id="hud-gold-rate">+0.00/s</span></div>
-      <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
       <div class="chip">HP <b id="hud-hp">100</b></div>
       <button id="pause-toggle">[P] Pause</button>
       <div class="chip" id="hud-occ">Unoccupied</div>
@@ -192,7 +215,7 @@
         </div>
         <button class="start" id="start-btn">Start run</button>
         <p class="keys" style="margin-top:14px">
-          <b>WASD</b> move · <b>B</b> build menu · <b>Enter</b>/<b>click</b> build here / select structure ·
+          <b>WASD</b> move · <b>B</b> build menu · <b>X</b> build wall · <b>T</b> start wave early · <b>Enter</b>/<b>click</b> build / select ·
           <b>R</b> hold to repair · <b>1</b> weapon upgrade · <b>G</b> garrison · <b>- / =</b> zoom · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
         </p>
       </div>
@@ -255,18 +278,19 @@
       <button id="build-toggle">[B] Toggle build mode</button>
       <div id="build-choices">
         <button id="build-tower">Tower<span class="cost" id="build-tower-cost"></span></button>
+        <button id="build-wall">Wall [X]<span class="cost" id="build-wall-cost"></span></button>
         <button id="build-farm">Farm<span class="cost" id="build-farm-cost"></span></button>
         <button id="build-quarry">Quarry<span class="cost" id="build-quarry-cost"></span></button>
         <button id="build-mine">Gold Mine<span class="cost" id="build-mine-cost"></span></button>
       </div>
       <button id="build-confirm" disabled>Build here [Enter]</button>
-      <div id="build-info" class="keys" style="margin-top:6px">Press B, walk to a site, Enter to build here. Towers create their own wall links.</div>
+      <div id="build-info" class="keys" style="margin-top:6px">Choose a structure and build nearby, or choose Wall [X] and select two finished anchors.</div>
     </div>
 
     <div class="sec">
       <h2>Controls</h2>
       <div class="keys">
-        <b>WASD</b> move · <b>B</b> build · <b>Enter</b>/<b>click</b> build here/select<br />
+        <b>WASD</b> move · <b>B</b> build · <b>X</b> wall · <b>T</b> start wave · <b>Enter</b>/<b>click</b> build/select<br />
         <b>R</b> hold repair · <b>1</b> weapon upgrade · <b>G</b> / <b>Shift+G</b> garrison +/− · <b>- / =</b> or wheel zoom · <b>Space</b> melee<br />
         <b>P</b> pause · <b>Esc</b> cancel build · <b>F1</b> debug panel
       </div>

@@ -31,7 +31,7 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     paused: false,
     res: { ...START_RESOURCES },
     phase: 'prep',
-    phaseLeft: WAVE.prepFirst,
+    phaseLeft: WAVE.prepFirst - WAVE.warning,
     wave: 1,
     spawnSides: [],
     pendingSpawns: [],
@@ -76,6 +76,7 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     supply: { since: null, nextStandDownAt: null },
     nests: [],
     wildFields: new Map(),
+    warning5Cued: false,
   };
 
   const start = placeTower(g, map.start.x + 0.5, map.start.y + 0.5, true, true);
@@ -83,6 +84,8 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
   g.keepId = start.id;
   g.towerConnectivityCache[start.id] = 'keep';
   for (const n of map.nests || []) addNest(g, n.x, n.y, n.guards);
+  // D97: the approach is known for the whole mandatory expansion phase.
+  rollWave(g);
   recomputeVisibility(g, true);
   say(g, `Seed ${seed} — survive ${WAVE.totalToSurvive} waves.`);
   return g;
@@ -306,7 +309,6 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
   const type = normalizeBuildType(buildType);
   const reasons = [];
   let cost = buildCost(g, type);
-  let autoWalls = null;
   let site = null;
   let rate = 0;
   let fertility = null;
@@ -319,9 +321,6 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
         break;
       }
     }
-    autoWalls = autoWallPlan(g, x, y);
-    cost = autoWalls.cost;
-    if (!autoWalls.ok) reasons.push(autoWalls.reason);
   } else if (!BUILDINGS[type]) {
     reasons.push('unknown building');
   } else if (!isPassable(g.map, Math.floor(x), Math.floor(y))) {
@@ -351,7 +350,7 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
   }
 
   const unique = [...new Set(reasons)];
-  if (type !== 'tower' && !canAfford(g, cost)) unique.push(`need ${costLabel(cost)}`);
+  if (!canAfford(g, cost)) unique.push(`need ${costLabel(cost)}`);
   const terrain = kindAt(g.map, Math.floor(x), Math.floor(y));
   const elev = elevAt(g.map, Math.floor(x), Math.floor(y));
   return {
@@ -362,7 +361,6 @@ export function canPlaceAt(g, x, y, buildType = g.buildType || 'tower') {
     rate,
     fertility,
     site,
-    autoWalls,
     coverage: type === 'tower' ? coverageAt(g.map, x, y, TOWER.weapon.range) : null,
     terrain,
     elev,
@@ -453,8 +451,6 @@ export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
   spend(g, check.cost);
   if (type === 'tower') {
     const t = placeTower(g, x, y, false);
-    const links = check.autoWalls.links.map((link) => createAutomaticWall(g, link, t));
-    if (links.length) recomputeTowerConnectivity(g);
     g.selected = t.id;
     g.selectedBuildingId = null;
   } else {
@@ -464,8 +460,7 @@ export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
   }
   say(g, 'Construction started.');
   emitAudioEvent(g, 'constructionStart', { x, y });
-  return { ...check, plan: check.autoWalls, links: type === 'tower'
-    ? g.walls.filter((w) => w.builderTowerId === g.towers[g.towers.length - 1]?.id) : [],
+  return { ...check, links: [],
   structure: type === 'tower' ? g.towers[g.towers.length - 1] : g.buildings[g.buildings.length - 1] };
 }
 
@@ -930,15 +925,6 @@ function wallLinkExists(g, aId, bId) {
   return g.walls.some((w) => (w.a === aId && w.b === bId) || (w.a === bId && w.b === aId));
 }
 
-function wallDegree(g, towerId) {
-  return g.walls.reduce((n, w) => n + ((w.a === towerId || w.b === towerId)
-    && (!w.cancelled || w.segments.some((s) => s.present)) ? 1 : 0), 0);
-}
-
-function maxWallDegree(t) {
-  return t.keep ? WALL.maxDegree.keep : WALL.maxDegree.tower;
-}
-
 function samePoint(a, b) {
   return Math.abs(a.x - b.x) < 1e-7 && Math.abs(a.y - b.y) < 1e-7;
 }
@@ -1014,131 +1000,6 @@ function footprintContains(structure, tile) {
   return Math.hypot(nx - structure.x, ny - structure.y) <= radius + 1e-6;
 }
 
-function autoLinkCandidate(g, x, y, anchor) {
-  const length = Math.hypot(anchor.x - x, anchor.y - y);
-  if (length > WALL.maxLength + 1e-6 || wallDegree(g, anchor.id) >= maxWallDegree(anchor)) return null;
-  const planned = { x, y, radius: TOWER.radius };
-  const excluded = new Set([...towerFootprintTiles(anchor), ...towerFootprintTiles(planned)]);
-  const tiles = [];
-  const segments = [];
-  for (const tile of supercoverLine(anchor.x, anchor.y, x, y)) {
-    if (!inBounds(tile.x, tile.y)) continue;
-    const i = idx(tile.x, tile.y);
-    if (excluded.has(i)) continue;
-    tiles.push(tile);
-    if (!isPassable(g.map, tile.x, tile.y)) continue;
-    if (g.towers.some((t) => t !== anchor && footprintContains(t, tile))) return null;
-    if (g.buildings.some((b) => !b.destroyed && footprintContains(b, tile))) return null;
-    if ((g.nests || []).some((nest) => !nest.destroyed && footprintContains(nest, tile))) return null;
-    if (wallSegments(g).some((seg) => !seg.cancelled && seg.tx === tile.x && seg.ty === tile.y)) return null;
-    segments.push(tile);
-  }
-  if (!segments.length) return null;
-  const newPoint = { x, y };
-  for (const existing of g.walls) {
-    const points = linkPoints(g, existing);
-    if (points && properLineCross(anchor, newPoint, points[0], points[1])) return null;
-  }
-  return {
-    anchorId: anchor.id,
-    anchor,
-    length,
-    tiles,
-    segments,
-    cost: segments.length * WALL.costStonePerSegment,
-  };
-}
-
-function linkAngle(a, b) {
-  const dot = (a.anchor.x - a.newX) * (b.anchor.x - b.newX)
-    + (a.anchor.y - a.newY) * (b.anchor.y - b.newY);
-  const cos = clamp(dot / Math.max(1e-9, a.length * b.length), -1, 1);
-  return Math.acos(cos) * 180 / Math.PI;
-}
-
-function costWithWalls(tower, wallStone) {
-  return { stone: (tower.stone || 0) + wallStone, gold: tower.gold || 0 };
-}
-
-function affordabilityReason(g, cost) {
-  const shortfall = Math.max(0, (cost.stone || 0) - g.res.stone);
-  return shortfall > 0 ? `Need ${Math.ceil(shortfall)} more Stone.` : `need ${costLabel(cost)}`;
-}
-
-/** Pure D89 plan for one local tower site. No state is mutated. */
-export function autoWallPlan(g, x, y) {
-  const tower = towerCost(g);
-  const components = towerComponents(g);
-  const keepComponent = components.get(g.keepId);
-  const candidates = g.towers.map((anchor) => autoLinkCandidate(g, x, y, anchor))
-    .filter(Boolean).map((link) => ({ ...link, newX: x, newY: y,
-      component: components.get(link.anchorId), connected: components.get(link.anchorId) === keepComponent }));
-  const connected = candidates.filter((c) => c.connected)
-    .sort((a, b) => a.length * (a.anchor.keep ? WALL.keepPreference : 1)
-      - b.length * (b.anchor.keep ? WALL.keepPreference : 1) || a.anchorId - b.anchorId);
-  const isolated = candidates.filter((c) => !c.connected)
-    .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
-  const first = connected[0] || isolated[0] || null;
-  let second = null;
-  if (first) {
-    const validSecond = candidates.filter((c) => c !== first
-      && linkAngle(first, c) + 1e-7 >= WALL.minLinkAngle
-      && !properLineCross(first.anchor, { x, y }, c.anchor, { x, y })
-      && !c.segments.some((tile) => first.segments.some((other) => tile.x === other.x && tile.y === other.y)));
-    const bridges = validSecond.filter((c) => c.component !== first.component)
-      .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
-    const loops = validSecond.filter((c) => c.component === first.component)
-      .sort((a, b) => a.length - b.length || a.anchorId - b.anchorId);
-    second = bridges[0] || loops[0] || null;
-  }
-
-  const selected = first ? [first, ...(second ? [second] : [])] : [];
-  const firstWall = first?.cost || 0;
-  const allWalls = selected.reduce((sum, link) => sum + link.cost, 0);
-  const requiredCost = costWithWalls(tower, firstWall);
-  const fullCost = costWithWalls(tower, allWalls);
-  let links = selected;
-  let droppedOptional = false;
-  let ok = true;
-  let reason = null;
-  if (!canAfford(g, fullCost) && second && canAfford(g, requiredCost)) {
-    links = [first];
-    droppedOptional = true;
-  } else if (!canAfford(g, requiredCost)) {
-    ok = false;
-    reason = affordabilityReason(g, requiredCost);
-    links = [];
-  } else if (!canAfford(g, fullCost)) {
-    ok = false;
-    reason = affordabilityReason(g, fullCost);
-    links = [];
-  }
-  const costLinks = ok ? links : (first ? [first] : []);
-  const bridgeToKeep = costLinks.length > 1 && costLinks[0].component !== costLinks[1].component
-    && (costLinks[0].connected || costLinks[1].connected);
-  const status = bridgeToKeep ? 'bridges'
-    : (costLinks.some((link) => link.connected) ? 'connected' : 'outpost');
-  const wallCost = costLinks.reduce((sum, link) => sum + link.cost, 0);
-  const cost = costWithWalls(tower, wallCost);
-  const previewLinks = selected.map((link, index) => ({ ...link,
-    dropped: droppedOptional && index === 1,
-    refused: !ok && index === 0,
-  }));
-  return {
-    ok,
-    reasons: reason ? [reason] : [],
-    reason,
-    links: links.map(({ anchor, component, connected: isConnected, newX, newY, ...link }) => link),
-    previewLinks,
-    towerCost: tower.stone || 0,
-    wallCost,
-    total: (tower.stone || 0) + wallCost,
-    cost,
-    status,
-    droppedOptional,
-  };
-}
-
 /** Everything the wall preview needs: tiles, segments, cost and refusal reasons. */
 export function wallPlan(g, aId, bId) {
   const a = g.towers.find((t) => t.id === aId);
@@ -1152,6 +1013,10 @@ export function wallPlan(g, aId, bId) {
   result.length = dist(a, b);
   if (result.length > WALL.maxLength + 1e-6) reasons.push(`too long (${result.length.toFixed(1)} > ${WALL.maxLength} tiles)`);
   if (wallLinkExists(g, aId, bId)) reasons.push('these towers are already joined');
+  for (const existing of g.walls) {
+    const points = linkPoints(g, existing);
+    if (points && properLineCross(a, b, points[0], points[1])) reasons.push('crosses an existing wall');
+  }
 
   const footprints = new Set([...towerFootprintTiles(a), ...towerFootprintTiles(b)]);
   for (const tile of supercoverLine(a.x, a.y, b.x, b.y)) {
@@ -1162,12 +1027,16 @@ export function wallPlan(g, aId, bId) {
     // Cliffs and deep water are already barriers: skipped, never charged.
     if (!isPassable(g.map, tile.x, tile.y)) { result.skipped++; continue; }
     const blocker = g.blockerGrid[i];
-    if (blocker?.kind === 'wall') reasons.push('crosses an existing wall');
+    if (blocker?.kind === 'wall'
+      || wallSegments(g).some((seg) => !seg.cancelled && seg.tx === tile.x && seg.ty === tile.y)) {
+      reasons.push('crosses an existing wall');
+    }
     else if (blocker?.kind === 'tower') reasons.push('crosses another tower');
     if (g.towers.some((t) => t !== a && t !== b && towerFootprintTiles(t).includes(i))) reasons.push('crosses another tower');
-    if (g.buildings.some((o) => !o.destroyed && Math.floor(o.x) === tile.x && Math.floor(o.y) === tile.y)) {
+    if (g.buildings.some((o) => !o.destroyed && footprintContains(o, tile))) {
       reasons.push('crosses an economic building');
     }
+    if ((g.nests || []).some((n) => !n.destroyed && footprintContains(n, tile))) reasons.push('crosses a nest');
     result.segments.push(tile);
   }
   if (!result.segments.length && !reasons.length) reasons.push('nothing to build between these towers');
@@ -1181,32 +1050,6 @@ export function wallPlan(g, aId, bId) {
 
 function registerWallSegment(g, seg) {
   g.blockerGrid[seg.i] = { kind: 'wall', id: seg.id, structure: seg, maxHp: seg.maxHp };
-}
-
-function createAutomaticWall(g, plan, newTower) {
-  const anchor = g.towers.find((t) => t.id === plan.anchorId);
-  const link = {
-    id: g.nextWallId++, a: plan.anchorId, b: newTower.id,
-    aPos: { x: anchor.x, y: anchor.y }, bPos: { x: newTower.x, y: newTower.y },
-    builderTowerId: newTower.id,
-    automatic: true,
-    built: false, cancelled: false, progress: 0,
-    duration: Math.max(TOWER.buildTime, WALL.buildBase + WALL.buildPerTile * plan.segments.length),
-    segments: [],
-  };
-  plan.segments.forEach((tile, k) => {
-    link.segments.push({
-      id: `w${link.id}:${k}`, wall: true, linkId: link.id,
-      tx: tile.x, ty: tile.y, i: idx(tile.x, tile.y), x: tile.x + 0.5, y: tile.y + 0.5,
-      radius: 0.5, maxHp: WALL.segmentHp, hp: 0,
-      gate: k === 0 || k === plan.segments.length - 1,
-      present: false, cancelled: false, destroyed: false,
-      flash: 0, shake: 0, unseenHitAt: null,
-    });
-  });
-  g.walls.push(link);
-  g.stats.wallsBuilt++;
-  return link;
 }
 
 /** D81: start a wall link. The player must be at one of its towers. */
@@ -1233,13 +1076,12 @@ export function tryBuildWall(g, aId, bId) {
     const seg = {
       id: `w${link.id}:${k}`, wall: true, linkId: link.id,
       tx: tile.x, ty: tile.y, i: idx(tile.x, tile.y), x: tile.x + 0.5, y: tile.y + 0.5,
-      radius: 0.5, maxHp: WALL.segmentHp, hp: WALL.segmentHp * WALL.buildHpFraction,
+      radius: 0.5, maxHp: WALL.segmentHp, hp: 0,
       // The segment next to each anchor is a postern: enemy-solid, player-open.
       gate: k === 0 || k === plan.segments.length - 1,
-      present: true, cancelled: false, destroyed: false, flash: 0, shake: 0, unseenHitAt: null,
+      present: false, cancelled: false, destroyed: false, flash: 0, shake: 0, unseenHitAt: null,
     };
     link.segments.push(seg);
-    registerWallSegment(g, seg);
   });
   g.walls.push(link);
   invalidateKeepFields(g);
@@ -1268,50 +1110,27 @@ function updateWalls(g, dt) {
       if (!seg.destroyed && seg.hp <= 0) destroyWallSegment(g, seg);
     }
     if (link.built || link.cancelled) continue;
-    if (link.automatic) {
-      const builder = g.towers.find((t) => t.id === link.builderTowerId);
-      if (builder?.built) link.builderFinished = true;
-      if (!builder && !link.builderFinished) {
-        link.cancelled = true;
-        for (const seg of link.segments) if (!seg.present) seg.cancelled = true;
-        continue;
-      }
-      const rate = builder ? constructionRateMult(g, builder) : 1;
-      link.progress = Math.min(1, link.progress + rate * dt / link.duration);
-      const count = link.segments.length;
-      for (let k = 0; k < count; k++) {
-        const seg = link.segments[k];
-        if (seg.cancelled) continue;
-        const share = clamp(link.progress * count - k, 0, 1);
-        if (share <= 0) continue;
-        if (!seg.present) {
-          seg.present = true;
-          seg.hp = seg.maxHp * WALL.buildHpFraction;
-          registerWallSegment(g, seg);
-          invalidateKeepFields(g);
-        }
-        if (!seg.destroyed) seg.hp = Math.min(seg.maxHp,
-          seg.maxHp * (WALL.buildHpFraction + share * (1 - WALL.buildHpFraction)));
-      }
-      if (link.progress >= 1) {
-        link.built = true;
-        for (const seg of link.segments) if (seg.present && !seg.destroyed) seg.hp = seg.maxHp;
-        say(g, 'Wall complete.');
-        const mid = link.segments[Math.floor(link.segments.length / 2)];
-        emitAudioEvent(g, 'constructionComplete', mid || g.player);
-      }
-      continue;
-    }
     const near = link.segments.some((s) => dist(g.player, s) <= PLAYER.presenceRadius)
       || [link.a, link.b].some((id) => { const t = g.towers.find((o) => o.id === id); return t && dist(g.player, t) <= PLAYER.presenceRadius; });
-    const rate = (near ? occupancyMults(g).construction : 1) / link.duration;
-    const before = link.progress;
-    link.progress = Math.min(1, link.progress + rate * dt);
-    const gain = (link.progress - before) * WALL.segmentHp * (1 - WALL.buildHpFraction);
-    for (const seg of link.segments) if (!seg.destroyed) seg.hp = Math.min(seg.maxHp, seg.hp + gain);
+    const rate = near ? occupancyMults(g).construction : 1;
+    link.progress = Math.min(1, link.progress + rate * dt / link.duration);
+    const count = link.segments.length;
+    for (let k = 0; k < count; k++) {
+      const seg = link.segments[k];
+      const share = clamp(link.progress * count - k, 0, 1);
+      if (share <= 0) continue;
+      if (!seg.present) {
+        seg.present = true;
+        seg.hp = seg.maxHp * WALL.buildHpFraction;
+        registerWallSegment(g, seg);
+        invalidateKeepFields(g);
+      }
+      if (!seg.destroyed) seg.hp = Math.min(seg.maxHp,
+        seg.maxHp * (WALL.buildHpFraction + share * (1 - WALL.buildHpFraction)));
+    }
     if (link.progress >= 1) {
       link.built = true;
-      for (const seg of link.segments) if (!seg.destroyed && seg.maxHp - seg.hp < 1e-6 * seg.maxHp) seg.hp = seg.maxHp;
+      for (const seg of link.segments) if (seg.present && !seg.destroyed) seg.hp = seg.maxHp;
       say(g, 'Wall complete.');
       const mid = link.segments[Math.floor(link.segments.length / 2)];
       emitAudioEvent(g, 'constructionComplete', mid || g.player);
@@ -2513,24 +2332,56 @@ function rollWave(g) {
   g.waveWindow = window;
 }
 
+/** D97: whole countdown to combat, including the final warning. */
+export function assaultIn(g) {
+  if (g.phase === 'prep') return Math.max(0, g.phaseLeft) + WAVE.warning;
+  if (g.phase === 'warning') return Math.max(0, g.phaseLeft);
+  return 0;
+}
+
+function beginWaveWarning(g, seconds = WAVE.warning) {
+  g.phase = 'warning';
+  g.phaseLeft = Math.min(WAVE.warning, Math.max(0, seconds));
+  g.warning5Cued = false;
+  const where = g.spawnSides.length
+    ? g.spawnSides.map((s) => s.toUpperCase()).join(' and ')
+    : 'UNKNOWN';
+  say(g, `Wave ${g.wave} incoming from the ${where}.`);
+  emitAudioEvent(g, 'waveWarning', g.player);
+}
+
+/** Player-facing early start; unlike forceNextWave, this preserves readiness. */
+export function startWaveEarly(g) {
+  if (g.status !== 'playing') return { ok: false, reason: 'game ended' };
+  if (g.paused) return { ok: false, reason: 'paused' };
+  if (g.phase !== 'prep' && g.phase !== 'warning') return { ok: false, reason: `unavailable during ${g.phase}` };
+  const readyIn = Math.min(assaultIn(g), WAVE.earlyStartReady);
+  if (g.phase === 'prep') beginWaveWarning(g, readyIn);
+  else g.phaseLeft = readyIn;
+  // The readiness countdown already opened with the warning cue; no second one.
+  g.warning5Cued = true;
+  return { ok: true };
+}
+
 function updateWaves(g, dt) {
-  g.phaseLeft -= dt;
+  if (g.phase === 'prep' || g.phase === 'warning' || g.phase === 'aftermath') g.phaseLeft -= dt;
 
   if (g.phase === 'prep' && g.phaseLeft <= 0) {
-    rollWave(g);
-    g.phase = 'warning';
-    g.phaseLeft = WAVE.warning;
-    const where = g.spawnSides.map((s) => s.toUpperCase()).join(' and ');
-    say(g, `Wave ${g.wave} incoming from the ${where}.`);
-    emitAudioEvent(g, 'waveWarning', g.player);
+    beginWaveWarning(g);
     return;
   }
 
-  if (g.phase === 'warning' && g.phaseLeft <= 0) {
-    g.phase = 'combat';
-    g.phaseLeft = 0;
-    g.combatT = 0;
-    emitAudioEvent(g, g.wave >= WAVE.totalToSurvive ? 'finalWave' : 'waveStart', g.player);
+  if (g.phase === 'warning') {
+    if (g.phaseLeft <= 5 && !g.warning5Cued) {
+      g.warning5Cued = true;
+      emitAudioEvent(g, 'waveWarning', g.player);
+    }
+    if (g.phaseLeft <= 0) {
+      g.phase = 'combat';
+      g.phaseLeft = 0;
+      g.combatT = 0;
+      emitAudioEvent(g, g.wave >= WAVE.totalToSurvive ? 'finalWave' : 'waveStart', g.player);
+    }
     return;
   }
 
@@ -2548,19 +2399,22 @@ function updateWaves(g, dt) {
       g.phaseLeft = WAVE.aftermath;
       g.stats.wavesCleared++;
       say(g, `Wave ${g.wave} cleared.`);
-      if (g.wave >= WAVE.totalToSurvive) {
-        g.status = 'won';
-        emitAudioEvent(g, 'victory', g.player);
-        say(g, 'The final wave broke. Run complete.');
-      }
     }
     return;
   }
 
   if (g.phase === 'aftermath' && g.phaseLeft <= 0) {
+    if (g.wave >= WAVE.totalToSurvive) {
+      g.phaseLeft = 0;
+      g.status = 'won';
+      emitAudioEvent(g, 'victory', g.player);
+      say(g, 'The final wave broke. Run complete.');
+      return;
+    }
     g.wave++;
     g.phase = 'prep';
-    g.phaseLeft = WAVE.prep;
+    g.phaseLeft = WAVE.prep - WAVE.warning;
+    rollWave(g);
   }
 }
 

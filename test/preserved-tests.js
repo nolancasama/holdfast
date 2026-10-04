@@ -2015,12 +2015,12 @@ check('waves escalate rather than staying flat', () => {
     g.wave = wave;
     let total = 0;
     for (let i = 0; i < 12; i++) { // average out the roll
-      g.phase = 'prep';
+      g.wave = wave - 1;
+      g.phase = 'aftermath';
       g.phaseLeft = 0;
       update(g, 0.001);
       total += g.pendingSpawns.length;
       g.pendingSpawns = [];
-      g.phase = 'prep';
     }
     sizes.push(total / 12);
   }

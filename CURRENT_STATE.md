@@ -1,14 +1,7 @@
 # Holdfast current state
 
-Last updated: 2026-10-04 (fortress phase 3 D89-D95 and simple roads D96,
-committed and pushed, awaiting hand-play)
-
-## Codex / Delegated Work — none in flight
-
-Phase 3 slice A (automatic walls, coalesced fields, blind spots) was written
-by Codex, which hit its usage limit during validation; Claude reviewed it,
-fixed the D90 recompute timing and implemented slice B (garrison, nests) and
-the D94 evaluation directly. Nothing delegated is pending.
+Last updated: 2026-10-05 (expansion pacing D97 and manual walls D98,
+implemented in the working tree, awaiting hand-play)
 
 ## What this is
 
@@ -29,11 +22,16 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
 - **Enemies (D78/D82/D85):** march on the Keep on per-type break-cost flow
   fields; Swarm detours, Heavy breaks walls. Fields rebuild on the next frame
   after a geometry change, one type per frame, coalesced while busy (D90/D95).
-- **Automatic walls (D89):** placing a tower plans up to two links (max 13
-  tiles, no crossings, angle >= 50, degree caps 3/6), preferring the Keep's
-  component, then bridging outposts or closing loops. Preview shows planned
-  links, Tower/Walls/Total Stone and CONNECTED/OUTPOST/BRIDGES OUTPOST.
-  Segments grow from the anchor during construction. No manual wall mode.
+- **Waves (D97):** mandatory expansion lasts 120 s before wave 1 and 90 s
+  thereafter, including the final 15 s `ASSAULT IMMINENT` warning. Direction
+  is known from expansion start. A 4 s aftermath follows a cleared wave;
+  `START NEXT WAVE` shortens expansion/warning to at most 4 s, with no reward
+  for either waiting or starting early.
+- **Manual walls (D98):** `Build Wall` selects two finished Tower/Keep anchors,
+  previews tiles, segments, Stone cost, connectivity and refusal reasons, then
+  confirms construction. Tower placement never creates or charges for walls.
+  Walls retain grow-from-anchor construction, rubble/repair rules and
+  coalesced path-field invalidation.
 - **Blind spot (D93):** towers fire only between 2.8 and max range (Keep
   3.2); `towerMinRange` reads `t.closeDefense` for a future upgrade. Range
   display hatches the blind zone.
@@ -51,34 +49,40 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
 
 ## Verification
 
-- `npm test`: **222 passed, 0 failed** (exposure-feature tests retired with
-  D96; new hard road checks plus 12 extra generated seeds).
+- D97/D98 `npm test`: **220 passed, 0 failed**.
 - `npm run road-report`: 40 seeds, 0 hard road defects, 0 readability
   defects, generation median 783 ms.
 - Nest probe: a lone tower dies to ferals in its blind spot (27-42 s); two
   supporting towers destroy the nest in 68 s at full health (4 seeds).
-- `npm run economy-sim`: opening (2 connected towers with walls, Farm,
-  Quarry) at 0 s; first Gold Mine ~115 s.
-- `npm run wave-report`: lone Keep falls waves 1-2; fortress falls 8-10;
-  fortress+ won 2/5 (see D95). Bots are passive.
-- Browser (1600x900, no errors): tower preview with links/costs/blind zone,
-  wall growth, Keep-A-B triangle, garrison pips and HUD, agitated nest with
-  territory ring, minimap.
+- `npm run economy-sim`: passed; each finished Tower is followed by an
+  explicit 4-segment Keep link (Tower starts at 0.0 s and 3.6 s), Farm and
+  Quarry start at 7.2 s, first Gold Mine at 123.9 s (8/8 seeds).
+- `npm run wave-report`: passed; outposts fall waves 1-4, fortress falls waves
+  8-10, and fortress+ falls waves 8-10. BRAVO has no valid fortress layout;
+  the other five seeds run both explicit fan/ring profiles.
+- D97/D98 browser hand-play: pending.
 
 ## Known risks / open questions
 
-1. **Feel is unverified by a human** (the brief's 20 hand-play questions).
+1. **Feel is unverified by a human:** in particular, whether expansion creates
+   idle time and whether the 15 s warning or 4 s early-start readiness feels
+   rushed.
 2. A Keep with no supporting tower is nearly defenceless at its base (D93);
    intended, but may feel harsh in the first minute.
 3. Farms placed on blob edges feed only 1-2 soldiers; whether players notice
    fertility quality is untested.
 4. Fewer spawn mouths (1-2 per side) concentrate waves on the roads; the
    wave report shows unchanged pressure, but hand-play should confirm.
-5. Waves on the large map run ~90 s each; a full run is ~15-20 minutes.
+5. The effect of manual wall spending on opening tempo and late-wave repair
+   pressure needs hand-play confirmation.
 
 ## Next steps
 
-1. Hand-play several runs (the brief's 20 fortress questions and the 12 road
-   questions): readability of roads vs walls, nests, garrison, blind spots.
-2. Tune nest hp/feral pressure and Farm support from play.
-3. Raise wave pressure only if hand-play finds the fortress too strong.
+1. Hand-play the opening: use the full 120 s expansion and try an early start.
+2. Hand-play an intermission: repair and extend walls inside the 90 s total.
+3. Hand-play the exploration gamble: range far from the Keep and judge the
+   return decision once direction and countdown are known.
+4. Hand-play a late-nest push during expansion and verify the assault does not
+   pause, clear ferals or teleport the player home.
+5. Run an idle test to judge whether mandatory waiting feels empty, and a
+   deliberately late return to judge whether the warning feels rushed.

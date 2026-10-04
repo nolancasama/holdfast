@@ -4,7 +4,7 @@ import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, WALL, NEST } from 
 import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
 import { polylineTurns } from './roads.js';
 import {
-  autoWallPlan, towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
+  towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
 } from './game.js';
 
 const TP = RENDER.baseTilePx;
@@ -751,7 +751,7 @@ function drawBuildings(ctx, g, view) {
   }
 }
 
-// D81/D89: present segments are masonry; not-yet-present segments are a faint plan.
+// D98: present segments are masonry; not-yet-present segments are a faint plan.
 function drawWalls(ctx, g, view) {
   for (const link of g.walls || []) {
     const pending = link.segments.filter((seg) => seg.present === false && !seg.cancelled
@@ -891,18 +891,23 @@ function drawKeepArrow(ctx, g, view) {
   ctx.fillText('KEEP', 0, -15); ctx.restore();
 }
 
-function ensureMinimap(layers) {
+function ensureMinimap(g, layers) {
   if (layers.minimap) return layers.minimap;
   const canvas = document.createElement('canvas');
   canvas.width = MAP.w; canvas.height = MAP.h;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#020304'; ctx.fillRect(0, 0, MAP.w, MAP.h);
+  // Roads are strategic landmarks and remain readable beyond explored terrain.
+  ctx.fillStyle = '#7e6948';
+  for (let i = 0; i < g.map.road.length; i++) {
+    if (g.map.road[i]) ctx.fillRect(i % MAP.w, Math.floor(i / MAP.w), 1, 1);
+  }
   layers.minimap = { canvas, ctx, explored: new Uint8Array(MAP.w * MAP.h), exploredTiles: 0, fogVersion: -1 };
   return layers.minimap;
 }
 
 function updateMinimapTerrain(g, layers) {
-  const mini = ensureMinimap(layers);
+  const mini = ensureMinimap(g, layers);
   if (mini.fogVersion === (g.fog?.version ?? 0)) return mini;
   for (let y = 0; y < MAP.h; y++) {
     for (let x = 0; x < MAP.w; x++) {
@@ -957,15 +962,21 @@ function drawMinimap(ctx, g, layers, view) {
   }
   for (const link of g.walls || []) {
     for (const seg of link.segments) {
-      if (seg.destroyed || seg.cancelled || seg.present === false || !tileExplored(g, seg.tx, seg.ty)) continue;
+      if (seg.destroyed || seg.cancelled || seg.present === false) continue;
       miniPoint(ctx, rect, seg.x, seg.y, '#d9d1c0', 2);
     }
   }
   for (const t of g.towers) {
-    if (!tileExplored(g, Math.floor(t.x), Math.floor(t.y))) continue;
+    if (t.hp <= 0 || t.destroyed) continue;
     const connectivity = towerConnectivity(g, t);
     const color = t.keep ? '#ffd666' : connectivity === 'outpost' ? '#f2a93b' : '#70c9ff';
     miniPoint(ctx, rect, t.x, t.y, color, t.keep ? 6 : 4);
+    if (t.keep) {
+      const kx = rect.x + t.x / MAP.w * rect.w;
+      const ky = rect.y + t.y / MAP.h * rect.h;
+      ctx.strokeStyle = '#fff1a8'; ctx.lineWidth = 1.5;
+      ctx.strokeRect(kx - 4, ky - 4, 8, 8);
+    }
   }
   miniPoint(ctx, rect, g.player.x, g.player.y, '#ffffff', 4);
   const px = rect.x + g.player.x / MAP.w * rect.w;
@@ -981,15 +992,19 @@ function drawMinimap(ctx, g, layers, view) {
   ctx.strokeRect(rect.x + wx0 / MAP.w * rect.w, rect.y + wy0 / MAP.h * rect.h,
     ww / MAP.w * rect.w, wh / MAP.h * rect.h);
 
-  if (g.phase === 'warning' || g.phase === 'combat') {
-    ctx.fillStyle = '#ff5b5b';
+  if (g.phase === 'prep' || g.phase === 'warning' || g.phase === 'combat') {
+    const warning = g.phase === 'warning';
+    const urgent = warning && g.phaseLeft <= 5;
+    const pulse = 0.5 + 0.5 * Math.sin(g.time * (urgent ? 11 : warning ? 6 : 2.5));
+    ctx.fillStyle = warning ? `rgba(255,75,75,${0.58 + pulse * 0.42})` : 'rgba(255,214,102,0.88)';
     for (const side of g.spawnSides || []) {
       const west = side === 'west';
       const x = west ? rect.x + 3 : rect.x + rect.w - 3;
       const y = rect.y + rect.h * 0.5;
+      const size = urgent ? 7 + pulse * 3 : warning ? 6 + pulse * 2 : 6;
       ctx.beginPath();
-      if (west) { ctx.moveTo(x + 8, y); ctx.lineTo(x, y - 5); ctx.lineTo(x, y + 5); }
-      else { ctx.moveTo(x - 8, y); ctx.lineTo(x, y - 5); ctx.lineTo(x, y + 5); }
+      if (west) { ctx.moveTo(x + size + 3, y); ctx.lineTo(x, y - size); ctx.lineTo(x, y + size); }
+      else { ctx.moveTo(x - size - 3, y); ctx.lineTo(x, y - size); ctx.lineTo(x, y + size); }
       ctx.closePath(); ctx.fill();
     }
   }
@@ -1143,39 +1158,37 @@ function previewLinkTiles(link) {
   return [];
 }
 
-function drawAutoWallPreview(ctx, g, view, x, y, check) {
-  const plan = check.autoWalls || check.autoWallPlan || check.wallPlan || autoWallPlan(g, x, y);
-  if (!plan) return;
-  const previews = plan.previewLinks || plan.links || [];
-  for (const link of previews) {
-    const refused = !check.ok || !plan.ok || link.refused;
-    const dropped = !refused && link.dropped;
-    const color = refused ? '#ff5a5a' : dropped ? '#f2a93b' : '#7be196';
-    const fill = refused ? 'rgba(255,90,90,0.27)' : dropped ? 'rgba(242,169,59,0.25)' : 'rgba(123,225,150,0.25)';
-    const anchor = g.towers.find((tower) => tower.id === link.anchorId);
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.fillStyle = fill;
-    ctx.lineWidth = localPx(view, 2);
-    if (dropped || refused) ctx.setLineDash([localPx(view, 6), localPx(view, 4)]);
-    if (anchor) {
-      ctx.beginPath();
-      ctx.moveTo(anchor.x * TP, anchor.y * TP);
-      ctx.lineTo(x * TP, y * TP);
-      ctx.stroke();
-    }
-    for (const tile of previewLinkTiles(link)) {
-      const tx = Number.isFinite(tile.tx) ? tile.tx : tile.x;
-      const ty = Number.isFinite(tile.ty) ? tile.ty : tile.y;
-      if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
-      ctx.fillRect(tx * TP, ty * TP, TP, TP);
-      ctx.strokeRect(tx * TP, ty * TP, TP, TP);
-    }
-    ctx.restore();
+function drawWallPreview(ctx, g, view) {
+  const a = g.towers.find((tower) => tower.id === g.wallAnchorA);
+  const b = g.towers.find((tower) => tower.id === g.wallAnchorB);
+  ctx.save();
+  for (const tower of g.towers) {
+    if (!tower.built || tower.hp <= 0 || tower.destroyed) continue;
+    const chosen = tower === a || tower === b;
+    ctx.strokeStyle = chosen ? '#ffd666' : 'rgba(123,225,150,0.72)';
+    ctx.lineWidth = localPx(view, chosen ? 4 : 2);
+    ctx.beginPath(); ctx.arc(tower.x * TP, tower.y * TP, (tower.radius + 0.28) * TP, 0, Math.PI * 2); ctx.stroke();
   }
+  if (!a || !b) { ctx.restore(); return; }
+  const plan = g.buildCheck;
+  const valid = !!plan?.ok;
+  ctx.strokeStyle = valid ? '#7be196' : '#ff5a5a';
+  ctx.fillStyle = valid ? 'rgba(123,225,150,0.28)' : 'rgba(255,90,90,0.28)';
+  ctx.lineWidth = localPx(view, 2);
+  if (!valid) ctx.setLineDash([localPx(view, 6), localPx(view, 4)]);
+  ctx.beginPath(); ctx.moveTo(a.x * TP, a.y * TP); ctx.lineTo(b.x * TP, b.y * TP); ctx.stroke();
+  for (const tile of previewLinkTiles(plan || {})) {
+    const tx = Number.isFinite(tile.tx) ? tile.tx : tile.x;
+    const ty = Number.isFinite(tile.ty) ? tile.ty : tile.y;
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+    ctx.fillRect(tx * TP, ty * TP, TP, TP);
+    ctx.strokeRect(tx * TP, ty * TP, TP, TP);
+  }
+  ctx.restore();
 }
 
 function drawBuildPreview(ctx, g, view) {
+  if (g.buildType === 'wall') { drawWallPreview(ctx, g, view); return; }
   const { x, y } = g.buildSite || g.cursor;
   const check = g.buildCheck;
   if (!check) return;
@@ -1197,7 +1210,6 @@ function drawBuildPreview(ctx, g, view) {
   if (type === 'tower') {
     drawRangeDisplay(ctx, g, { x, y, keep: false, closeDefense: 0 }, TOWER.weapon.range, view,
       'rgba(180,210,255,0.5)');
-    drawAutoWallPreview(ctx, g, view, x, y, check);
   }
 
   // Minimum-spacing rings around existing towers, so refusals are legible.

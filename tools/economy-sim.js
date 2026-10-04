@@ -2,11 +2,13 @@
 // production code; the scripted player teleports between build sites so the
 // report measures the economy rather than travel execution.
 
-import { MAP, NEST } from '../src/config.js';
-import { autoWallPlan, createGame, canPlaceAt, tryBuild, update, foodSupport } from '../src/game.js';
+import { MAP, NEST, WALL } from '../src/config.js';
+import {
+  createGame, canPlaceAt, tryBuild, tryBuildWall, wallPlan, towerConnectivity, update, foodSupport,
+} from '../src/game.js';
 
 const SEEDS = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 'HOTEL'];
-// D89: wall links and their Stone cost are part of each tower placement.
+// D98: towers and their deliberate Keep links are separate purchases.
 const ORDER = ['tower', 'tower', 'farm', 'quarry', 'mine'];
 const STEP = 0.1;
 const DURATION = 300;
@@ -18,6 +20,7 @@ function findSite(g, type) {
     const wx = x + 0.5;
     const wy = y + 0.5;
     const distance = Math.hypot(wx - keep.x, wy - keep.y);
+    if (type === 'tower' && distance > WALL.maxLength) continue;
     if ((type === 'farm' || type === 'quarry') && distance > 20) continue;
     if (type === 'mine' && distance < 27) continue;
     // D92: measure the economy on unguarded Gold; guarded Gold needs a siege first.
@@ -49,17 +52,39 @@ function simulate(seed) {
   const samples = [];
   let orderIndex = 0;
   let pendingSite = null;
+  let pendingTower = null;
 
   for (let elapsed = 0; elapsed <= DURATION + 1e-6; elapsed += STEP) {
     while (orderIndex < ORDER.length) {
       const type = ORDER[orderIndex];
+      if (pendingTower) {
+        if (!pendingTower.tower.built) break;
+        const keep = g.towers.find((t) => t.keep);
+        const plan = wallPlan(g, keep.id, pendingTower.tower.id);
+        if (!plan.ok) {
+          if (plan.reasons.every((reason) => /^need /i.test(reason))) break;
+          throw new Error(`${seed}: cannot join ${pendingTower.key} to Keep: ${plan.reasons.join(', ')}`);
+        }
+        g.player.x = pendingTower.tower.x;
+        g.player.y = pendingTower.tower.y;
+        const result = tryBuildWall(g, keep.id, pendingTower.tower.id);
+        if (!result.ok) throw new Error(`${seed}: ${pendingTower.key} wall changed during build`);
+        const link = g.walls[g.walls.length - 1];
+        timings[`${pendingTower.key}Links`] = 1;
+        timings[`${pendingTower.key}Segments`] = link.segments.length;
+        timings[`${pendingTower.key}WallStone`] = plan.cost.stone;
+        timings[`${pendingTower.key}TotalStone`] = pendingTower.towerStone + plan.cost.stone;
+        timings[`${pendingTower.key}Status`] = towerConnectivity(g, pendingTower.tower);
+        pendingTower = null;
+        orderIndex++;
+        pendingSite = null;
+        continue;
+      }
       const site = pendingSite || findSite(g, type);
       if (!site) throw new Error(`${seed}: no valid ${type} site for scripted opening`);
       pendingSite = site;
       const current = canPlaceAt(g, site.x, site.y, type);
       if (!current.ok) break;
-      const wallPlan = type === 'tower' ? autoWallPlan(g, site.x, site.y) : null;
-      const wallsBefore = g.walls.length;
       g.player.x = site.x;
       g.player.y = site.y;
       const result = tryBuild(g, site.x, site.y, type);
@@ -68,12 +93,8 @@ function simulate(seed) {
       const key = `${type}${type === 'tower' ? ordinal : ''}`;
       timings[key] = elapsed;
       if (type === 'tower') {
-        const links = g.walls.slice(wallsBefore);
-        timings[`${key}Links`] = links.length;
-        timings[`${key}Segments`] = links.reduce((sum, link) => sum + link.segments.length, 0);
-        timings[`${key}WallStone`] = wallPlan.wallCost;
-        timings[`${key}TotalStone`] = wallPlan.total;
-        timings[`${key}Status`] = wallPlan.status;
+        pendingTower = { tower: result.structure, key, towerStone: result.cost.stone || 0 };
+        break;
       }
       orderIndex++;
       pendingSite = null;
@@ -94,7 +115,7 @@ function median(values) {
 }
 
 const runs = SEEDS.map(simulate);
-console.log('D89 scripted opening (seconds affordable/built; automatic links charged with towers)');
+console.log('D98 scripted opening (seconds affordable/built; manual Keep links charged separately)');
 const COLS = ['tower1', 'tower2', 'farm', 'quarry', 'mine'];
 console.log('| Seed | Tower 1 (links/segs, wall/total Stone) | Tower 2 (links/segs, wall/total Stone) | Farm | Quarry | Gold Mine |');
 console.log('|---|---:|---:|---:|---:|---:|');

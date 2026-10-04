@@ -4,12 +4,12 @@ import { ARCHETYPES, TOWER, PLAYER, BUILDINGS, WAVE, DROP } from './config.js';
 import {
   towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState,
   upgradeState, upgradeRateMult, towerAlarmState, stuckState, playerBuildSite, resourceState,
-  autoWallPlan, towerMinRange, garrisonState, garrisonSlots, farmSupport,
+  assaultIn, wallPlan, towerConnectivity, towerMinRange, garrisonState, garrisonSlots, farmSupport,
 } from './game.js';
 
 export const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 1) => Number(n || 0).toFixed(d);
-const LABEL = { tower: 'Tower', farm: 'Farm', quarry: 'Quarry', mine: 'Gold Mine' };
+const LABEL = { tower: 'Tower', wall: 'Wall', farm: 'Farm', quarry: 'Quarry', mine: 'Gold Mine' };
 const RESOURCE = { farm: 'food', quarry: 'stone', mine: 'gold' };
 
 function resourceRates(g) {
@@ -57,7 +57,12 @@ export function renderPicks(selectedKey, onPick) {
 let lastLogLen = -1;
 
 export function updateHud(g) {
-  const phaseLabel = { prep: 'PREP', warning: 'INCOMING', combat: 'COMBAT', aftermath: 'CLEAR' }[g.phase];
+  const seconds = Math.max(0, assaultIn(g));
+  const shownSeconds = Math.ceil(seconds);
+  const countdown = `${String(Math.floor(shownSeconds / 60)).padStart(2, '0')}:${String(shownSeconds % 60).padStart(2, '0')}`;
+  const incoming = (g.spawnSides || []).length
+    ? g.spawnSides.map((side) => side.toUpperCase()).join(' + ') : 'UNKNOWN';
+  const enemiesLeft = (g.enemies || []).filter((enemy) => !enemy.wild).length + (g.pendingSpawns || []).length;
   const rates = resourceRates(g);
   for (const key of ['stone', 'gold']) {
     $(`hud-${key}`).textContent = Math.floor(g.res?.[key] || 0);
@@ -74,12 +79,19 @@ export function updateHud(g) {
       : `SUPPLY DEFICIT · ${Math.ceil(food.graceLeft ?? 0)}s`;
     deficit.style.color = 'var(--red)'; deficit.style.borderColor = 'var(--red)';
   }
-  $('hud-wave').textContent = `${g.wave}/${WAVE.totalToSurvive}`;
-  $('hud-phase').textContent = g.paused ? 'PAUSED' : g.phase === 'warning'
-    ? `INCOMING — ${(g.spawnSides || []).map((s) => s.toUpperCase()).join(' + ')}` : phaseLabel;
-  $('hud-timer').textContent = g.phase === 'combat'
-    ? `${g.enemies.filter((e) => !e.wild).length + g.pendingSpawns.length} left` : `${Math.max(0, g.phaseLeft).toFixed(0)}s`;
-  $('hud-phase-chip').className = `chip ${g.paused ? '' : `phase-${g.phase}`}`;
+  $('hud-wave').textContent = `WAVE ${g.wave}`;
+  $('hud-incoming').textContent = `Incoming: ${incoming}`;
+  $('hud-incoming').hidden = g.phase === 'combat' || g.phase === 'aftermath';
+  $('hud-phase').textContent = g.paused ? 'PAUSED' : g.phase === 'prep' ? 'EXPANSION'
+    : g.phase === 'warning' ? 'ASSAULT IMMINENT' : g.phase === 'combat' ? 'SIEGE' : 'WAVE COMPLETE';
+  $('hud-timer').textContent = g.phase === 'prep' || g.phase === 'warning'
+    ? `NEXT ASSAULT ${countdown}` : g.phase === 'combat' ? `${enemiesLeft} ENEMIES LEFT`
+      : g.phase === 'aftermath' ? `${Math.max(0, g.phaseLeft).toFixed(0)}s` : '';
+  $('hud-phase-chip').className = `phase-block phase-${g.phase}${g.paused ? ' paused' : ''}${
+    g.phase === 'warning' && seconds <= 5 ? ' urgent' : ''}`;
+  const early = $('start-wave');
+  early.hidden = g.paused || g.status !== 'playing' || (g.phase !== 'prep' && g.phase !== 'warning');
+  early.disabled = early.hidden;
   $('hud-hp').textContent = Math.max(0, Math.round(g.player.hp));
   $('hud-seed').textContent = `seed ${g.seed}`;
   const pause = $('pause-toggle');
@@ -218,8 +230,9 @@ function updateSelection(g) {
 
 function updateBuild(g) {
   $('build-toggle').disabled = g.paused;
-  $('build-confirm').disabled = g.paused || !g.buildMode || !g.buildCheck?.ok;
-  $('build-confirm').textContent = 'Build here [Enter]';
+  const wallMode = g.buildMode && g.buildType === 'wall';
+  $('build-confirm').disabled = g.paused || !g.buildMode || !g.buildCheck?.ok || (wallMode && g.wallAnchorB == null);
+  $('build-confirm').textContent = wallMode ? 'Build wall [Enter]' : 'Build here [Enter]';
   $('build-state').textContent = g.buildMode ? `— ${LABEL[g.buildType || 'tower'].toUpperCase()}` : '';
   $('build-state').className = g.buildMode ? 'good' : 'muted';
   for (const type of ['tower', 'farm', 'quarry', 'mine']) {
@@ -233,22 +246,41 @@ function updateBuild(g) {
     button.style.borderColor = g.buildMode && g.buildType === type ? 'var(--gold)' : '';
     button.title = check && !check.ok ? reasons.join(', ') : '';
   }
+  $('build-wall').disabled = g.paused;
+  $('build-wall').style.borderColor = wallMode ? 'var(--gold)' : '';
+  $('build-wall-cost').textContent = 'anchors';
 
   const info = $('build-info');
-  if (g.buildMode && g.buildCheck) {
+  if (wallMode) {
+    const a = g.towers.find((tower) => tower.id === g.wallAnchorA);
+    const b = g.towers.find((tower) => tower.id === g.wallAnchorB);
+    if (!a) {
+      info.innerHTML = 'Click a finished <b>Tower</b> or the <b>Keep</b> for anchor A.';
+    } else if (!b) {
+      info.innerHTML = `Anchor A: <b>${a.keep ? 'KEEP' : `Tower #${a.id}`}</b><br />Click a different finished anchor for B. Escape/right-click goes back.`;
+    } else {
+      const plan = g.buildCheck || wallPlan(g, a.id, b.id);
+      const near = [a, b].some((tower) => Math.hypot(g.player.x - tower.x, g.player.y - tower.y)
+        <= PLAYER.presenceRadius + tower.radius);
+      const reasons = [...(plan.reasons || [])];
+      if (!near) reasons.push('stand at one of the two towers to start the wall');
+      const connected = towerConnectivity(g, a) !== 'outpost' || towerConnectivity(g, b) !== 'outpost';
+      info.innerHTML = [
+        `${a.keep ? 'KEEP' : `Tower #${a.id}`} → ${b.keep ? 'KEEP' : `Tower #${b.id}`}`,
+        `${plan.segments?.length || 0} segments · ${plan.skipped || 0} cliff/water skipped · ${Math.ceil(plan.cost?.stone || 0)} Stone`,
+        `<span class="${connected ? 'good' : 'warn'}">${connected ? 'CONNECTED' : 'OUTPOST'}</span>`,
+        plan.ok && near ? '<span class="good">Valid wall — press Enter or click Build wall.</span>'
+          : `<span class="warn">Blocked: ${[...new Set(reasons)].join(', ') || 'invalid wall'}</span>`,
+      ].join('<br />');
+    }
+  } else if (g.buildMode && g.buildCheck) {
     const check = g.buildCheck;
     const reasons = check.reasons || (check.reason ? [check.reason] : []);
     const lines = [];
     if ((g.buildType || 'tower') === 'tower' && g.buildSite) {
-      const plan = check.autoWalls || check.autoWallPlan || check.wallPlan || autoWallPlan(g, g.buildSite.x, g.buildSite.y);
-      const stone = (value) => Math.ceil(Number(value?.stone ?? value ?? 0));
-      lines.push(`Tower ${stone(plan.towerCost)} Stone / Walls ${stone(plan.wallCost)} Stone / Total ${stone(plan.total)} Stone`);
-      const status = plan.status === 'bridges' ? 'BRIDGES OUTPOST' : String(plan.status || 'outpost').toUpperCase();
-      lines.push(`<span class="${check.ok && plan.ok ? 'good' : 'warn'}">${status}</span>`);
-      if (plan.droppedOptional) lines.push('<span class="warn">Optional second wall dropped — not enough Stone.</span>');
-      const reason = plan.reason || plan.reasons?.[0] || reasons[0];
-      lines.push(check.ok && plan.ok ? '<span class="good">Valid site — press Enter or click Build here.</span>'
-        : `<span class="warn">Blocked: ${reason || 'invalid site'}</span>`);
+      lines.push(`Cost ${costText(check.cost)}`);
+      lines.push(check.ok ? '<span class="good">Valid site — press Enter or click Build here.</span>'
+        : `<span class="warn">Blocked: ${reasons.join(', ') || 'invalid site'}</span>`);
     } else {
       if (g.buildType === 'farm' && Number.isFinite(check.fertility)) lines.push(`Fertility x${fmt(check.fertility, 2)}`);
       if (g.buildType === 'farm' && Number.isFinite(check.rate)) lines.push(`Feeds ${farmSupport({ rate: check.rate })} soldiers`);
@@ -259,7 +291,7 @@ function updateBuild(g) {
     }
     info.innerHTML = lines.join('<br />');
   } else {
-    info.innerHTML = 'Choose a structure, walk to a site, then press <b>Enter</b>. Towers create up to two automatic wall links. Farms need fertile ground; quarries and mines need an unclaimed site.';
+    info.innerHTML = 'Choose a structure and build nearby, or choose <b>Wall [X]</b> and select two finished anchors. Farms need fertile ground; quarries and mines need an unclaimed site.';
   }
 }
 

@@ -395,13 +395,14 @@ export const STUCK = {
 
 // --- waves ------------------------------------------------------------------
 export const WAVE = {
-  // D83: ten waves; pressure comes from budget, Heavy share, hp and structural
-  // damage - never from speed.
+  // D97: prepFirst/prep are the total time to assault. The warning is the
+  // final portion of that total, not extra time added afterward.
   totalToSurvive: 10,
-  prepFirst: 40,
-  prep: 20,
-  warning: 7,
-  aftermath: 3,
+  prepFirst: 120,
+  prep: 90,
+  warning: 15,
+  aftermath: 4,
+  earlyStartReady: 4,
   budgetBase: 40,
   budgetPerWave: 36,
   budgetAccel: 2,           // extra budget x (wave-1)^2: late waves become formations

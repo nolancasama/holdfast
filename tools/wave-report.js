@@ -1,16 +1,16 @@
-// D89-D94 wave-pressure report. Real wave rolls, spawning, pathing, combat,
+// D89-D98 wave-pressure report. Real wave rolls, spawning, pathing, combat,
 // walls and repair; a scripted player sits in the Keep holding Repair. Three
-// defences exercise the automatic-wall placement rules:
-//   outposts  - the Keep plus two isolated towers beyond automatic-link range
-//   fortress  - three inner towers whose placements form an auto-linked fan,
+// defences exercise deliberate manual-wall layouts:
+//   outposts  - the Keep plus two isolated towers with no walls
+//   fortress  - three inner towers joined as a Keep-centred fan,
 //               upgraded to W1 on wave 4 and W2 on wave 7
-//   fortress+ - the same, plus three auto-linked towers extending around the Keep
+//   fortress+ - the same, plus three towers extending the wall around the Keep
 // All get a farm and a quarry at the nearest valid sites, then live on the
 // real economy (no cheats after setup). Run: npm run wave-report [seeds...]
 
 import { MAP, WALL, WAVE, KEEP, PLAYER } from '../src/config.js';
 import {
-  autoWallPlan, createGame, update, canPlaceAt, tryBuild, tryUpgrade, wallSegments,
+  createGame, update, canPlaceAt, tryBuild, tryBuildWall, tryUpgrade, wallSegments,
   assignGarrison, garrisonState,
 } from '../src/game.js';
 
@@ -47,7 +47,7 @@ function nearestSite(g, type, maxDistance = 40) {
   return best;
 }
 
-function towerSiteNear(g, x, y, minimumLinks, maximumLinks = Infinity) {
+function towerSiteNear(g, x, y) {
   const candidates = [];
   for (let oy = -3; oy <= 3; oy++) for (let ox = -3; ox <= 3; ox++) {
     const wx = Math.floor(x + ox) + 0.5;
@@ -56,22 +56,17 @@ function towerSiteNear(g, x, y, minimumLinks, maximumLinks = Infinity) {
     candidates.push({ x: wx, y: wy, d });
   }
   candidates.sort((a, b) => a.d - b.d || a.y - b.y || a.x - b.x);
-  return candidates.find((p) => {
-    if (!canPlaceAt(g, p.x, p.y, 'tower').ok) return false;
-    const links = autoWallPlan(g, p.x, p.y).links.length;
-    return links >= minimumLinks && links <= maximumLinks;
-  }) || null;
+  return candidates.find((p) => canPlaceAt(g, p.x, p.y, 'tower').ok) || null;
 }
 
-/** Three adjacent towers form two Keep-centred triangles under D89 placement. */
+/** Three adjacent towers can be joined as two Keep-centred triangles. */
 function innerNetwork(g) {
   const keep = g.towers[0];
   const radius = 7.4;
   const towers = [];
   for (const degrees of [-60, 0, 60]) {
     const a = (degrees * Math.PI) / 180;
-    const site = towerSiteNear(g, keep.x + Math.cos(a) * radius, keep.y + Math.sin(a) * radius,
-      towers.length ? 2 : 1);
+    const site = towerSiteNear(g, keep.x + Math.cos(a) * radius, keep.y + Math.sin(a) * radius);
     if (!site) return null;
     const t = place(g, site.x, site.y, 'tower');
     if (!t) return null;
@@ -85,13 +80,11 @@ function isolatedOutpost(g, angle) {
   const radius = WALL.maxLength + 2;
   const x = keep.x + Math.cos(angle) * radius;
   const y = keep.y + Math.sin(angle) * radius;
-  return towerSiteNear(g, x, y, 0, 0);
+  return towerSiteNear(g, x, y);
 }
 
-/** Let the real construction code finish towers, buildings and sequential walls. */
-function finishSetup(g) {
-  g.phase = 'prep';
-  g.phaseLeft = 1e9;
+/** Let the real construction code finish every currently queued structure. */
+function finishConstruction(g) {
   for (let guard = 0; guard < 2400; guard++) {
     const pending = g.towers.some((t) => !t.built)
       || g.buildings.some((b) => !b.destroyed && !b.built)
@@ -99,27 +92,47 @@ function finishSetup(g) {
     if (!pending) break;
     update(g, STEP);
   }
-  if (g.towers.some((t) => !t.built) || g.buildings.some((b) => !b.destroyed && !b.built)
-      || g.walls.some((w) => !w.built)) return false;
-  g.time = 0;
-  g.phase = 'prep';
-  g.phaseLeft = WAVE.prepFirst;
+  return !g.towers.some((t) => !t.built)
+    && !g.buildings.some((b) => !b.destroyed && !b.built)
+    && !g.walls.some((w) => !w.built);
+}
+
+function buildWall(g, a, b) {
+  g.player.x = a.x; g.player.y = a.y;
+  return tryBuildWall(g, a.id, b.id).ok;
+}
+
+/** D98: explicitly build the fan/ring after all anchor towers are finished. */
+function buildFortressWalls(g, keep, towers, extended) {
+  const spokes = [[keep, towers[0]], [keep, towers[1]], [keep, towers[2]]];
+  const spokeCount = spokes.filter(([a, b]) => a && b && buildWall(g, a, b)).length;
+  if (spokeCount < 2) return false;
+  const perimeter = [[towers[0], towers[1]], [towers[1], towers[2]]];
+  if (extended) {
+    perimeter.push([towers[2], towers[3]], [towers[3], towers[4]],
+      [towers[4], towers[5]], [towers[5], towers[0]]);
+  }
+  // Terrain or another segment can invalidate an individual perimeter edge;
+  // keep the valid explicit links instead of discarding the whole seed.
+  for (const [a, b] of perimeter) if (a && b) buildWall(g, a, b);
   return true;
 }
 
 function setup(seed, profile) {
   const g = createGame(seed, 'gunner');
   g.res = { stone: 1e5, gold: 1e5 };
+  g.phase = 'prep';
+  g.phaseLeft = 1e9;
   const keep = g.towers[0];
   let towers = [];
   if (profile.startsWith('fortress')) {
     towers = innerNetwork(g);
     if (!towers) return null;
     if (profile === 'fortress+') {
-      // Continue the automatic chain around the far side of the Keep.
+      // Continue the ring around the far side of the Keep.
       for (const degrees of [120, 180, 240]) {
         const a = (degrees * Math.PI) / 180;
-        const site = towerSiteNear(g, keep.x + Math.cos(a) * 8.5, keep.y + Math.sin(a) * 8.5, 2);
+        const site = towerSiteNear(g, keep.x + Math.cos(a) * 8.5, keep.y + Math.sin(a) * 8.5);
         if (!site) return null;
         const t = place(g, site.x, site.y, 'tower');
         if (!t) return null;
@@ -129,16 +142,23 @@ function setup(seed, profile) {
   } else {
     for (const angle of [0, Math.PI]) {
       const site = isolatedOutpost(g, angle);
-      if (!site || autoWallPlan(g, site.x, site.y).links.length) return null;
+      if (!site) return null;
       const t = place(g, site.x, site.y, 'tower');
       if (t) towers.push(t);
     }
   }
+  if (!finishConstruction(g)) return null;
+  if (profile.startsWith('fortress')
+      && !buildFortressWalls(g, keep, towers, profile === 'fortress+')) return null;
+  if (!finishConstruction(g)) return null;
   for (const type of ['farm', 'quarry']) {
     const site = nearestSite(g, type);
     if (site) place(g, site.x, site.y, type);
   }
-  if (!finishSetup(g)) return null;
+  if (!finishConstruction(g)) return null;
+  g.time = 0;
+  g.phase = 'prep';
+  g.phaseLeft = WAVE.prepFirst;
   g.res = { stone: 120, gold: 0 };
   // D91: man what the farm feeds, outer towers first, the Keep with the rest.
   for (const t of [...towers, keep]) while (garrisonState(g).free > 0 && assignGarrison(g, t, 1).ok);

@@ -16,6 +16,7 @@ import {
   resourceSitesState, keepState, buildingState, keepFieldState,
   enemyKeepField, flushKeepFieldRecomputes, endState, playerSpeed,
   foodSupport, garrisonState, assignGarrison, addNest, nestState, towerCanHitNest, towerMinRange,
+  assaultIn, startWaveEarly, setPaused,
 } from '../src/game.js';
 
 let passed = 0;
@@ -536,6 +537,94 @@ check('D83 pressure rises through budget, Heavies and structure damage, never sp
   update(g, 0.01);
   const heavy = g.enemies.find((e) => e.type === 'heavy');
   assert(heavy && heavy.structMult > 1.4 && heavy.speed === undefined && heavy.def.speed === 1.7, 'late Heavy not structurally scaled');
+});
+
+check('D97 expansion totals include the 15-second warning and assaults start automatically', () => {
+  const first = createGame('D97-FIRST', 'gunner', flatMap());
+  approx(assaultIn(first), 120, 1e-9, 'wave 1 does not begin at 120 seconds');
+  assert(first.spawnSides.length && first.pendingSpawns.length, 'wave 1 direction/spawns were not rolled at expansion start');
+  run(first, 105, 0.05);
+  assert(first.phase === 'warning' && Math.abs(assaultIn(first) - 15) < 0.06, 'warning did not begin at 15 seconds');
+  run(first, 15.1, 0.05);
+  assert(first.phase === 'combat', 'combat did not begin automatically at zero');
+
+  const later = gameOn();
+  later.phase = 'aftermath'; later.phaseLeft = WAVE.aftermath; later.wave = 1;
+  run(later, WAVE.aftermath + 0.05, 0.05);
+  assert(later.wave === 2 && later.phase === 'prep', 'aftermath did not advance to wave 2 expansion');
+  approx(assaultIn(later), 90, 0.06, 'later expansion is not 90 seconds total');
+  assert(later.spawnSides.length && later.pendingSpawns.length, 'later wave was not rolled at expansion start');
+  run(later, 75, 0.05);
+  assert(later.phase === 'warning' && Math.abs(assaultIn(later) - 15) < 0.06, 'later prep did not last 75 seconds');
+});
+
+check('D97 Start Next Wave readiness works and rejects invalid states', () => {
+  const prep = createGame('D97-EARLY-PREP', 'gunner', flatMap());
+  assert(startWaveEarly(prep).ok && prep.phase === 'warning' && assaultIn(prep) <= 4, 'early start failed in prep');
+  run(prep, 4.1, 0.05);
+  assert(prep.phase === 'combat', 'early prep start did not reach combat within 4 seconds');
+
+  const warning = createGame('D97-EARLY-WARN', 'gunner', flatMap());
+  warning.phase = 'warning'; warning.phaseLeft = 12;
+  assert(startWaveEarly(warning).ok && assaultIn(warning) === 4, 'early start failed in warning');
+  for (const phase of ['combat', 'aftermath']) {
+    const g = gameOn(); g.phase = phase;
+    assert(!startWaveEarly(g).ok, `early start accepted during ${phase}`);
+  }
+  const paused = gameOn(); setPaused(paused, true);
+  assert(!startWaveEarly(paused).ok, 'early start accepted while paused');
+  for (const status of ['won', 'lost']) {
+    const g = gameOn(); g.status = status;
+    assert(!startWaveEarly(g).ok, `early start accepted after ${status}`);
+  }
+});
+
+check('D97 expansion income accrues and pause freezes every phase clock and income', () => {
+  const g = createGame('D97-INCOME', 'gunner', flatMap());
+  g.buildings.push(
+    { id: 91, type: 'quarry', x: 20, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.5 },
+    { id: 92, type: 'mine', x: 22, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.2 },
+  );
+  const before = { ...g.res };
+  run(g, 2, 0.05);
+  assert(g.res.stone > before.stone && g.res.gold > before.gold, 'passive income stopped during expansion');
+  for (const [phase, left] of [['prep', 30], ['warning', 10], ['aftermath', 3]]) {
+    g.phase = phase; g.phaseLeft = left;
+    setPaused(g, true);
+    const frozen = { left: g.phaseLeft, stone: g.res.stone, gold: g.res.gold };
+    update(g, 5);
+    assert(g.phaseLeft === frozen.left && g.res.stone === frozen.stone && g.res.gold === frozen.gold,
+      `pause advanced ${phase} or passive income`);
+    setPaused(g, false);
+  }
+});
+
+check('D97 distant player does not delay the scheduled assault or Keep march', () => {
+  const g = createGame('D97-FAR', 'gunner', flatMap());
+  const keep = g.towers[0]; keep.shotCd = 1e9;
+  g.player.x = keep.x + 60; g.player.y = keep.y + 30;
+  run(g, 122, 0.05);
+  assert(g.phase === 'combat' && g.enemies.length, 'far player delayed scheduled spawning');
+  const enemy = g.enemies[0];
+  const before = Math.hypot(enemy.x - keep.x, enemy.y - keep.y);
+  run(g, 1, 0.05);
+  assert(Math.hypot(enemy.x - keep.x, enemy.y - keep.y) < before, 'wave enemy did not path toward the Keep');
+});
+
+check('D97 victory and defeat stop all later wave scheduling', () => {
+  const won = gameOn();
+  won.wave = WAVE.totalToSurvive; won.phase = 'aftermath'; won.phaseLeft = 0;
+  update(won, 0.01);
+  assert(won.status === 'won', 'final aftermath did not produce victory');
+  const wonState = [won.wave, won.phase, won.phaseLeft];
+  update(won, 300);
+  assert(JSON.stringify([won.wave, won.phase, won.phaseLeft]) === JSON.stringify(wonState), 'victory scheduled another wave');
+
+  const lost = gameOn(); lost.player.hp = -100; update(lost, 0.01);
+  assert(lost.status === 'lost', 'defeat precondition failed');
+  const lostState = [lost.wave, lost.phase, lost.phaseLeft];
+  update(lost, 300);
+  assert(JSON.stringify([lost.wave, lost.phase, lost.phaseLeft]) === JSON.stringify(lostState), 'defeat advanced wave scheduling');
 });
 
 check('flow-field obstacle layer remains optional and finite', () => {
