@@ -7,12 +7,20 @@ expanding and defending a fortress make the game more fun?
 > Start at the Keep. Walk into the wilderness. Claim Stone, Gold and farmland.
 > Raise Towers and join them with Walls. Get home before the assault arrives.
 
-Walk a 208x104-tile (416 x 208 m) procedural world, build farms, quarries and
-mines, place Towers and deliberately join them with Walls (never to the Keep).
-Stone builds, Gold upgrades weapons, Food feeds the soldiers you garrison.
-Towers cannot shoot at their own base, so they must cover each other.
-Wilderness Nests guard the best sites and must be besieged with Towers. Ten
-assaults march on the Keep; climb a Tower to watch them hit what you built.
+Walk a 208x104-tile (416 x 208 m) procedural world of hills, valleys and
+plains, build farms, quarries and mines, place Towers and deliberately join
+them with Walls (never to the Keep). Stone builds, Gold upgrades weapons. Your
+people work the Farms, Quarries and Mines or garrison the Towers - the same
+people, so every soldier is a worker not working; staffed Farms decide how many
+people the settlement can feed. Towers cannot shoot at their own base, so they
+must cover each other. Wilderness Nests guard the best sites and must be
+besieged with Towers. Ten assaults march on the Keep, unannounced: watch for
+dust on the roads, birds put up from the woods, a distant horn, a garrisoned
+Tower's bell. Weather comes and goes and changes how far you can see. You carry
+a sword and a slow crossbow - enough to help, never enough to replace a Tower.
+
+> You are not the army. You built the army. You live inside what you built.
+> Your weapon helps when the plan starts to fail.
 
 The previous top-down version is still playable at `classic.html`.
 
@@ -42,18 +50,22 @@ npm test                  # headless terrain, pathing, LOS and simulation checks
 | `Shift` | sprint (roads are faster still) |
 | `E` | climb onto / down from the Tower or Keep you face |
 | `1`–`5` | build Tower · Wall · Farm · Quarry · Gold Mine (again or `Q` to cancel) |
-| **click** | place the ghost / pick Wall Towers A then B · otherwise a weak swing |
+| **click** | use your weapon · in build mode: place the ghost / pick Wall Towers A then B |
+| `F` · wheel | switch Sword / Crossbow (strong bolt, ~2.4 s reload) |
 | **right-click** | step back (Wall corner, then build mode) |
 | `R` (hold) | repair what you look at, in reach — costs Stone |
-| `G` / `Shift+G` | assign / withdraw a soldier on the Tower you face |
+| `G` / `Shift+G` | put a free person to work (Farm · Quarry · Mine) or on the Tower you face / send one back |
 | `U` | weapon upgrade (beside the Tower; Stone + Gold) |
-| `T` | start the next assault early |
+| `T` | sound the horn: bring the next assault on now |
 | `Esc` / `P` | release the mouse and pause (menu, sound, debug) |
 
-Debug: `F2` fly/no-clip · `F3` coordinates · `F4` teleport to Keep · `M`
-resources · `N` next assault · `Y` spawn at crosshair · `K`/`J` damage/destroy
-the Tower you face · `H` path field · `L` pause spawning · `O` regenerate. The
-pause card also toggles Tower ranges, Nest territory and Wall nav blockers.
+Debug: `F2` fly/no-clip · `F3` coordinates, weather, population, jobs and the
+looked-at Tower's target · `F4` teleport to Keep · `F6` Tower LOS rays · `F7`
+next weather (`Shift+F7` instant) · `F8` assault timer + approach direction ·
+`M` resources · `N` next assault · `Y` spawn at crosshair · `K`/`J`
+damage/destroy the Tower you face · `H` path field · `L` pause spawning · `O`
+regenerate. The pause card also toggles Tower ranges, Nest territory and Wall
+nav blockers.
 
 Extra reports: `npm run economy-sim` (opening economy), `npm run wave-report`
 (ten-wave pressure against scripted fortresses), `npm run road-report` (road
@@ -71,8 +83,11 @@ Survive 10 waves. The run is lost if the Keep falls or you die.
 | `src/rng.js` | seeded PRNG, value noise, fbm |
 | `src/terrain.js` | multi-pass generation, the validation gate, line of sight |
 | `src/flowfield.js` | shared Dijkstra distance fields and steering |
-| `src/game.js` | the whole simulation, on the tile grid |
+| `src/game.js` | the whole simulation, on the tile grid (incl. population, crossbow, garrison watch) |
+| `src/weather.js` | seeded weather schedule and blended visibility (pure) |
 | `src/fp/space.js` | tile <-> world mapping, height field, raycasts, picking (pure, tested) |
+| `src/fp/sight.js` | height-aware Tower sight through the rendered terrain and trees (pure, tested) |
+| `src/fp/weather.js` · `weapon.js` | sky/fog/rain/dust presentation · first-person weapon models |
 | `src/fp/terrain3d.js` · `models.js` | static world meshes · primitive models |
 | `src/fp/entities3d.js` · `overlays.js` | sim -> mesh sync and effects · build/debug overlays |
 | `src/fp/hud.js` · `main.js` | DOM HUD and minimap · first-person bootstrap, input, frame loop |
@@ -94,9 +109,12 @@ tight passes, both edges connected to the centre, and an open-ground fraction
 inside a band. See `VALID` in `config.js`. Pure noise does not reliably produce
 chokepoints; generate-and-check does.
 
-**Elevation matters through sight, not through stats.** Cliffs block line of
-sight always. Forest blocks it unless the firing tower stands at least one
-elevation band above the trees. There is no "+20% hill damage" anywhere.
+**Elevation matters through sight, not through stats.** In first person a
+Tower's sight line runs from its muzzle (9 m up) to the target's upper body
+through the rendered height field and the rendered trees: hills and cliffs hide
+low targets, one tree is a gap you can see past, thick woods are not. The 2D
+classic keeps the tile LOS (cliffs always block; forest blocks unless the tower
+stands a band higher). There is no "+20% hill damage" anywhere.
 
 **One flow field per enemy type, shared, aimed at the Keep.** Walls and tower
 footprints are not impassable in it: each costs the distance the enemy could

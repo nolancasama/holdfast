@@ -3,8 +3,9 @@
 import {
   MAP, T, PLAYER, TOWER, OCCUPANCY, ARCHETYPES, ENEMIES, ENEMY,
   WAVE, START_RESOURCES, BUILDINGS, KEEP, WALL_PATH, DROP, ELEVATION_NAMES, AUDIO,
-  BUILD, VISION, STUCK, BREACH, WALL, GARRISON, NEST, WILD,
+  BUILD, VISION, STUCK, BREACH, WALL, GARRISON, NEST, WILD, SIGHT, POPULATION, WATCH,
 } from './config.js';
+import { createWeather, updateWeather, weatherParams } from './weather.js';
 import {
   generateMap, randomSeed, idx, inBounds, isPassable, moveCostAt,
   kindAt, elevAt, hasLineOfSight, hasClearWalk, isTerrainBuildable,
@@ -39,6 +40,7 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
       x: map.start.x + 0.5, y: map.start.y + 2.5,
       hp: PLAYER.maxHp, maxHp: PLAYER.maxHp,
       meleeCd: 0, hurtCd: 0, facing: { x: 0, y: 1 },
+      weapon: 'melee', boltCd: 0, lastSwingAt: -99, lastShotAt: -99,
     },
     effects: {}, equipment: [],
     towers: [], buildings: [], walls: [], enemies: [], drops: [],
@@ -51,7 +53,8 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     input: { mx: 0, my: 0, melee: false, repair: false },
     // D101: presentation-selected rules. The 2D classic keeps the defaults;
     // the first-person shell builds at the crosshair and treats towers as solid.
-    rules: { buildReach: BUILD.reach, solidTowers: false },
+    // D111: the classic announces assaults; first person leaves them to the world.
+    rules: { buildReach: BUILD.reach, solidTowers: false, announceAssaults: true },
     repairFocus: null,
     playerField: null, playerFieldAt: -99,
     blockerGrid: new Array(MAP.w * MAP.h).fill(null),
@@ -76,8 +79,10 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
       version: 0,
     },
     fogCache: { map, playerTile: null, towerSignature: null, towerTiles: new Map() },
-    // D91: Food deficit state. `since` is the time the deficit began.
-    supply: { since: null, nextStandDownAt: null },
+    // D110: the settlement's people. `shortageSince` is when Food Shortage began.
+    pop: { total: POPULATION.start, growthT: 0, shortageSince: null, nextLeaveAt: null },
+    weather: createWeather(seed),
+    watchT: 0,
     nests: [],
     wildFields: new Map(),
     warning5Cued: false,
@@ -443,7 +448,7 @@ function placeBuilding(g, x, y, type, check) {
     id: g.nextBuildingId++, type, x, y,
     hp: def.maxHp * (def.buildHpFraction ?? TOWER.buildHpFraction), maxHp: def.maxHp,
     built: false, progress: 0, destroyed: false,
-    rate: check.rate, siteId: check.site?.id ?? null,
+    rate: check.rate, siteId: check.site?.id ?? null, workers: 0,
     flash: 0, unseenHitAt: null,
   };
   g.buildings.push(b);
@@ -511,7 +516,9 @@ export function towerStats(g, t) {
 }
 
 // ---------------------------------------------------------------------------
-// Garrison (D91): Food support feeds soldiers; soldiers strengthen towers.
+// Population (D110): one pool of people works the economy or garrisons Towers.
+// Food support (Keep stores + staffed Farms) caps how many the settlement
+// sustains. Soldiers strengthen Towers (D91 multipliers).
 // ---------------------------------------------------------------------------
 
 export function garrisonSlots(t) {
@@ -519,16 +526,31 @@ export function garrisonSlots(t) {
   return t.wLevel >= GARRISON.upgradedFromLevel ? GARRISON.slots.towerUpgraded : GARRISON.slots.tower;
 }
 
-/** Soldiers a finished, standing farm feeds: richer soil feeds more. */
+export function workerSlots(b) {
+  return POPULATION.workerSlots[b?.type] || 0;
+}
+
+/** Share of full output a building produces: workers / slots (D110). */
+export function staffing(b) {
+  const slots = workerSlots(b);
+  return slots ? Math.min(1, (b.workers || 0) / slots) : 1;
+}
+
+/** Food support a staffed farm adds: richer soil feeds more. */
 export function farmSupport(b) {
   return Math.round(GARRISON.supportPerFarm * (b.rate || 0) / BUILDINGS.farm.baseRate);
 }
 
+/** What a building produces right now: Food support for a Farm, else per-second output. */
+export function buildingOutput(b) {
+  if (!b.built || b.destroyed) return 0;
+  if (b.type === 'farm') return (b.workers || 0) >= workerSlots(b) ? farmSupport(b) : 0;
+  return b.rate * staffing(b);
+}
+
 export function foodSupport(g) {
-  let support = g.arch.foodSupportBonus || 0;
-  for (const b of g.buildings) {
-    if (b.type === 'farm' && b.built && !b.destroyed) support += farmSupport(b);
-  }
+  let support = (keepTower(g) ? POPULATION.keepFoodSupport : 0) + (g.arch.foodSupportBonus || 0);
+  for (const b of g.buildings) if (b.type === 'farm') support += buildingOutput(b);
   return support;
 }
 
@@ -536,14 +558,31 @@ export function garrisonAssigned(g) {
   return g.towers.reduce((n, t) => n + (t.garrison || 0), 0);
 }
 
-export function garrisonState(g) {
+export function workersAssigned(g) {
+  return g.buildings.reduce((n, b) => n + (b.destroyed ? 0 : b.workers || 0), 0);
+}
+
+export function populationState(g) {
+  const total = g.pop.total;
   const support = foodSupport(g);
-  const assigned = garrisonAssigned(g);
-  const deficit = assigned > support;
-  const since = g.supply.since;
-  const graceLeft = deficit && since !== null ? Math.max(0, GARRISON.graceSeconds - (g.time - since)) : null;
-  return { support, assigned, free: Math.max(0, support - assigned), deficit, graceLeft,
-    standingDown: deficit && graceLeft === 0 };
+  const workers = workersAssigned(g);
+  const garrison = garrisonAssigned(g);
+  const shortage = g.pop.shortageSince !== null;
+  const graceLeft = shortage ? Math.max(0, POPULATION.shortageGrace - (g.time - g.pop.shortageSince)) : null;
+  return {
+    total, support, workers, garrison,
+    free: Math.max(0, total - workers - garrison),
+    shortage, graceLeft, leaving: shortage && graceLeft === 0,
+    growing: !shortage && total < support,
+    growthIn: !shortage && total < support ? Math.max(0, POPULATION.growthInterval - g.pop.growthT) : null,
+  };
+}
+
+/** Back-compatible garrison summary (D91 shape) over the D110 population. */
+export function garrisonState(g) {
+  const p = populationState(g);
+  return { support: p.support, assigned: p.garrison, free: p.free, deficit: p.shortage,
+    graceLeft: p.graceLeft, standingDown: p.leaving, population: p };
 }
 
 /** Instant assignment; remote is allowed (a command, not labour). */
@@ -555,7 +594,7 @@ export function assignGarrison(g, towerOrId, delta) {
   if (delta > 0) {
     if (!t.built) return { ok: false, reason: 'tower is still under construction' };
     if ((t.garrison || 0) >= garrisonSlots(t)) return { ok: false, reason: 'no free garrison slot' };
-    if (garrisonAssigned(g) >= foodSupport(g)) return { ok: false, reason: 'not enough Food support — build a Farm' };
+    if (populationState(g).free <= 0) return { ok: false, reason: 'no free people — withdraw workers from a building (Shift+G)' };
     t.garrison = (t.garrison || 0) + 1;
     emitAudioEvent(g, 'towerEntry', t);
     return { ok: true };
@@ -568,36 +607,91 @@ export function assignGarrison(g, towerOrId, delta) {
   return { ok: false, reason: 'no change' };
 }
 
-/** Outposts stand down first and the Keep last; ties go to the newest tower. */
+/** D110: put free people to work at a building, or send its workers back. */
+export function assignWorkers(g, buildingOrId, delta) {
+  if (g.paused) return { ok: false, reason: 'paused' };
+  const id = typeof buildingOrId === 'object' ? buildingOrId?.id : buildingOrId;
+  const b = g.buildings.find((o) => o.id === id);
+  if (!b || b.destroyed) return { ok: false, reason: 'no building' };
+  if (delta > 0) {
+    if ((b.workers || 0) >= workerSlots(b)) return { ok: false, reason: 'every job here is filled' };
+    if (populationState(g).free <= 0) return { ok: false, reason: 'no free people — withdraw a soldier or worker first' };
+    b.workers = (b.workers || 0) + 1;
+    return { ok: true };
+  }
+  if (delta < 0) {
+    if (!(b.workers > 0)) return { ok: false, reason: 'nobody works here' };
+    b.workers--;
+    return { ok: true };
+  }
+  return { ok: false, reason: 'no change' };
+}
+
+/**
+ * Free people take empty jobs: Farms first (Food lets the settlement grow),
+ * then Quarries, then Gold Mines. Garrison is always the player's call.
+ */
+function autoStaff(g, only = null) {
+  const order = { farm: 0, quarry: 1, mine: 2 };
+  const open = (only ? [only] : g.buildings)
+    .filter((b) => b.built && !b.destroyed && (b.workers || 0) < workerSlots(b))
+    .sort((a, b) => order[a.type] - order[b.type] || a.id - b.id);
+  for (const b of open) {
+    while ((b.workers || 0) < workerSlots(b) && populationState(g).free > 0) b.workers = (b.workers || 0) + 1;
+  }
+}
+
+/** Outposts lose soldiers first and the Keep last; ties go to the newest tower. */
 function standDownOrder(g, a, b) {
   const rank = (t) => (t.keep ? 2 : towerConnectivity(g, t) === 'outpost' ? 0 : 1);
   return rank(a) - rank(b) || b.id - a.id;
 }
 
-function updateGarrison(g) {
+/** One hungry person leaves: the idle first, then miners, quarrymen, farmers, soldiers. */
+function losePerson(g) {
+  const p = populationState(g);
+  if (p.free > 0) { g.pop.total--; return 'the settlement'; }
+  for (const type of ['mine', 'quarry', 'farm']) {
+    const b = g.buildings.filter((o) => o.type === type && !o.destroyed && o.workers > 0).sort((x, y) => y.id - x.id)[0];
+    if (b) { b.workers--; g.pop.total--; return `the ${BUILDINGS[type].name}`; }
+  }
+  const t = g.towers.filter((o) => o.garrison > 0).sort((a, b) => standDownOrder(g, a, b))[0];
+  if (t) { t.garrison--; g.pop.total--; floater(g, t.x, t.y - 1.3, 'DESERTED', '#ffb347'); return t.keep ? 'the Keep' : `tower #${t.id}`; }
+  return null;
+}
+
+function updatePopulation(g, dt) {
   const support = foodSupport(g);
-  let assigned = garrisonAssigned(g);
-  if (assigned <= support) {
-    if (g.supply.since !== null) say(g, 'Supply restored. The garrison is fed.');
-    g.supply.since = null;
-    g.supply.nextStandDownAt = null;
+  if (g.pop.total > support) {
+    // Food Shortage: growth stops at once; people leave only after a grace.
+    if (g.pop.shortageSince === null) {
+      g.pop.shortageSince = g.time;
+      g.pop.nextLeaveAt = g.time + POPULATION.shortageGrace;
+      g.pop.growthT = 0;
+      say(g, `Food Shortage: ${g.pop.total} people, Food for ${support}. Staff a Farm.`);
+      emitAudioEvent(g, 'supplyDeficit', keepTower(g) || g.player);
+    }
+    if (g.time >= g.pop.nextLeaveAt) {
+      const from = losePerson(g);
+      g.pop.nextLeaveAt = g.time + POPULATION.leaveInterval;
+      if (from) { g.stats.standDowns++; say(g, `Hungry, someone left ${from}.`); }
+    }
     return;
   }
-  if (g.supply.since === null) {
-    g.supply.since = g.time;
-    g.supply.nextStandDownAt = g.time + GARRISON.graceSeconds;
-    say(g, `SUPPLY DEFICIT: ${assigned} soldiers, Food for ${support}. ${GARRISON.graceSeconds}s before they stand down.`);
-    emitAudioEvent(g, 'supplyDeficit', keepTower(g) || g.player);
+  if (g.pop.shortageSince !== null) say(g, 'The Food Shortage is over.');
+  g.pop.shortageSince = null;
+  g.pop.nextLeaveAt = null;
+  if (g.pop.total < support) {
+    g.pop.growthT += dt;
+    if (g.pop.growthT >= POPULATION.growthInterval) {
+      g.pop.growthT = 0;
+      g.pop.total++;
+      say(g, 'A newcomer has arrived at the Keep.');
+      autoStaff(g);
+    }
+  } else {
+    g.pop.growthT = 0;
   }
-  if (g.time < g.supply.nextStandDownAt) return;
-  const t = g.towers.filter((o) => o.garrison > 0).sort((a, b) => standDownOrder(g, a, b))[0];
-  if (!t) return;
-  t.garrison--;
-  assigned--;
-  g.stats.standDowns++;
-  g.supply.nextStandDownAt = g.time + GARRISON.standDownInterval;
-  floater(g, t.x, t.y - 1.3, 'STOOD DOWN', '#ffb347');
-  say(g, `Unfed soldiers stood down at ${t.keep ? 'the Keep' : `tower #${t.id}`}.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +729,17 @@ export function towerCanHitNest(g, t, n) {
   if (!t.built || n.destroyed) return false;
   const d = dist(t, n);
   if (d < towerMinRange(g, t) || d - n.radius > towerStats(g, t).range) return false;
-  return isPointVisible(g, n.x, n.y) && hasLineOfSight(g.map, t.x, t.y, n.x, n.y);
+  return isPointVisible(g, n.x, n.y) && towerHasSight(g, t, n.x, n.y, n);
+}
+
+/**
+ * D109: can this Tower see that point? The first-person shell installs a
+ * height-aware trace (g.rules.towerSight, src/fp/sight.js); the classic keeps
+ * the tile LOS. Range and blind zone are checked by the callers.
+ */
+export function towerHasSight(g, t, x, y, target = null) {
+  const sight = g.rules?.towerSight;
+  return sight ? sight(g, t, x, y, target) : hasLineOfSight(g.map, t.x, t.y, x, y);
 }
 
 function agitateNest(g, n) {
@@ -1209,6 +1313,13 @@ function destroyTower(g, t) {
   g.towers = g.towers.filter((o) => o !== t);
   recomputeTowerConnectivity(g);
   g.stats.towersLost++;
+  // D110: a Tower's garrison falls with it - manpower is a wartime resource.
+  if (t.garrison > 0) {
+    g.pop.total = Math.max(0, g.pop.total - t.garrison);
+    g.stats.soldiersLost = (g.stats.soldiersLost || 0) + t.garrison;
+    say(g, `${t.garrison} soldier${t.garrison > 1 ? 's' : ''} lost with the Tower.`);
+    t.garrison = 0;
+  }
   if (g.selected === t.id) g.selected = null;
   for (const e of g.enemies) if (e.blockerTargetId === t.id) e.blockerTargetId = null;
 
@@ -1239,6 +1350,7 @@ function destroyBuilding(g, b) {
   b.hp = 0;
   b.progress = 0;
   b.destroyedAt = g.time;
+  b.workers = 0; // D110: workers flee home to the free pool
   if (g.selectedBuildingId === b.id) g.selectedBuildingId = null;
   for (const e of g.enemies) if (e.econTargetId === b.id) e.econTargetId = null;
   say(g, `${BUILDINGS[b.type].name} destroyed.`);
@@ -1425,6 +1537,10 @@ function updatePlayer(g, dt) {
   const p = g.player;
   p.meleeCd = Math.max(0, p.meleeCd - dt);
   p.hurtCd = Math.max(0, p.hurtCd - dt);
+  if (p.boltCd > 0) {
+    p.boltCd = Math.max(0, p.boltCd - dt);
+    if (p.boltCd === 0) emitAudioEvent(g, 'reloaded', p);
+  }
 
   const speed = playerSpeed(g);
 
@@ -1501,8 +1617,48 @@ function updatePlayer(g, dt) {
       hit = true;
     }
     burst(g, p.x + p.facing.x, p.y + p.facing.y, hit ? '#ffffff' : '#666c78', 6, 3);
+    p.lastSwingAt = g.time;
+    p.lastSwingHit = hit;
+    emitAudioEvent(g, 'swordSwing', p);
   }
 
+}
+
+// ---------------------------------------------------------------------------
+// D113: the player's crossbow. A strong single bolt and a long reload - it
+// helps when the plan starts to fail; it never replaces a Tower.
+// ---------------------------------------------------------------------------
+
+export function switchWeapon(g, weapon = null) {
+  const p = g.player;
+  p.weapon = weapon ?? (p.weapon === 'crossbow' ? 'melee' : 'crossbow');
+  return p.weapon;
+}
+
+/**
+ * Loose one bolt. The 3D shell resolves the aim against the scene and passes
+ * what it struck: { enemyId | nestId | ground, x, y, z (metres above ground),
+ * from3d }. The simulation owns reload, range and damage.
+ */
+export function fireCrossbow(g, aim = {}) {
+  const p = g.player;
+  if (g.paused || g.status !== 'playing') return { ok: false, reason: 'paused' };
+  if (p.weapon !== 'crossbow') return { ok: false, reason: 'crossbow not in hand' };
+  if (p.boltCd > 0) return { ok: false, reason: 'reloading' };
+  const c = PLAYER.crossbow;
+  p.boltCd = c.reload;
+  p.lastShotAt = g.time;
+  let hit = false;
+  const e = aim.enemyId != null ? g.enemies.find((o) => o.id === aim.enemyId) : null;
+  const n = aim.nestId != null ? g.nests.find((o) => o.id === aim.nestId && !o.destroyed) : null;
+  if (e && dist(p, e) <= c.range + e.def.radius) { damageEnemy(g, e, c.damage); hit = true; }
+  else if (n && dist(p, n) <= c.range + n.radius) { damageNest(g, n, c.damage); hit = true; }
+  const x1 = aim.x ?? p.x + p.facing.x * c.range;
+  const y1 = aim.y ?? p.y + p.facing.y * c.range;
+  g.tracers.push({ kind: 'bolt', x0: p.x, y0: p.y, x1, y1, z1: aim.z ?? 1, from3d: aim.from3d ?? null,
+    hit: hit || !!aim.ground, t: 0, life: 0.35, color: '#efe2bd' });
+  emitAudioEvent(g, 'crossbow', p);
+  return { ok: true, hit };
 }
 
 /**
@@ -1614,10 +1770,10 @@ function updateTowers(g, dt) {
       const e = g.enemies.find((o) => o.id === t.targetId);
       const targetDistance = e ? dist(e, t) : Infinity;
       if (e && targetDistance >= towerMinRange(g, t) && targetDistance <= s.range
-          && hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) {
+          && towerHasSight(g, t, e.x, e.y, e)) {
         t.shotCd = 1 / s.fireRate;
-        g.tracers.push({ x0: t.x, y0: t.y, x1: e.x, y1: e.y, t: 0,
-          life: 0.09, color: s.occupied ? '#ffe680' : '#cfd6e0' });
+        g.tracers.push({ x0: t.x, y0: t.y, x1: e.x, y1: e.y, t: 0, towerId: t.id,
+          z1: SIGHT.targetHeight[e.type], life: 0.09, color: s.occupied ? '#ffe680' : '#cfd6e0' });
         emitAudioEvent(g, 'towerFire', { ...t, occupied: s.occupied });
         damageEnemy(g, e, s.damage);
       } else {
@@ -1661,14 +1817,16 @@ function updateBuildings(g, dt) {
       if (b.progress >= 1) {
         b.built = true;
         b.hp = b.maxHp;
-        say(g, `${def.name} producing.`);
         emitAudioEvent(g, 'constructionComplete', b);
+        // D110: free people take the new jobs; production needs them.
+        autoStaff(g, b);
+        say(g, b.workers ? `${def.name} staffed (${b.workers}/${workerSlots(b)}).` : `${def.name} built - no free people to work it.`);
       }
       continue;
     }
     const key = def.resource;
     if (key === 'food') continue; // D91: Food is support (foodSupport), never a stockpile
-    const gained = b.rate * dt;
+    const gained = buildingOutput(b) * dt;
     g.res[key] += gained;
     g.stats.resourcesEarned[key] += gained;
   }
@@ -1683,7 +1841,7 @@ function acquireTarget(g, t, range) {
     if (d < towerMinRange(g, t) || d > range) continue;
     const key = (e.blockerTargetId === t.id ? 0 : 1000) + d;
     if (key >= bestKey) continue;
-    if (!hasLineOfSight(g.map, t.x, t.y, e.x, e.y)) continue;
+    if (!towerHasSight(g, t, e.x, e.y, e)) continue;
     bestKey = key;
     best = e;
   }
@@ -2412,11 +2570,53 @@ function beginWaveWarning(g, seconds = WAVE.warning) {
   g.phase = 'warning';
   g.phaseLeft = Math.min(WAVE.warning, Math.max(0, seconds));
   g.warning5Cued = false;
+  if (!g.rules.announceAssaults) {
+    // D111: no message. Somewhere out on the incoming road a horn may sound.
+    if (Math.random() < WATCH.hornChance) emitAudioEvent(g, 'distantHorn', approachMouth(g));
+    return;
+  }
   const where = g.spawnSides.length
     ? g.spawnSides.map((s) => s.toUpperCase()).join(' and ')
     : 'UNKNOWN';
   say(g, `Wave ${g.wave} incoming from the ${where}.`);
   emitAudioEvent(g, 'waveWarning', g.player);
+}
+
+/** A road mouth the coming assault will use (for physical cues only). */
+export function approachMouth(g) {
+  const mouths = (g.spawnSides || []).flatMap((side) => g.map.spawns?.[side] || []);
+  const m = mouths[Math.floor(Math.random() * mouths.length)];
+  return m ? { x: m.x + 0.5, y: m.y + 0.5 } : { x: g.player.x, y: g.player.y };
+}
+
+/**
+ * D111 garrison watch: soldiers on a Tower that sees the main army ring the
+ * bell. No text and no countdown - only "that Tower sees danger". Weather
+ * shortens how far the lookouts see; terrain and trees block them as they
+ * block Tower fire.
+ */
+function updateWatch(g, dt) {
+  for (const t of g.towers) {
+    if (t.alarmUntil > g.time && g.time >= (t.nextBellAt ?? 0)) {
+      t.nextBellAt = g.time + 1.8;
+      emitAudioEvent(g, 'towerBell', t);
+    }
+  }
+  g.watchT -= dt;
+  if (g.watchT > 0) return;
+  g.watchT = WATCH.checkInterval;
+  if (g.phase !== 'combat') return;
+  const army = g.enemies.filter((e) => !e.wild && !e.fadeAt);
+  if (!army.length) return;
+  const range = WATCH.spotRange * weatherParams(g).visibility;
+  for (const t of g.towers) {
+    if (!t.built || !(t.garrison > 0) || t.watchWave === g.wave) continue;
+    const seen = army.some((e) => dist(e, t) <= range && towerHasSight(g, t, e.x, e.y, e));
+    if (!seen) continue;
+    t.watchWave = g.wave;
+    t.alarmUntil = g.time + WATCH.alarmSeconds;
+    t.nextBellAt = g.time;
+  }
 }
 
 /** Player-facing early start; unlike forceNextWave, this preserves readiness. */
@@ -2443,13 +2643,14 @@ function updateWaves(g, dt) {
   if (g.phase === 'warning') {
     if (g.phaseLeft <= 5 && !g.warning5Cued) {
       g.warning5Cued = true;
-      emitAudioEvent(g, 'waveWarning', g.player);
+      if (g.rules.announceAssaults) emitAudioEvent(g, 'waveWarning', g.player);
     }
     if (g.phaseLeft <= 0) {
       g.phase = 'combat';
       g.phaseLeft = 0;
       g.combatT = 0;
-      emitAudioEvent(g, g.wave >= WAVE.totalToSurvive ? 'finalWave' : 'waveStart', g.player);
+      if (g.rules.announceAssaults) emitAudioEvent(g, g.wave >= WAVE.totalToSurvive ? 'finalWave' : 'waveStart', g.player);
+      else emitAudioEvent(g, 'distantRoar', approachMouth(g));
     }
     return;
   }
@@ -2467,7 +2668,7 @@ function updateWaves(g, dt) {
       g.phase = 'aftermath';
       g.phaseLeft = WAVE.aftermath;
       g.stats.wavesCleared++;
-      say(g, `Wave ${g.wave} cleared.`);
+      say(g, g.rules.announceAssaults ? `Wave ${g.wave} cleared.` : 'The assault is broken. For now.');
     }
     return;
   }
@@ -2535,7 +2736,7 @@ export function resourceState(g) {
   const rates = { stone: 0, gold: 0 };
   for (const b of g.buildings) {
     if (b.destroyed || !b.built || BUILDINGS[b.type].resource === 'food') continue;
-    rates[BUILDINGS[b.type].resource] += b.rate;
+    rates[BUILDINGS[b.type].resource] += buildingOutput(b);
   }
   return { totals: { ...g.res }, rates, food: garrisonState(g) };
 }
@@ -2544,6 +2745,7 @@ export function buildingState(g) {
   return g.buildings.map((b) => ({
     id: b.id, type: b.type, x: b.x, y: b.y, hp: b.hp, maxHp: b.maxHp,
     built: b.built, progress: b.progress, destroyed: b.destroyed, rate: b.rate, siteId: b.siteId,
+    workers: b.workers || 0, slots: workerSlots(b), output: buildingOutput(b),
   }));
 }
 
@@ -2679,9 +2881,11 @@ export function update(g, dt, { ignorePause = false } = {}) {
   updateWaves(g, dt);
   updatePlayer(g, dt);
   updateRepair(g, dt);
+  updateWeather(g, dt);
   updateTowers(g, dt);
+  updateWatch(g, dt);
   updateBuildings(g, dt);
-  updateGarrison(g);
+  updatePopulation(g, dt);
   updateWalls(g, dt);
   updateKeepFieldRecomputes(g);
   recomputeVisibility(g);

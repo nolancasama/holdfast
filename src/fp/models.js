@@ -18,7 +18,9 @@ export const MAT = {
   banner: new THREE.MeshLambertMaterial({ color: '#e0a92e', side: THREE.DoubleSide, emissive: '#5a3d05' }),
   bannerConnected: new THREE.MeshLambertMaterial({ color: '#5aa9ff', side: THREE.DoubleSide, emissive: '#0d2c55' }),
   bannerOutpost: new THREE.MeshLambertMaterial({ color: '#f2a03b', side: THREE.DoubleSide, emissive: '#4d2a05' }),
+  bannerAlarm: new THREE.MeshLambertMaterial({ color: '#ff3b2a', side: THREE.DoubleSide, emissive: '#6a0a04' }),
   soldier: new THREE.MeshLambertMaterial({ color: '#3d5f9e' }),
+  peasant: new THREE.MeshLambertMaterial({ color: '#8a6a44' }),
   crop: new THREE.MeshLambertMaterial({ color: '#8fb547', flatShading: true }),
   cropRipe: new THREE.MeshLambertMaterial({ color: '#d4b54a', flatShading: true }),
   soil: new THREE.MeshLambertMaterial({ color: '#6b4f33' }),
@@ -159,9 +161,11 @@ export function makeKeep() {
   gun.position.y = 0.6;
   gun.scale.setScalar(1.25);
   top.add(gun);
-  // Banner on a thin pole at the parapet edge; the cloth flies above eye height.
-  top.add(mesh(new THREE.CylinderGeometry(0.08, 0.08, 7, 5), MAT.wood, 0, 4.1, r * 1.0, false));
-  const flag = mesh(new THREE.PlaneGeometry(3.2, 1.8, 6, 1), MAT.banner, 1.6, 6.6, r * 1.0, false);
+  // Banner on a thin pole at the roof's centre: the player always looks out
+  // from a parapet (D103 lean), so the pole stays behind them and the cloth
+  // flies above eye height.
+  top.add(mesh(new THREE.CylinderGeometry(0.08, 0.08, 7, 5), MAT.wood, 0, 4.1, 0, false));
+  const flag = mesh(new THREE.PlaneGeometry(3.2, 1.8, 6, 1), MAT.banner, 1.6, 6.6, 0, false);
   top.add(flag);
   g.add(top);
   g.userData = { body, top, gun, flag, shaftMat: mat, height: h + 0.6, radius: r, soldiers: [] };
@@ -352,6 +356,28 @@ export function makeEnemy(type) {
   }
   g.add(body);
   g.userData = { body, mat, type, radius: r };
+  return g;
+}
+
+/**
+ * D110: a cosmetic worker. `arm` holds the tool and swings; production never
+ * depends on these figures.
+ */
+export function makeWorker(tool = 'hoe') {
+  const g = new THREE.Group();
+  const body = new THREE.Group();
+  body.add(mesh(new THREE.CylinderGeometry(0.2, 0.25, 0.95, 6), MAT.peasant, 0, 0.75, 0, false));
+  body.add(mesh(new THREE.SphereGeometry(0.17, 6, 5), MAT.stone, 0, 1.36, 0, false));
+  body.add(mesh(new THREE.ConeGeometry(0.26, 0.16, 7), MAT.wood, 0, 1.5, 0, false)); // hat
+  const arm = new THREE.Group();
+  arm.position.set(0.2, 1.05, 0);
+  arm.add(mesh(new THREE.BoxGeometry(0.05, 1.0, 0.05), MAT.wood, 0, -0.1, -0.35, false));
+  arm.children[0].rotation.x = Math.PI / 2.6;
+  const head = tool === 'pick' ? new THREE.BoxGeometry(0.4, 0.06, 0.06) : tool === 'hammer' ? new THREE.BoxGeometry(0.16, 0.12, 0.12) : new THREE.BoxGeometry(0.22, 0.04, 0.1);
+  arm.add(mesh(head, MAT.metal, 0, 0.15, -0.72, false));
+  body.add(arm);
+  g.add(body);
+  g.userData = { body, arm };
   return g;
 }
 

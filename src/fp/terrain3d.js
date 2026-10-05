@@ -5,6 +5,7 @@
 import * as THREE from 'three';
 import { MAP, T, WORLD3D } from '../config.js';
 import { heightAt, hash2 } from './space.js';
+import { treeAt } from './sight.js';
 
 const S = WORLD3D.tileMeters;
 
@@ -200,19 +201,16 @@ function buildForest(map, field) {
   const crownColors = [];
   for (let ty = 0; ty < MAP.h; ty++) {
     for (let tx = 0; tx < MAP.w; tx++) {
-      if (map.kind[ty * MAP.w + tx] !== T.FOREST) continue;
-      // About half the forest tiles carry one tree; crowns start well above
-      // eye height so the player can see between trunks.
-      if (hash2(tx, ty, 11) > 0.5) continue;
-      const x = tx + 0.25 + hash2(tx, ty, 12) * 0.5;
-      const y = ty + 0.25 + hash2(tx, ty, 13) * 0.5;
+      // D109: sight.js owns placement so Tower sight sees exactly these trees.
+      // Crowns start well above eye height so the player can see between trunks.
+      const tree = treeAt(map, tx, ty);
+      if (!tree) continue;
+      const { x, y, height, crownBase } = tree;
       const h = heightAt(field, x, y);
-      const height = 7 + hash2(tx, ty, 14) * 4;
       const wx = x * S;
       const wz = y * S;
       trunks.push(matrix(wx, h + height * 0.25, wz, 1, height * 0.5, 1));
-      const r = 0.8 + hash2(tx, ty, 15) * 0.45;
-      const crownBase = Math.max(2.8, height * 0.36);
+      const r = tree.crownRadius;
       const crownH = height - crownBase;
       crowns.push(matrix(wx, h + crownBase + crownH / 2, wz, r, crownH, r, hash2(tx, ty, 16) * 6));
       crownColors.push(new THREE.Color().setHSL(0.27 + hash2(tx, ty, 17) * 0.07, 0.45, 0.2 + hash2(tx, ty, 18) * 0.1));

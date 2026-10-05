@@ -1790,3 +1790,160 @@ uses default `g.rules`, so its behaviour is unchanged.
 "the same game, harder to control". An A/B on the same seed is the most direct
 way to judge it.
 **Rejected:** deleting the 2D renderer now.
+
+## 2026-10-06 — First-person hand-play pass (D108-D114)
+
+Brief: make Tower combat reliable and legible in 3D, give the player limited
+weapons, clear the Keep roof, remove explicit assault announcements, make
+topography meaningful, add population/workers and occasional weather - while
+keeping Holdfast a strategy game. No persistent fog/mist mechanics.
+
+### D108 — The Keep roof is an observation platform
+**Decision:** the Keep's four tall corner turrets and conical spires are gone.
+The body keeps short buttresses (below the roof walk), the low crenellated
+parapet and the central turret; the banner pole moved to the roof centre, which
+is always behind a player leaning on a parapet (D103), and the cloth flies
+above eye height.
+**Why:** the spires sat directly in front of the eye from the roof; the roof is
+the best early observation point and has to see roads, hills and dust in every
+direction.
+**Rejected:** shortening the spires (still a frame around every view); moving
+the banner to the parapet (it blocked the southern view).
+
+### D109 — Tower sight follows the 3D scene; shots are legible
+**Investigation (before changing anything):** a scripted check showed the
+simulation *does* acquire, fire, emit tracers and deal damage in the basic case
+(enemy 3-7 tiles away on clear ground). "Towers don't fire" in hand-play came
+from three conversions, not a broken loop:
+1. **Scale.** The firing annulus is 2.8-7.5 tiles = **5.6-15 m**. From a 9 m
+   Tower an enemy 20-30 m away looks well within reach but is out of range;
+   attackers at the base are inside the blind zone (by design, D93).
+2. **2D Forest LOS.** ~20% of annulus sight lines on real maps were blocked,
+   mostly by forest tiles treated as solid walls unless the shooter stood a
+   whole band higher - while only half the forest tiles even carry a rendered
+   tree, and a 9 m muzzle sees over most crowns near the target.
+3. **Presentation.** A 1-pixel line, a 0.08 s flash and a weak cue were easy to
+   miss at 20-30 m.
+**Decision:** a height-aware sight model (`src/fp/sight.js`) installed by the 3D
+shell as `g.rules.towerSight`: a line from the turret muzzle (Tower 9.55 m,
+Keep ~16.3 m) to the target's upper body (Swarm 0.8 m ... Heavy 1.9 m), traced
+through the rendered height field (hills and cliffs block low targets) and the
+rendered trees (`treeAt` is shared with `terrain3d.js`, so sight and scene
+cannot disagree). A line may pass one crown - a gap you can see past - but two
+crowns block (`SIGHT.canopyHitsToBlock`). Tower acquisition, the firing check
+and nest targeting all go through `towerHasSight`; the classic keeps tile LOS.
+Pathfinding stays 2D. Presentation: a solid additive streak several metres long
+plus the glowing bolt, a muzzle flash 2x larger and longer with a breath of
+smoke, an impact flash and brighter sparks, turret recoil, and a slightly
+stronger fire cue. The perched Tower's firing annulus is now shown, as the
+looked-at Tower's already was. Debug `F6` draws each nearby Tower's sight lines
+(green = current target, red = blocked, ending where it is blocked).
+**Not changed:** range, blind zone, damage and fire rate, as the brief required.
+**Open question for hand-play:** 15 m is short for what a 9 m Tower "looks
+like" it covers. If firing still reads as too rare once LOS and visuals are
+fixed, the next lever is `TOWER.weapon.range` - a balance change (coverage area
+grows with the square), so it is left to a deliberate playtest decision.
+**Rejected:** removing LOS for Towers (blind spots and terrain would stop
+mattering); exact per-pixel raycasts against tree meshes (expensive and no more
+readable); buffing damage/range as a workaround.
+
+### D110 — Population: workers and garrison are the same people
+**Decision:** the Keep founds the settlement with 8 people and Keep stores that
+feed 8. Every person is a Farm worker (1 slot), Quarry worker (2), Gold Mine
+worker (2), a Tower/Keep soldier, or free. Production follows staffing: a Farm
+adds its Food support only when staffed; Quarry/Mine output is workers/slots of
+full (0 / 50% / 100%). Garrison draws from free people, not from Food - Food
+support now caps *population*. While Food support exceeds population a
+newcomer arrives every 40 s; growth stops at support. If population exceeds
+support, Food Shortage: growth stops at once, nobody leaves for 45 s, then one
+person leaves every 20 s (idle first, then miners, quarrymen, farmers, soldiers
+last) until fed. A destroyed Tower loses its garrison; a destroyed building's
+workers return to the free pool. Assignment is instant and abstract: `G` /
+`Shift+G` on a building or Tower. Cosmetic workers stand and swing tools at
+staffed buildings; production never depends on them.
+**Added beyond the brief - auto-staffing:** a finished building and every
+newcomer fill empty jobs from free people (Farms first, then Quarries, then
+Mines). Garrison is always manual. This answers "Failure B" (tedious clicking)
+before it happens: the economy staffs itself, and the player's decisions are
+the interesting ones - pulling miners onto the western Towers when dust rises,
+sending them back afterwards.
+**Why:** the brief's core tension - economy versus defence - needs one pool of
+people; Food gains an intuitive purpose (how many people you can have).
+**Rejected:** walking workers, hauling, housing (out of scope); soldiers
+surviving a collapse (manpower would not be a wartime resource); a separate
+garrison pool (no tradeoff); instant starvation (punishing and unreadable).
+
+### D111 — Assaults arrive unannounced; the world carries the warning
+**Decision:** in first person (`g.rules.announceAssaults = false`) there is no
+assault plaque, countdown, "ENEMY MOVEMENT DETECTED", direction, attacker count
+or assault-direction compass marker, and the omniscient minimap approach arrows
+and off-sight enemy dots are gone. The schedule, wave number, timers (120 s /
+90 s, unchanged), spawns and scaling are untouched. The world speaks instead:
+dust rises at the road mouths ~35 s before the assault and thickens; dust hangs
+over marching columns; birds burst from woods near the mouth and along the
+march; a distant horn may sound from the incoming road (75%, positional, faint
+at range); a distant roar when the assault begins; Tower fire is heard.
+**Garrison bell:** a garrisoned Tower whose lookouts see the main army (height-
+aware sight, 46 tiles on a clear day, scaled by weather) rings a bell and
+streams a red pennant for a few seconds - once per assault per Tower. No text,
+no countdown: "that Tower sees danger". Garrison now buys intelligence as well
+as firepower.
+**Debug only:** `F8` shows the old plaque, the compass threat marker, the
+approach arrows and all enemies on the minimap; `F3` shows the exact timer.
+The classic keeps its announcements. Structure-under-attack alerts stay: they
+report your own buildings, not omniscient approach information.
+**Rejected:** restoring a vague "assault soon" text (still a HUD oracle); making
+every cue reliable and equally visible from everywhere (observation would not
+matter).
+
+### D112 — Occasional weather changes what you can see
+**Decision:** a seeded schedule (`src/weather.js`): long clear spells
+(first 150-260 s, then 240-420 s), then rain (55%), dust (25%) or storm (20%)
+for about a minute or two, blended over 10 s. Weather sets a visibility factor
+that shortens the atmospheric fog distance and the garrison lookouts' range,
+darkens the light, tints the sky (grey rain, slate storm, ochre dust), and adds
+rain streaks, drifting dust motes, storm flashes with thunder, and rain/wind
+beds. Rain damps the assault's dust. Elevation keeps an advantage: the higher
+the eye stands above the plain, the more of the lost distance it recovers (up
+to 55%). Towers still fire on anything they legitimately see - no accuracy or
+damage penalties. Fog distance never drops below 80 m so nearby navigation
+stays comfortable. Weather is never announced; `F3` shows it for debugging,
+`F7` cycles it.
+**Rejected:** mist/fog weather and persistent fog territory (out of scope);
+"rain = -20% damage" style modifiers; volumetric effects; day/night.
+
+### D113 — The player's sword and crossbow
+**Decision:** two weapons. The sword is the existing melee (18 damage, 0.9 s,
+short arc) with a visible blade, a swing and a swish. The crossbow fires one
+bolt down the crosshair - 30 damage, 2.4 s reload, 45 tiles - resolved against
+the 3D scene (first enemy, nest or structure along the ray, terrain stops it)
+and applied by the simulation. A wave-1 Swarm dies to one bolt; a Runner takes
+two; a Heavy (270+) takes nine or more, ~20 s of perfect shooting. Sustained
+12.5 dps is below one unupgraded Tower, and the Runners still hunt the player
+(D31), so a lone crossbow cannot hold a main assault. Unlimited bolts (option A
+of the brief). Controls: left click uses the weapon outside build mode and
+confirms placement inside it; `F` or the mouse wheel switches; a corner panel
+names the weapon and shows the reload bar. Placeholder view models render as a
+second pass (no clipping into walls): the crossbow kicks, its string goes slack
+and the bolt is missing while reloading.
+**Modified from the brief:** the switch key is `F`, not `1` - `1`-`5` are the
+build keys.
+**Rejected:** automatic weapons, ammo economy, multiple ammo types, loot,
+inventory.
+
+### D114 — Broad landforms and hills you can see
+**Decision:** elevation noise is low-frequency and three-octave (was five) with
+slightly more contrast, so the map forms broad hills, valleys and low plains
+instead of noisy bumps (band changes per map row fell ~27%). The noise draws
+from the RNG exactly as before, so barriers, rivers and roads keep their kind;
+roads already charge for band crossings, so they follow valleys and broad
+slopes without new geometry. The continuous landform is kept on the map
+(`map.relief`) and the 3D height field crowns High ground into hills up to 8 m
+above its band and lets Normal ground swell 1.5 m towards them; bands are now
+3 m apart (was 2.2). The relief is blurred harder than the bands so a river or
+clearing cut into a hill leaves a slope, not a wall; the cliff rim lift dropped
+slightly so a rim on a hill flank stays walkable. Hills matter through sight
+(D109): a Tower on a crown sees over low ground and trees; nothing grants a
+damage, rate or range bonus.
+**Rejected:** random bumps; switchbacks or hairpins for roads; magic
+high-ground stats.

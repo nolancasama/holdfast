@@ -3,9 +3,9 @@
 
 import { MAP, WAVE, WALL, WORLD3D, TOWER, PLAYER } from '../config.js';
 import {
-  assaultIn, garrisonState, resourceState, towerCost, towerStats, towerMinRange, garrisonSlots,
+  assaultIn, garrisonState, populationState, resourceState, towerCost, towerStats, towerMinRange, garrisonSlots,
   farmSupport, upgradeCost, upgradeState, towerConnectivity, repairCostPerHp, towerAlarmState,
-  isTileExplored, isTileVisible, canPlaceAt,
+  isTileExplored, isTileVisible, canPlaceAt, workerSlots, buildingOutput,
 } from '../game.js';
 import { headingDegrees } from './space.js';
 
@@ -50,7 +50,7 @@ function placeMarker(el, heading, target, width, label) {
   setText(el, `${Math.abs(delta) * PX_PER_DEG > half ? (delta < 0 ? '◀ ' : '') : '▲ '}${label}${Math.abs(delta) * PX_PER_DEG > half && delta > 0 ? ' ▶' : ''}`);
 }
 
-function updateCompass(g) {
+function updateCompass(g, intel) {
   const heading = headingDegrees(g.player.facing.x, g.player.facing.y);
   const width = $('compass').clientWidth;
   $('compass-tape').style.transform = `translateX(${-heading * PX_PER_DEG}px)`;
@@ -61,7 +61,8 @@ function updateCompass(g) {
   if (!keepEl.hidden) placeMarker(keepEl, heading, headingDegrees(keep.x - g.player.x, keep.y - g.player.y), width, `KEEP ${Math.round(dKeep * S)}m`);
   const threat = $('compass-threat');
   const sides = g.spawnSides || [];
-  threat.hidden = !sides.length || g.phase === 'aftermath';
+  // D111: no omniscient assault direction in normal play - debug intel only.
+  threat.hidden = !intel || !sides.length || g.phase === 'aftermath';
   if (!threat.hidden) {
     // Point at the nearest known mouth on the incoming side.
     const mouths = sides.flatMap((s) => g.map.spawns?.[s] || []);
@@ -76,8 +77,12 @@ function updateCompass(g) {
 }
 
 // --- assault plaque -----------------------------------------------------------
-function updatePhase(g) {
+function updatePhase(g, intel) {
   const el = $('phase');
+  // D111: the assault schedule is internal. Its timer, direction and size are
+  // debug intel; in normal play the player reads the world instead.
+  el.hidden = !intel;
+  if (!intel) return;
   const left = assaultIn(g);
   const sides = (g.spawnSides || []).map((s) => s.toUpperCase()).join(' + ') || 'UNKNOWN';
   let head = 'NEXT ASSAULT';
@@ -103,10 +108,10 @@ function updatePhase(g) {
     time = '';
     sub = 'Repair and expand.';
   }
-  el.className = `hud ${cls}`;
+  el.className = `hud ${cls} debug-intel`;
   setText($('phase-head'), head);
   setText($('phase-time'), time);
-  setText($('phase-sub'), sub);
+  setText($('phase-sub'), `${sub} · DEBUG`);
   $('start-early').hidden = g.paused || (g.phase !== 'prep' && g.phase !== 'warning');
 }
 
@@ -117,10 +122,12 @@ function updateResources(g) {
   setText($('r-gold'), String(Math.floor(g.res.gold || 0)));
   setText($('r-stone-rate'), rates.stone ? `+${fmt(rates.stone, 2)}/s` : '');
   setText($('r-gold-rate'), rates.gold ? `+${fmt(rates.gold, 2)}/s` : '');
-  const food = garrisonState(g);
-  setText($('r-food'), `${food.assigned}/${food.support}`);
-  setText($('r-food-note'), food.deficit ? 'DEFICIT' : food.free > 0 ? `${food.free} free` : '');
-  $('r-food-note').style.color = food.deficit ? 'var(--red)' : '';
+  // D110: Population n / Food support, then where the people are.
+  const pop = populationState(g);
+  setText($('r-pop'), `${pop.total} / ${pop.support}`);
+  setText($('r-pop-note'), pop.shortage ? 'FOOD SHORTAGE' : pop.growing ? 'growing' : '');
+  $('r-pop-note').style.color = pop.shortage ? 'var(--red)' : '';
+  setHtml($('r-roles'), `Workers <b>${pop.workers}</b> · Garrison <b>${pop.garrison}</b> · Free <b class="${pop.free ? 'free' : ''}">${pop.free}</b>`);
   const hp = Math.max(0, g.player.hp);
   setText($('r-hp'), String(Math.round(hp)));
   const frac = hp / g.player.maxHp;
@@ -144,8 +151,8 @@ function updateAlerts(g) {
     alerts.push(`<div class="alert">${target.toUpperCase()} UNDER ATTACK${where ? ` · ${where}` : ''}</div>`);
     if (alerts.length >= 2) break;
   }
-  const food = garrisonState(g);
-  if (food.deficit) alerts.push(`<div class="alert">SUPPLY DEFICIT · ${food.standingDown ? 'SOLDIERS STANDING DOWN' : `${Math.ceil(food.graceLeft ?? 0)}s`}</div>`);
+  const pop = populationState(g);
+  if (pop.shortage) alerts.push(`<div class="alert">FOOD SHORTAGE · ${pop.leaving ? 'PEOPLE ARE LEAVING' : 'staff or build a Farm'}</div>`);
   if (g.wallNotice?.until > g.time) alerts.push(`<div class="alert info">${g.wallNotice.text}</div>`);
   setHtml($('alerts'), alerts.join(''));
 
@@ -205,7 +212,7 @@ function updatePrompt(g, look, ui) {
     if (tower.hp < tower.maxHp - 0.5 && ui.repairable) keys.push('<kbd>R</kbd> repair');
     if (near && tower.built) {
       const food = garrisonState(g);
-      if ((tower.garrison || 0) < garrisonSlots(tower) && food.free > 0) keys.push('<kbd>G</kbd> garrison');
+      if ((tower.garrison || 0) < garrisonSlots(tower)) keys.push(food.free > 0 ? '<kbd>G</kbd> garrison' : '<span class="warn">no free people</span>');
       if (tower.garrison > 0) keys.push('<kbd>⇧G</kbd> withdraw');
       const up = upgradeCost(tower);
       if (up && !tower.upgrade) keys.push(`<kbd>U</kbd> upgrade (${costText(up)})`);
@@ -224,9 +231,26 @@ function updatePrompt(g, look, ui) {
   } else if (t.kind === 'building') {
     const b = ref;
     title = LABEL[b.type].toUpperCase();
-    const out = b.type === 'farm' ? `feeds ${farmSupport(b)} soldiers` : `${fmt(b.rate, 2)} ${b.type === 'quarry' ? 'Stone' : 'Gold'}/s`;
-    body = !b.built ? `under construction ${Math.round((b.progress || 0) * 100)}%` : `${out} · HP ${Math.round(b.hp)}/${b.maxHp}`;
+    // D110: cause and effect - workers in, output out.
+    const slots = workerSlots(b);
+    const out = buildingOutput(b);
+    const outText = b.type === 'farm' ? `Food support +${out}` : `${b.type === 'quarry' ? 'Stone' : 'Gold'} +${fmt(out, 2)}/s`;
+    const idle = b.built && !(b.workers > 0) ? ' <span class="warn">· idle: needs workers</span>' : '';
+    body = !b.built ? `under construction ${Math.round((b.progress || 0) * 100)}% · Workers ${b.workers || 0} / ${slots}`
+      : `Workers ${b.workers || 0} / ${slots} · ${outText}${idle}`;
+    if (near) {
+      if ((b.workers || 0) < slots) keys.push(populationState(g).free > 0 ? '<kbd>G</kbd> assign' : '<span class="warn">no free people</span>');
+      if (b.workers > 0) keys.push('<kbd>⇧G</kbd> remove');
+    }
     if (b.hp < b.maxHp - 0.5 && ui.repairable) keys.push('<kbd>R</kbd> repair');
+    if (near && b.built) {
+      rows = [
+        ['Workers', `${b.workers || 0} / ${slots}`],
+        [b.type === 'farm' ? 'Food support' : b.type === 'quarry' ? 'Stone' : 'Gold',
+          b.type === 'farm' ? `+${out} (full: ${farmSupport(b)})` : `+${fmt(out, 2)}/s (full: ${fmt(b.rate, 2)})`],
+        ['HP', `${Math.round(b.hp)} / ${b.maxHp}`],
+      ];
+    }
   } else if (t.kind === 'wall') {
     const seg = ref;
     title = seg.gate ? 'POSTERN' : 'WALL';
@@ -304,8 +328,8 @@ function updateBuild(g, ui) {
       const info = [];
       info.push(costText(check.cost));
       if (ui.buildType === 'tower') info.push(`fires ${Math.round(TOWER.weapon.minRange * S)}–${Math.round(TOWER.weapon.range * S)} m · red disc = blind spot`);
-      if (ui.buildType === 'farm' && Number.isFinite(check.fertility)) info.push(`fertility ×${fmt(check.fertility, 2)} · feeds ${farmSupport({ rate: check.rate })}`);
-      if ((ui.buildType === 'quarry' || ui.buildType === 'mine') && check.rate) info.push(`${fmt(check.rate, 2)}/s`);
+      if (ui.buildType === 'farm' && Number.isFinite(check.fertility)) info.push(`fertility ×${fmt(check.fertility, 2)} · Food support +${farmSupport({ rate: check.rate })} with 1 worker`);
+      if ((ui.buildType === 'quarry' || ui.buildType === 'mine') && check.rate) info.push(`${fmt(check.rate, 2)}/s with 2 workers`);
       status = `${info.join(' · ')}<br />${ok ? '<span class="good">Click to build.</span>'
         : `<span class="warn">${(check.reasons || []).join(' · ')}</span>`}`;
     }
@@ -354,7 +378,7 @@ function ensureMiniTerrain(g) {
   return miniTerrain;
 }
 
-function updateMinimap(g) {
+function updateMinimap(g, intel) {
   const canvas = $('minimap');
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
@@ -386,11 +410,11 @@ function updateMinimap(g) {
   }
   // Live hostile information only where currently observed.
   for (const e of g.enemies) {
-    if (!isTileVisible(g, Math.floor(e.x), Math.floor(e.y))) continue;
+    if (!intel && !isTileVisible(g, Math.floor(e.x), Math.floor(e.y))) continue;
     pt(e.x, e.y, e.wild ? '#d7f36b' : '#ff4a3a', e.type === 'heavy' ? 4 : 2.5);
   }
-  // Assault approach arrows at the incoming map edge.
-  if (g.phase !== 'aftermath') {
+  // Assault approach arrows at the incoming map edge: debug intel only (D111).
+  if (intel && g.phase !== 'aftermath') {
     const warn = g.phase === 'warning' || g.phase === 'combat';
     const pulse = 0.5 + 0.5 * Math.sin(g.time * (warn ? 8 : 2.5));
     ctx.fillStyle = warn ? `rgba(255,75,75,${0.55 + pulse * 0.45})` : 'rgba(255,214,102,0.85)';
@@ -426,14 +450,29 @@ function updateMinimap(g) {
   ctx.fill();
 }
 
-export function updateHud(g, look, ui) {
+// --- weapon (D113) ----------------------------------------------------------------
+function updateWeapon(g, ui) {
+  const p = g.player;
+  const crossbow = p.weapon === 'crossbow';
+  $('weapon').classList.toggle('dim', ui.buildMode);
+  setText($('weapon-name'), ui.buildMode ? 'BUILDING' : crossbow ? 'CROSSBOW' : 'SWORD');
+  const reloading = crossbow && p.boltCd > 0;
+  setHtml($('weapon-sub'), ui.buildMode ? 'click places · <kbd>Q</kbd> back out'
+    : reloading ? 'reloading…' : crossbow ? 'loaded · <kbd>F</kbd> sword' : '<kbd>F</kbd> crossbow');
+  $('weapon-reload').hidden = !reloading;
+  if (reloading) $('weapon-reload-bar').style.width = `${(1 - p.boltCd / PLAYER.crossbow.reload) * 100}%`;
+}
+
+export function updateHud(g, look, ui, debug = {}) {
+  const intel = !!debug.intel;
+  updateWeapon(g, ui);
   updateResources(g);
-  updateCompass(g);
-  updatePhase(g);
+  updateCompass(g, intel);
+  updatePhase(g, intel);
   updateAlerts(g);
   updatePrompt(g, look, ui);
   updateBuild(g, ui);
-  updateMinimap(g);
+  updateMinimap(g, intel);
   $('perch').hidden = g.player.perchId == null;
   setText($('mini-seed'), `seed ${g.seed}`);
 }

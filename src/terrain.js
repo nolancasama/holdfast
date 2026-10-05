@@ -597,16 +597,23 @@ function buildMap(rng) {
     terrainVersion: 0,
   };
 
+  // D114: broad landforms - large hills, valleys and low plains - rather than
+  // noisy bumps: low frequency, few octaves. The noise generator draws from
+  // rng exactly as before, so barrier/road layout is unchanged in kind.
   const elevNoise = makeNoise2D(rng);
   const elevCont = new Float32Array(size);
+  const { freqX, freqY, octaves, contrast } = GEN.landform;
   for (let y = 0; y < MAP.h; y++) {
     for (let x = 0; x < MAP.w; x++) {
-      const e = fbm(elevNoise, x * 0.032, y * 0.05, 5);
+      const raw = fbm(elevNoise, x * freqX, y * freqY, octaves);
+      const e = Math.max(0, Math.min(1, 0.5 + (raw - 0.5) * contrast));
       const i = idx(x, y);
       elevCont[i] = e;
       map.elev[i] = e < GEN.elevationCuts[0] ? 0 : e < GEN.elevationCuts[1] ? 1 : 2;
     }
   }
+  // The continuous field shapes the 3D relief (hill crowns, valley floors).
+  map.relief = elevCont;
 
   const columns = chooseBarrierColumns(rng);
   const barriers = stampRidges(map, rng, columns.ridges);

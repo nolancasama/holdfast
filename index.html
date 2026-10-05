@@ -6,8 +6,8 @@
 <title>Holdfast</title>
 <style>
   /* D101: first-person shell. The world is a full-screen WebGL canvas; the HUD
-     is plain DOM layered over it (resources, compass, assault plaque,
-     crosshair prompt, build bar, minimap). */
+     is plain DOM layered over it (resources + population, compass, crosshair
+     prompt, weapon, build bar, minimap). The assault plaque is debug-only (D111). */
   @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&display=swap');
   :root {
     --bg: #0a0908;
@@ -55,6 +55,8 @@
   #res .r .lbl { color: var(--dim); width: 64px; font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; }
   #res .r .note { color: var(--dim); font-size: 11px; }
   #res .stone b { color: #d6dde2; } #res .gold b { color: var(--gold); } #res .food b { color: #b6e07a; }
+  #res .roles { font-size: 11px; color: var(--dim); padding-left: 72px; margin-top: -2px; }
+  #res .roles b { color: var(--text); font-weight: 600; } #res .roles b.free { color: var(--green); }
   .hpbar { height: 6px; background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.15); border-radius: 2px; overflow: hidden; margin-top: 3px; }
   .hpbar i { display: block; height: 100%; width: 100%; background: var(--green); }
 
@@ -71,6 +73,7 @@
   #compass::after { content: ''; position: absolute; left: 50%; top: 0; width: 2px; height: 8px; background: var(--bronze-hi); transform: translateX(-50%); }
 
   /* assault plaque */
+  /* D111: debug intel only - normal play shows no assault timer or direction */
   #phase { top: 12px; right: 12px; padding: 8px 14px; text-align: right; min-width: 230px; }
   #phase-head { font: 700 14px var(--display); letter-spacing: 0.08em; color: var(--parch); }
   #phase-time { font: 700 26px/1.1 var(--ui); color: var(--parch); }
@@ -106,6 +109,12 @@
   #prompt-keys { margin-top: 3px; font-size: 12px; color: var(--dim); display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
   .hpline { width: 140px; margin: 3px auto 0; }
 
+  /* D113: equipped weapon + reload */
+  #weapon { right: 18px; bottom: 196px; padding: 5px 10px; text-align: right; min-width: 132px; }
+  #weapon-name { font: 700 13px var(--display); letter-spacing: 0.08em; color: var(--parch); }
+  #weapon-sub { font-size: 11px; color: var(--dim); }
+  #weapon .hpbar { margin-top: 3px; }
+  #weapon .hpbar i { background: var(--bronze-hi); }
   #perch { bottom: 168px; left: 50%; transform: translateX(-50%); padding: 3px 12px; color: var(--gold); font: 700 12px var(--display); letter-spacing: 0.08em; }
 
   /* build */
@@ -181,7 +190,8 @@
 <div class="hud panel" id="res">
   <div class="r stone"><span class="lbl">Stone</span><b id="r-stone">0</b><span class="note" id="r-stone-rate"></span></div>
   <div class="r gold"><span class="lbl">Gold</span><b id="r-gold">0</b><span class="note" id="r-gold-rate"></span></div>
-  <div class="r food"><span class="lbl">Garrison</span><b id="r-food">0/0</b><span class="note" id="r-food-note"></span></div>
+  <div class="r food"><span class="lbl">People</span><b id="r-pop">0 / 0</b><span class="note" id="r-pop-note"></span></div>
+  <div class="roles" id="r-roles"></div>
   <div class="r hp"><span class="lbl">Health</span><b id="r-hp">100</b></div>
   <div class="hpbar"><i id="r-hpbar"></i></div>
 </div>
@@ -192,7 +202,7 @@
   <span class="marker" id="compass-threat" hidden>▲ ENEMY</span>
 </div>
 
-<div class="hud panel" id="phase">
+<div class="hud panel" id="phase" hidden>
   <div id="phase-head">NEXT ASSAULT</div>
   <div id="phase-time">02:00</div>
   <div id="phase-sub"></div>
@@ -207,6 +217,11 @@
   <div id="prompt-title"></div>
   <div id="prompt-body"></div>
   <div id="prompt-keys"></div>
+</div>
+<div class="hud panel" id="weapon">
+  <div id="weapon-name">SWORD</div>
+  <div id="weapon-sub"><kbd>F</kbd> / wheel switch</div>
+  <div class="hpbar" id="weapon-reload" hidden><i id="weapon-reload-bar"></i></div>
 </div>
 <div class="hud panel" id="perch" hidden>ON THE TOWER · <kbd>E</kbd> climb down</div>
 
@@ -245,15 +260,17 @@
           <kbd>Mouse</kbd><span>look</span>
           <kbd>E</kbd><span>climb onto / down from the Tower you face</span>
           <kbd>1–5</kbd><span>build Tower · Wall · Farm · Quarry · Gold Mine (press again or <kbd>Q</kbd> to cancel)</span>
-          <kbd>Click</kbd><span>place / pick Wall Towers · otherwise a weak swing</span>
+          <kbd>Click</kbd><span>use your weapon · in build mode: place / pick Wall Towers</span>
+          <kbd>F</kbd><span>switch Sword / Crossbow (or mouse wheel) · the crossbow is slow to reload</span>
           <kbd>Right-click</kbd><span>step back (Wall corner, then build mode)</span>
           <kbd>R</kbd><span>hold to repair what you look at (Stone)</span>
-          <kbd>G</kbd><span>assign a soldier · <kbd>Shift+G</kbd> withdraw</span>
+          <kbd>G</kbd><span>put a free person to work (Farm · Quarry · Mine) or on a Tower · <kbd>Shift+G</kbd> send one back</span>
           <kbd>U</kbd><span>weapon upgrade (at the Tower)</span>
-          <kbd>T</kbd><span>start the next assault early</span>
+          <kbd>T</kbd><span>sound the horn: bring the next assault on now</span>
           <kbd>Esc</kbd><span>release the mouse / this screen · <kbd>P</kbd> pause</span>
         </div>
         <p class="muted">Walls join two finished Towers you stand at or on — never the Keep. The gaps beside each Tower are posterns: you can pass, enemies cannot.</p>
+        <p class="muted">Nobody announces an assault. Watch for dust on the roads, birds put up from the woods, a distant horn, Tower fire — and listen for a garrisoned Tower's bell. High ground and Tower tops see farthest.</p>
       </div>
       <div class="sec">
         <h2>Sound</h2>
@@ -275,6 +292,10 @@
           <button data-dbg="spawn">Spawn at crosshair [Y]</button>
           <button data-dbg="spawnpause">Pause spawning [L]</button>
           <button data-dbg="regen">Regenerate map [O]</button>
+          <button data-dbg="intel">Assault timer + approach [F8]</button>
+          <button data-dbg="los">Tower target + LOS rays [F6]</button>
+          <button data-dbg="weather">Next weather [F7]</button>
+          <button data-dbg="weatherFast">Instant weather change</button>
         </div>
         <div class="muted" id="d-mapinfo" style="margin-top:8px; font-size:11px"></div>
       </div>
@@ -294,7 +315,7 @@
       <span class="muted">Same seed = same map. <a href="./classic.html" style="color:var(--bronze-hi)">2D classic</a></span>
     </div>
     <button class="start" id="start-btn">Start run</button>
-    <p class="muted" style="margin-top:12px"><kbd>WASD</kbd> move · <kbd>Mouse</kbd> look · <kbd>Shift</kbd> sprint · <kbd>E</kbd> climb Tower · <kbd>1–5</kbd> build · <kbd>R</kbd> repair · <kbd>G</kbd> garrison · <kbd>Esc</kbd> menu</p>
+    <p class="muted" style="margin-top:12px"><kbd>WASD</kbd> move · <kbd>Mouse</kbd> look · <kbd>Shift</kbd> sprint · <kbd>Click</kbd> weapon · <kbd>F</kbd> switch weapon · <kbd>E</kbd> climb Tower · <kbd>1–5</kbd> build · <kbd>R</kbd> repair · <kbd>G</kbd> assign people · <kbd>Esc</kbd> menu</p>
   </div>
 </div>
 

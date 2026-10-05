@@ -5,7 +5,7 @@
 // (X = x * S, Z = y * S) with S = WORLD3D.tileMeters; world Y is height.
 // North is -Z (decreasing tile y), east is +X.
 
-import { MAP, T, WORLD3D } from '../config.js';
+import { MAP, T, WORLD3D, GEN } from '../config.js';
 
 const S = WORLD3D.tileMeters;
 const VW = MAP.w + 1; // height-field vertices per row
@@ -16,20 +16,32 @@ export const worldToTile = (wx, wz) => ({ x: wx / S, y: wz / S });
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
+const smoothstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
 /** Pre-depression ground height of one tile from its elevation band. */
 function bandHeight(map, i) {
   return map.elev[i] * WORLD3D.elevStep;
 }
 
 /**
- * Vertex heights for the (w+1) x (h+1) corner grid.
- * - `surface`: smoothed band height, ignoring water depression and cliffs. Water
- *   surfaces sit on this.
- * - `ground`: the visible, walkable terrain: surface minus water depth, plus
- *   cliff relief where every touching tile is cliff (a ridge interior) and
- *   partial relief at its rim, so cliffs read as steep rock faces.
+ * D114: on a generated map the continuous landform (`map.relief`) crowns High
+ * ground into real hills and lets Normal ground swell gently towards them, so
+ * walking up to a hill reads as "that is high ground". Test maps without
+ * relief stay flat. Blurred harder than the bands, so a river or clearing cut
+ * into a hill leaves a slope, never a wall.
  */
-export function buildHeightField(map) {
+function reliefHeight(map, i) {
+  const r = map.relief?.[i];
+  if (r == null) return 0;
+  const band = map.elev[i];
+  const [, cut1] = GEN.elevationCuts;
+  if (band === 2) return WORLD3D.hillCrown * smoothstep(cut1, cut1 + 0.22, r);
+  if (band === 1) return WORLD3D.plainSwell * smoothstep(0.5, cut1, r);
+  return 0;
+}
+
+/** Tile values averaged onto the (w+1) x (h+1) vertex grid. */
+function cornerGrid(map, fn) {
   const raw = new Float32Array(VW * VH);
   for (let vy = 0; vy < VH; vy++) {
     for (let vx = 0; vx < VW; vx++) {
@@ -39,14 +51,18 @@ export function buildHeightField(map) {
         const tx = vx + ox;
         const ty = vy + oy;
         if (tx < 0 || ty < 0 || tx >= MAP.w || ty >= MAP.h) continue;
-        sum += bandHeight(map, ty * MAP.w + tx);
+        sum += fn(map, ty * MAP.w + tx);
         n++;
       }
       raw[vy * VW + vx] = n ? sum / n : 0;
     }
   }
-  let surface = raw;
-  for (let pass = 0; pass < WORLD3D.smoothPasses; pass++) {
+  return raw;
+}
+
+function blur(grid, passes) {
+  let surface = grid;
+  for (let pass = 0; pass < passes; pass++) {
     const next = new Float32Array(VW * VH);
     for (let vy = 0; vy < VH; vy++) {
       for (let vx = 0; vx < VW; vx++) {
@@ -65,6 +81,23 @@ export function buildHeightField(map) {
       }
     }
     surface = next;
+  }
+  return surface;
+}
+
+/**
+ * Vertex heights for the (w+1) x (h+1) corner grid.
+ * - `surface`: smoothed band height (+ D114 relief), ignoring water depression
+ *   and cliffs. Water surfaces sit on this.
+ * - `ground`: the visible, walkable terrain: surface minus water depth, plus
+ *   cliff relief where every touching tile is cliff (a ridge interior) and
+ *   partial relief at its rim, so cliffs read as steep rock faces.
+ */
+export function buildHeightField(map) {
+  const surface = blur(cornerGrid(map, bandHeight), WORLD3D.smoothPasses);
+  if (map.relief) {
+    const relief = blur(cornerGrid(map, reliefHeight), WORLD3D.reliefPasses);
+    for (let i = 0; i < surface.length; i++) surface[i] += relief[i];
   }
 
   const ground = new Float32Array(VW * VH);
@@ -93,7 +126,8 @@ export function buildHeightField(map) {
           const share = cliff / n;
           // Deterministic jitter keeps ridges from looking extruded.
           const jitter = (hash2(vx, vy) - 0.5) * 1.6;
-          h += share === 1 ? WORLD3D.cliffHeight + jitter : share * WORLD3D.cliffHeight * 0.55;
+          // D114: a lower rim lift (was 0.55) keeps a rim on a hill flank walkable.
+          h += share === 1 ? WORLD3D.cliffHeight + jitter : share * WORLD3D.cliffHeight * 0.45;
         }
       }
       ground[i] = h;

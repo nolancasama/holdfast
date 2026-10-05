@@ -2,7 +2,7 @@
 
 import {
   MAP, T, PLAYER, TOWER, KEEP, START_RESOURCES, WALL_PATH,
-  ENEMIES, WAVE, PASSABLE, GARRISON, NEST,
+  ENEMIES, WAVE, PASSABLE, GARRISON, NEST, POPULATION,
 } from '../src/config.js';
 import {
   generateMap, validateResourceGeography, idx,
@@ -11,19 +11,25 @@ import { computeField } from '../src/flowfield.js';
 import { runPreserved } from './preserved-tests.js';
 import { runFortress } from './fortress-tests.js';
 import { runFirstPerson } from './fp-tests.js';
+import { runSight } from './sight-tests.js';
+import { runWorld } from './world-tests.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats,
   spawnGroupAt, isTileExplored, resourceState,
   resourceSitesState, keepState, buildingState, keepFieldState,
   enemyKeepField, flushKeepFieldRecomputes, endState, playerSpeed,
-  foodSupport, garrisonState, assignGarrison, addNest, nestState, towerCanHitNest, towerMinRange,
+  foodSupport, garrisonState, assignGarrison, assignWorkers, populationState, addNest, nestState, towerCanHitNest, towerMinRange,
   assaultIn, startWaveEarly, setPaused,
 } from '../src/game.js';
 
 let passed = 0;
 const failures = [];
+// TEST_FILTER=<regex> runs only matching checks (and skips the preserved suite
+// unless the filter names it) for fast iteration; npm test runs everything.
+const FILTER = process.env.TEST_FILTER ? new RegExp(process.env.TEST_FILTER, 'i') : null;
 
 function check(name, fn) {
+  if (FILTER && !FILTER.test(name)) return;
   try {
     const result = fn();
     if (result === false) throw new Error('assertion returned false');
@@ -174,18 +180,22 @@ check('D80 g.res replaces Materials and tower extraction', () => {
   assert(!('income' in stats) && !('extractRadius' in stats), 'tower extraction stats remain');
 });
 
-check('D80/D91 Farm requires fertility and feeds soldiers only after construction', () => {
+check('D80/D110 Farm requires fertility and adds Food support only once built and staffed', () => {
   const map = flatMap();
   const g = gameOn(map); rich(g);
+  const base = foodSupport(g);
+  assert(base === POPULATION.keepFoodSupport, `Keep stores feed ${base}`);
   const x = map.start.x + 4.5; const y = map.start.y + 4.5;
   assert(!canPlaceAt(g, x, y, 'farm').ok, 'farm accepted barren ground');
   for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) map.fertility[idx(Math.floor(x) + ox, Math.floor(y) + oy)] = 1;
   const farm = buildAt(g, x, y, 'farm');
   const before = { ...g.res };
   update(g, 0.5);
-  assert(foodSupport(g) === 0, 'unfinished farm fed soldiers');
+  assert(foodSupport(g) === base, 'unfinished farm added support');
   run(g, 12);
-  assert(farm.built && foodSupport(g) === GARRISON.supportPerFarm, `built farm feeds ${foodSupport(g)}`);
+  assert(farm.built && farm.workers === 1, `built farm auto-staffed (${farm.workers})`);
+  assert(foodSupport(g) === base + GARRISON.supportPerFarm, `staffed farm feeds ${foodSupport(g) - base}`);
+  assert(assignWorkers(g, farm, -1).ok && foodSupport(g) === base, 'unstaffed farm still feeds');
   assert(!('food' in g.res), 'Food became a stockpile again');
   approx(g.res.stone, before.stone, 1e-6, 'farm produced Stone');
   approx(g.res.gold, before.gold, 1e-6, 'farm produced Gold');
@@ -237,7 +247,7 @@ check('D80 Steward discounts and accelerates economic buildings', () => {
   assert(b.progress > a.progress, 'no Steward build-speed bonus');
 });
 
-// --- D91 garrison ----------------------------------------------------------
+// --- D110 population: workers and garrison are the same people ---------------
 
 function fedGame(farms = 1) {
   const map = flatMap();
@@ -246,17 +256,21 @@ function fedGame(farms = 1) {
     const x = map.start.x - 6.5 - k * 4; const y = map.start.y + 5.5;
     for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) map.fertility[idx(Math.floor(x) + ox, Math.floor(y) + oy)] = 1;
     const farm = buildAt(g, x, y, 'farm');
-    farm.built = true; farm.progress = 1; farm.hp = farm.maxHp;
+    farm.built = true; farm.progress = 1; farm.hp = farm.maxHp; farm.workers = 1;
   }
   return g;
 }
 
-check('D91 Food support caps garrison; Keep has 4 slots, a tower 1 (2 at W2)', () => {
-  const bare = gameOn(); rich(bare);
-  assert(!assignGarrison(bare, bare.towers[0], 1).ok, 'garrisoned with no Food support');
-  const g = fedGame(2);
+check('D110 the Keep founds the settlement with free people its stores can feed', () => {
+  const g = gameOn();
+  const p = populationState(g);
+  assert(p.total === POPULATION.start && p.free === POPULATION.start, `start ${JSON.stringify(p)}`);
+  assert(p.support >= p.total && !p.shortage, 'founding settlement is fed');
+});
+
+check('D110 garrison draws from free people; Keep has 4 slots, a tower 1 (2 at W2)', () => {
+  const g = fedGame(0);
   const keep = g.towers[0];
-  assert(foodSupport(g) === 2 * GARRISON.supportPerFarm, `support ${foodSupport(g)}`);
   for (let k = 0; k < GARRISON.slots.keep; k++) assert(assignGarrison(g, keep, 1).ok, `Keep slot ${k} refused`);
   assert(!assignGarrison(g, keep, 1).ok, 'Keep took a fifth soldier');
   const t = buildAt(g, keep.x + 8, keep.y);
@@ -265,9 +279,90 @@ check('D91 Food support caps garrison; Keep has 4 slots, a tower 1 (2 at W2)', (
   assert(assignGarrison(g, t, 1).ok && !assignGarrison(g, t, 1).ok, 'basic tower is not one slot');
   t.wLevel = GARRISON.upgradedFromLevel;
   assert(assignGarrison(g, t, 1).ok, 'W2 tower has no second slot');
-  assert(garrisonState(g).assigned === 2 * GARRISON.supportPerFarm, 'assigned count wrong');
+  assert(garrisonState(g).assigned === GARRISON.slots.keep + 2, 'assigned count wrong');
+  // Every person is now a soldier or free; with no free people nobody else enlists.
+  const p = populationState(g);
+  assert(p.garrison + p.free === p.total, 'people do not add up');
+  g.pop.total = p.garrison;
   t.wLevel = 3; g.towers.push({ ...t, id: 777, garrison: 0 });
-  assert(!assignGarrison(g, 777, 1).ok, 'assigned beyond Food support');
+  assert(!assignGarrison(g, 777, 1).ok, 'garrisoned with nobody free');
+});
+
+check('D110 a worker cannot also garrison: pulling miners into a Tower stops Gold', () => {
+  const map = flatMap(); const g = gameOn(map); rich(g);
+  const mine = buildAt(g, map.goldSites[0].x, map.goldSites[0].y, 'mine');
+  run(g, 16);
+  assert(mine.built && mine.workers === 2, `mine staffed ${mine.workers}`);
+  const keep = g.towers[0];
+  // Occupy free people in the Keep; the rest of the settlement is away.
+  while (populationState(g).free > 0 && assignGarrison(g, keep, 1).ok);
+  g.pop.total = populationState(g).workers + populationState(g).garrison;
+  const full = populationState(g);
+  assert(full.free === 0 && full.workers === 2, `pool ${JSON.stringify(full)}`);
+  const t = buildAt(g, keep.x + 9, keep.y); t.built = true; t.progress = 1;
+  assert(!assignGarrison(g, t, 1).ok, 'a worker garrisoned without leaving work');
+  assert(assignWorkers(g, mine, -1).ok && assignWorkers(g, mine, -1).ok, 'could not withdraw miners');
+  assert(assignGarrison(g, t, 1).ok, 'freed miner could not garrison');
+  const gold = g.res.gold;
+  run(g, 3);
+  approx(g.res.gold, gold, 1e-9, 'unstaffed mine still produced');
+});
+
+check('D110 production scales with workers: Quarry 0 / 50% / 100%', () => {
+  const map = flatMap(); const g = gameOn(map); rich(g);
+  const q = buildAt(g, map.stoneSites[0].x, map.stoneSites[0].y, 'quarry');
+  q.built = true; q.progress = 1; q.hp = q.maxHp;
+  const rate = (w) => { q.workers = w; const s = g.res.stone; run(g, 4); return (g.res.stone - s) / 4; };
+  approx(rate(0), 0, 1e-9, 'idle quarry produced');
+  approx(rate(1), q.rate * 0.5, q.rate * 0.03, 'one worker is not half');
+  approx(rate(2), q.rate, q.rate * 0.03, 'two workers are not full');
+});
+
+check('D110 people arrive while Food support has room, never beyond it', () => {
+  const g = fedGame(1);
+  const p0 = populationState(g);
+  assert(p0.support === POPULATION.keepFoodSupport + GARRISON.supportPerFarm, `support ${p0.support}`);
+  run(g, POPULATION.growthInterval + 0.5);
+  assert(g.pop.total === p0.total + 1, `one newcomer (${g.pop.total})`);
+  run(g, POPULATION.growthInterval * 6);
+  assert(g.pop.total === p0.support, `growth capped at support (${g.pop.total}/${p0.support})`);
+});
+
+check('D110 Food Shortage stops growth, has a grace period, then one person leaves at a time', () => {
+  const g = fedGame(1);
+  g.pop.total = foodSupport(g);
+  const keep = g.towers[0];
+  for (let k = 0; k < 3; k++) assignGarrison(g, keep, 1);
+  const farm = g.buildings[0];
+  farm.hp = 0; update(g, 0.05);
+  const total = g.pop.total;
+  assert(farm.destroyed && populationState(g).shortage, 'no shortage after losing the farm');
+  run(g, POPULATION.shortageGrace - 1);
+  assert(g.pop.total === total, 'people vanished during the grace period');
+  run(g, 1.5);
+  assert(g.pop.total === total - 1, `first departure missing (${g.pop.total})`);
+  run(g, POPULATION.leaveInterval * 0.5);
+  assert(g.pop.total === total - 1, 'left faster than the interval');
+  assert(keep.garrison === 3, 'a soldier left while idle people remained');
+  g.arch = { ...g.arch, foodSupportBonus: 10 };
+  run(g, POPULATION.leaveInterval * 2);
+  assert(!populationState(g).shortage && g.pop.total >= total - 1, 'shortage did not clear on recovery');
+});
+
+check('D110 a destroyed Tower loses its garrison; a destroyed building frees its workers', () => {
+  const map = flatMap(); const g = gameOn(map); rich(g);
+  const keep = g.towers[0];
+  const t = buildAt(g, keep.x + 9, keep.y); t.built = true; t.progress = 1; t.hp = t.maxHp;
+  assignGarrison(g, t, 1);
+  const q = buildAt(g, map.stoneSites[0].x, map.stoneSites[0].y, 'quarry');
+  run(g, 14);
+  assert(q.workers === 2, 'quarry staffed');
+  const total = g.pop.total;
+  t.hp = -1; update(g, 0.05);
+  assert(g.pop.total === total - 1, `garrison survived the collapse (${g.pop.total})`);
+  const free = populationState(g).free;
+  q.hp = -1; update(g, 0.05);
+  assert(populationState(g).free === free + 2 && g.pop.total === total - 1, 'workers did not return to the free pool');
 });
 
 check('D91 garrison raises damage and fire rate but never min range', () => {
@@ -280,25 +375,6 @@ check('D91 garrison raises damage and fire rate but never min range', () => {
   approx(after.damage / before.damage, 1 + 2 * GARRISON.damagePerSoldier, 1e-9, 'damage bonus');
   approx(after.fireRate / before.fireRate, 1 + 2 * GARRISON.fireRatePerSoldier, 1e-9, 'fire-rate bonus');
   approx(towerMinRange(g, keep), minBefore, 1e-12, 'garrison changed min range');
-});
-
-check('D91 supply deficit has a grace period, then soldiers stand down one at a time', () => {
-  const g = fedGame(1);
-  const keep = g.towers[0];
-  for (let k = 0; k < GARRISON.supportPerFarm; k++) assignGarrison(g, keep, 1);
-  const farm = g.buildings[0];
-  farm.hp = 0; update(g, 0.05);
-  assert(farm.destroyed && garrisonState(g).deficit, 'no deficit after losing the farm');
-  run(g, GARRISON.graceSeconds - 1);
-  assert(keep.garrison === GARRISON.supportPerFarm, 'soldiers vanished during the grace period');
-  run(g, 1.5);
-  assert(keep.garrison === GARRISON.supportPerFarm - 1, `first stand-down missing (${keep.garrison})`);
-  run(g, GARRISON.standDownInterval * 0.5);
-  assert(keep.garrison === GARRISON.supportPerFarm - 1, 'stood down faster than the interval');
-  // Recovering Food ends the deficit and nobody else leaves.
-  g.arch = { ...g.arch, foodSupportBonus: 10 };
-  run(g, GARRISON.standDownInterval * 2);
-  assert(!garrisonState(g).deficit && keep.garrison === GARRISON.supportPerFarm - 1, 'deficit did not clear on recovery');
 });
 
 // --- D92 nests ---------------------------------------------------------------
@@ -583,8 +659,8 @@ check('D97 Start Next Wave readiness works and rejects invalid states', () => {
 check('D97 expansion income accrues and pause freezes every phase clock and income', () => {
   const g = createGame('D97-INCOME', 'gunner', flatMap());
   g.buildings.push(
-    { id: 91, type: 'quarry', x: 20, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.5 },
-    { id: 92, type: 'mine', x: 22, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.2 },
+    { id: 91, type: 'quarry', x: 20, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.5, workers: 2 },
+    { id: 92, type: 'mine', x: 22, y: 20, hp: 100, maxHp: 100, built: true, destroyed: false, rate: 0.2, workers: 2 },
   );
   const before = { ...g.res };
   run(g, 2, 0.05);
@@ -653,8 +729,14 @@ runFortress({ check, assert, gameOn, flatMap, rich, run });
 // D101 first-person shell: 3D-space math and the sim rules it selects.
 runFirstPerson({ check, assert, gameOn, flatMap, rich, run, maps, seeds: SEEDS });
 
+// D109 first-person Tower sight and firing.
+runSight({ check, assert, gameOn, flatMap, rich, run });
+
+// D111-D113 unannounced assaults, the garrison bell, weather and the crossbow.
+runWorld({ check, assert, gameOn, flatMap, rich, run });
+
 // Preserved-system checks (roads, fog, LOS, upgrades, stuck recovery, audio...).
-const preserved = runPreserved(maps, SEEDS);
+const preserved = FILTER && !FILTER.test('preserved') ? { passed: 0, failures: [] } : runPreserved(maps, SEEDS);
 passed += preserved.passed;
 failures.push(...preserved.failures);
 

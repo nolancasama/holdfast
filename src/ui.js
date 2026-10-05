@@ -68,15 +68,16 @@ export function updateHud(g) {
     $(`hud-${key}`).textContent = Math.floor(g.res?.[key] || 0);
     $(`hud-${key}-rate`).textContent = `+${fmt(rates[key], 2)}/s`;
   }
-  // D91: Food is support, shown as soldiers garrisoned / soldiers fed.
+  // D110: people / Food support; the classic auto-staffs buildings.
   const food = garrisonState(g);
-  $('hud-food').textContent = `${food.assigned}/${food.support}`;
-  $('hud-food-rate').textContent = food.free > 0 ? `${food.free} free` : 'fed by farms';
+  const pop = food.population;
+  $('hud-food').textContent = `${pop.total}/${pop.support}`;
+  $('hud-food-rate').textContent = `${pop.workers} work · ${pop.garrison} guard · ${pop.free} free`;
   const deficit = $('hud-deficit');
   deficit.hidden = !food.deficit;
   if (food.deficit) {
-    deficit.textContent = food.standingDown ? 'SUPPLY DEFICIT · SOLDIERS STANDING DOWN'
-      : `SUPPLY DEFICIT · ${Math.ceil(food.graceLeft ?? 0)}s`;
+    deficit.textContent = food.standingDown ? 'FOOD SHORTAGE · PEOPLE LEAVING'
+      : `FOOD SHORTAGE · ${Math.ceil(food.graceLeft ?? 0)}s`;
     deficit.style.color = 'var(--red)'; deficit.style.borderColor = 'var(--red)';
   }
   $('hud-wave').textContent = `WAVE ${g.wave}`;
@@ -209,8 +210,8 @@ function updateSelection(g) {
     $('garrison-plus').disabled = g.paused || !tower.built || (tower.garrison || 0) >= slots || food.free <= 0;
     $('garrison-minus').disabled = g.paused || !(tower.garrison > 0);
     $('sel-garrison-note').innerHTML = !tower.built ? 'Soldiers can man it once it is finished.'
-      : food.free > 0 ? `<span class="good">${food.free} fed soldier${food.free === 1 ? '' : 's'} free.</span> Each adds fire rate and damage, never close defence.`
-        : (tower.garrison || 0) < slots ? '<span class="warn">No free Food support — build a Farm.</span>'
+      : food.free > 0 ? `<span class="good">${food.free} free ${food.free === 1 ? 'person' : 'people'}.</span> Each soldier adds fire rate and damage, never close defence.`
+        : (tower.garrison || 0) < slots ? '<span class="warn">No free people — they are all working or garrisoned.</span>'
           : 'Fully garrisoned.';
     $('sel-upgrade').hidden = !upgrading;
     if (upgrading) {

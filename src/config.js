@@ -36,6 +36,8 @@ export const ELEVATION_NAMES = ['Low', 'Normal', 'High'];
 // --- terrain generation -----------------------------------------------------
 export const GEN = {
   elevationCuts: [0.38, 0.68],
+  // D114: broad landforms (was fbm x0.032/y0.05, 5 octaves).
+  landform: { freqX: 0.017, freqY: 0.028, octaves: 3, contrast: 1.15 },
   // D79: retain the old feature scale and author more barriers rather than
   // stretching the old 104x52 layout over the larger world.
   ridges: { min: 4, max: 6, thicknessMin: 2, thicknessMax: 5, wander: 10 },
@@ -156,6 +158,9 @@ export const PLAYER = {
   radius: 0.42,
   presenceRadius: 2.4,      // inside this, a tower is the Occupied Tower
   melee: { damage: 18, cooldown: 0.9, range: 1.2, arc: Math.PI * 0.8 },
+  // D113: one strong bolt, a long reload. 30 kills a wave-1 Swarm, wounds a
+  // Runner, and takes ~9 bolts (~20 s) for a Heavy: help, not an army.
+  crossbow: { damage: 30, reload: 2.4, range: 45 },
   invulnAfterHit: 0.35,
   regen: 2.5,               // hp/sec, prep phase only: surviving a collapse is a
                             // scar you can recover from, not a delayed death
@@ -176,8 +181,11 @@ export const BUILD = {
 export const WORLD3D = {
   tileMeters: 2,
   eyeHeight: 1.7,             // metres above the ground
-  elevStep: 2.2,              // metres per elevation band (Low/Normal/High)
+  elevStep: 3.0,              // metres per elevation band (Low/Normal/High); D114 was 2.2
+  hillCrown: 8,               // D114: metres a hill's crown rises above its High band
+  plainSwell: 1.5,            // D114: Normal ground swells this much towards hills
   smoothPasses: 3,            // box-blur passes on the walkable height field
+  reliefPasses: 8,            // D114: the hill relief is blurred harder (broad forms, no walls)
   cliffHeight: 5.5,           // metres a cliff interior rises above its band
   shallowDepth: 0.55,
   deepDepth: 1.8,
@@ -195,6 +203,16 @@ export const WORLD3D = {
   drawDistance: 330,          // metres (camera far / atmospheric fog end)
   fogNear: 70,
   mouseSensitivity: 0.0022,
+};
+
+// D109: first-person Tower sight (src/fp/sight.js). The 3D shell traces a
+// line from the turret muzzle to the target's upper body through the rendered
+// height field and trees; the 2D classic keeps the tile LOS.
+export const SIGHT = {
+  step: 0.25,               // tiles between samples along a sight line
+  endClearance: 0.75,       // tiles near either end that never block (tower base, target footing)
+  canopyHitsToBlock: 2,     // one crown is a gap you can see past; two is woods
+  targetHeight: { swarm: 0.8, runner: 1.5, heavy: 1.9, feral: 1.1, nest: 1.6 }, // metres
 };
 
 export const VISION = {
@@ -267,16 +285,28 @@ export const BUILDINGS = {
 
 export const START_RESOURCES = { stone: 340, gold: 0 };
 
-// D91: Food is support, not currency. Farms set how many soldiers the fortress
-// can feed; soldiers are assigned to towers and make them hit harder and faster.
+// D91: Food is support, not currency. D110: a staffed Farm adds Food support
+// (how many people the settlement sustains); soldiers are drawn from those
+// people and make Towers hit harder and faster.
 export const GARRISON = {
   supportPerFarm: 3,        // x the farm's fertility multiplier, rounded
   slots: { keep: 4, tower: 1, towerUpgraded: 2 },
   upgradedFromLevel: 2,     // weapon level at which a tower gains its second slot
   fireRatePerSoldier: 0.20,
   damagePerSoldier: 0.15,
-  graceSeconds: 30,         // deficit grace before anyone stands down
-  standDownInterval: 8,     // then one soldier every this many seconds
+};
+
+// D110: population. People work Farms, Quarries and Gold Mines or garrison
+// Towers - the same people, so every soldier is a worker not working. Food
+// support (the Keep's stores + staffed Farms) caps how many people the
+// settlement sustains. Assignment is instant and abstract: no walking workers.
+export const POPULATION = {
+  start: 8,
+  keepFoodSupport: 8,       // the Keep's stores feed the founding settlement
+  workerSlots: { farm: 1, quarry: 2, mine: 2 },
+  growthInterval: 40,       // seconds per newcomer while Food support has room
+  shortageGrace: 45,        // seconds of Food Shortage before anyone leaves
+  leaveInterval: 20,        // then one hungry person leaves this often
 };
 
 // D92: wilderness nests guard valuable sites. One nest type, one defender.
@@ -447,6 +477,31 @@ export const WAVE = {
   heavyBiasPerWave: 0.40,    // later waves lean on Heavies rather than more Swarms
 };
 
+// D111: assaults arrive unannounced in first person. Information comes from
+// the world: dust, birds, a distant horn, Tower fire, and a garrisoned Tower's
+// bell when its soldiers see the army.
+export const WATCH = {
+  spotRange: 46,            // tiles a garrisoned Tower's lookouts can see on a clear day
+  checkInterval: 0.5,
+  alarmSeconds: 9,          // pennant streams and the bell rings this long
+  hornChance: 0.75,         // the far horn is not perfectly reliable
+  mouthDustLead: 35,        // seconds before the assault that dust rises at the road mouth
+};
+
+// D112: occasional weather (src/weather.js). `visibility` scales how far the
+// eye (and a Tower's lookouts) can see; nothing changes damage or accuracy.
+export const WEATHER = {
+  blendSeconds: 10,
+  firstClear: [150, 260],
+  kinds: {
+    clear: { visibility: 1, rain: 0, dust: 0, storm: 0, dark: 0, duration: [240, 420] },
+    rain:  { visibility: 0.62, rain: 0.55, dust: 0, storm: 0, dark: 0.22, duration: [70, 130] },
+    storm: { visibility: 0.38, rain: 1, dust: 0, storm: 1, dark: 0.42, duration: [50, 90] },
+    dust:  { visibility: 0.5, rain: 0, dust: 1, storm: 0, dark: 0.12, duration: [60, 110] },
+  },
+  eventWeights: { total: 100, kinds: { rain: 55, dust: 25, storm: 20 } },
+};
+
 // D79: camera defaults and D19 readability floors for important entities.
 export const RENDER = {
   baseTilePx: 18,
@@ -497,10 +552,14 @@ export const AUDIO = {
   rateLimits: {
     towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
     heavyTowerHit: 0.22, breach: 0.12, heavyBreach: 0.2, towerUnderAttack: 2.5,
-    wallHit: 0.14, heavyWallHit: 0.2, wallBreak: 0.25, collapsing: 0.75, repair: 0.16, nestAmbient: 3.0, default: 0.08,
+    wallHit: 0.14, heavyWallHit: 0.2, wallBreak: 0.25, collapsing: 0.75, repair: 0.16, nestAmbient: 3.0,
+    towerBell: 0.5, thunder: 2.0, distantHorn: 3.0, distantRoar: 3.0, default: 0.08,
   },
   limiter: { threshold: -12, ratio: 16 },
-  envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
+  // D109: Tower fire is a little stronger than ordinary cues so a firing Tower
+  // is heard as well as seen.
+  envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035,
+    towerFire: 0.12, towerFireNoise: 0.06 },
   cues: {
     towerFire: [260, .10, 'square'], enemyHit: [430, .045, 'sine'], enemyDeath: [330, .14, 'triangle'],
     towerHit: [75, .18, 'triangle'], heavyTowerHit: [48, .30, 'triangle'],
@@ -514,6 +573,14 @@ export const AUDIO = {
     nestAgitated: [120, .38, 'sawtooth'], nestDestroyed: [42, 1.1, 'sawtooth'], supplyDeficit: [300, .30, 'square'],
     nestAmbient: [58, .9, 'sawtooth'],   // D101: low growl near an undestroyed nest
   },
+  // D111-D113: synthesized world cues (audio.js special()) and their reach as
+  // [tiles to silence, minimum gain, maximum gain].
+  special: ['distantHorn', 'distantRoar', 'towerBell', 'thunder', 'crossbow', 'reloaded', 'swordSwing'],
+  reach: {
+    distantHorn: [190, 0.05, 0.75], distantRoar: [150, 0.04, 0.8], towerBell: [120, 0.08, 1],
+    thunder: [1e9, 1, 1], crossbow: [40, 0.1, 1], reloaded: [10, 0.3, 1], swordSwing: [20, 0.2, 1],
+  },
+  ambience: { rain: 0.10, wind: 0.07 },
   dropFrequencies: { temporary: 620, supply: 310, equipment: 880 },
   // D47: positive confirmations RISE in pitch; everything else falls. A falling
   // tone reads as failure, so a descending victory sting says the wrong thing.

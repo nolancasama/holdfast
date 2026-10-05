@@ -8,10 +8,11 @@ import { BUILD, ENEMIES, WORLD3D, PLAYER, TOWER } from '../config.js';
 import { randomSeed, isPassable } from '../terrain.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, forceNextWave, startWaveEarly, spawnGroupAt,
-  setPaused, drainAudioEvents, wallPlan, tryBuildWall, assignGarrison, perchOnTower, leavePerch,
+  setPaused, drainAudioEvents, wallPlan, tryBuildWall, assignGarrison, assignWorkers, populationState, perchOnTower, leavePerch,
   towerStats, towerMinRange, wallState, nestState, garrisonState, resourceState, keepState, towerConnectivity,
-  repairTarget, isPointVisible, recomputeVisibility,
+  repairTarget, isPointVisible, recomputeVisibility, fireCrossbow, switchWeapon, assaultIn, buildingState,
 } from '../game.js';
+import { cycleWeather, setWeather, weatherState } from '../weather.js';
 import { createAudioSystem } from '../audio.js';
 import { renderPicks, showEnd, updateMapInfo } from '../ui.js';
 import {
@@ -21,6 +22,9 @@ import {
 import { buildTerrainScene, refreshVegetation, disposeTree } from './terrain3d.js';
 import { createEntityLayer } from './entities3d.js';
 import { createOverlays } from './overlays.js';
+import { createTowerSight } from './sight.js';
+import { createViewModel } from './weapon.js';
+import { createWeatherLayer } from './weather.js';
 import { updateHud, setVignette } from './hud.js';
 
 const $ = (id) => document.getElementById(id);
@@ -53,12 +57,16 @@ scene.add(sun.target);
 const camera = new THREE.PerspectiveCamera(WORLD3D.fov, 1, 0.1, WORLD3D.drawDistance + 60);
 camera.rotation.order = 'YXZ';
 
+const viewModel = createViewModel();
+const weather = createWeatherLayer(scene, { hemi, sun });
+
 function resize() {
   const w = window.innerWidth;
   const h = window.innerHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  viewModel.resize(w / h);
 }
 window.addEventListener('resize', resize);
 resize();
@@ -79,7 +87,7 @@ let meleeQueued = false;
 let lastHp = PLAYER.maxHp;
 let hurt = 0;
 const fly = { on: false, pos: new THREE.Vector3() };
-const debugFlags = { info: false, ranges: false, nests: false, blockers: false, paths: false };
+const debugFlags = { info: false, ranges: false, nests: false, blockers: false, paths: false, los: false, intel: false };
 const ui = { buildMode: false, buildType: 'tower', site: null, wall: { a: null, hover: null, plan: null, near: false, notice: null, noticeAt: 0 }, repairable: false };
 let look = { target: null, hit: null };
 let nestAmbientAt = 0;
@@ -107,9 +115,12 @@ function startRun(seed, archetype) {
   disposeWorld();
   game = createGame(seed, archetype);
   // D101: crosshair placement within reach, and solid Towers for the player.
-  game.rules = { ...game.rules, buildReach: BUILD.lookReach, solidTowers: true, exploreRadius: WORLD3D.exploreRadius };
+  // D111: no assault announcements - the world carries that information.
+  game.rules = { ...game.rules, buildReach: BUILD.lookReach, solidTowers: true, exploreRadius: WORLD3D.exploreRadius, announceAssaults: false };
   recomputeVisibility(game, true);
   field = buildHeightField(game.map);
+  // D109: Towers fire on what they can physically see in this 3D scene.
+  game.rules.towerSight = createTowerSight(field);
   const terrain = buildTerrainScene(game.map, field);
   scene.add(terrain.group);
   world = {
@@ -135,6 +146,7 @@ function startRun(seed, archetype) {
   endShown = false;
   lastHp = game.player.hp;
   setBuild(false);
+  weather.reset();
   $('select-overlay').hidden = true;
   $('end-overlay').hidden = true;
   $('pause-overlay').hidden = true;
@@ -185,6 +197,15 @@ document.addEventListener('mousedown', (e) => {
   if (e.button === 0) primaryAction();
   if (e.button === 2) cancelStep();
 });
+// D113: the wheel swaps weapons outside build mode.
+let wheelAt = 0;
+document.addEventListener('wheel', (e) => {
+  if (!locked || !game || game.paused || ui.buildMode || Math.abs(e.deltaY) < 1) return;
+  const now = performance.now();
+  if (now - wheelAt < 220) return;
+  wheelAt = now;
+  switchWeapon(game);
+}, { passive: true });
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // --- build / interact -----------------------------------------------------------------
@@ -212,7 +233,12 @@ function nearTower(t) {
 
 function primaryAction() {
   const g = game;
-  if (!ui.buildMode) { meleeQueued = true; return; }
+  // D113: outside build mode the left button uses the weapon in hand.
+  if (!ui.buildMode) {
+    if (g.player.weapon === 'crossbow') fireBolt();
+    else meleeQueued = true;
+    return;
+  }
   if (ui.buildType === 'wall') {
     const pickRes = wallAnchorFromPick(look.target);
     if (!pickRes.ok) { if (pickRes.reason) wallNotice(pickRes.reason); return; }
@@ -233,6 +259,31 @@ function primaryAction() {
   if (res.ok) setBuild(false);
 }
 
+/** D113: aim a bolt down the crosshair against the 3D scene, then let the sim resolve it. */
+function fireBolt() {
+  const g = game;
+  if (g.player.boltCd > 0) return;
+  const origin = camera.position.clone();
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  const maxDist = PLAYER.crossbow.range * S;
+  const ground = raycastTerrain(field, origin, dir, maxDist);
+  const targets = lookTargets(g).filter((t) => !(t.kind === 'tower' && t.ref.id === g.player.perchId) && t.kind !== 'site');
+  const hit = pickTarget(field, origin, dir, targets, maxDist, ground ? ground.distance : Infinity);
+  const along = hit ? hit.distance : ground ? ground.distance : maxDist;
+  const point = origin.clone().addScaledVector(dir, along);
+  const x = point.x / S;
+  const y = point.z / S;
+  const from = origin.clone().addScaledVector(dir, 0.6).add(new THREE.Vector3(0, -0.15, 0));
+  fireCrossbow(g, {
+    enemyId: hit?.kind === 'enemy' ? hit.ref.id : null,
+    nestId: hit?.kind === 'nest' ? hit.ref.id : null,
+    ground: !!(hit || ground),
+    x, y, z: point.y - heightAt(field, x, y),
+    from3d: { x: from.x, y: from.y, z: from.z },
+  });
+}
+
 function interact() {
   const g = game;
   if (g.player.perchId != null) { leavePerch(g, facingFromYaw(yaw)); camY = null; return; }
@@ -247,6 +298,12 @@ function lookedTower(range = WORLD3D.interactRange) {
   const t = look.target;
   if (t?.kind === 'tower' && Math.hypot(t.ref.x - game.player.x, t.ref.y - game.player.y) <= range) return t.ref;
   return game.towers.find((o) => o.id === game.player.perchId) || null;
+}
+
+function lookedBuilding(range = WORLD3D.interactRange) {
+  const t = look.target;
+  if (t?.kind === 'building' && !t.ref.destroyed && Math.hypot(t.ref.x - game.player.x, t.ref.y - game.player.y) <= range) return t.ref;
+  return null;
 }
 
 // --- keys ---------------------------------------------------------------------------------
@@ -270,12 +327,20 @@ window.addEventListener('keydown', (e) => {
     case 'Digit4': toggleBuild('quarry'); break;
     case 'Digit5': toggleBuild('mine'); break;
     case 'KeyQ': cancelStep(); break;
+    case 'KeyF': switchWeapon(game); break;
     case 'KeyE': interact(); break;
     case 'KeyG': {
+      // D110: G puts a free person to work or on the walls; Shift+G sends one back.
+      const b = lookedBuilding();
+      if (b) {
+        const res = assignWorkers(game, b, e.shiftKey ? -1 : 1);
+        if (!res.ok && !e.repeat) game.log.unshift({ text: `Cannot ${e.shiftKey ? 'withdraw' : 'assign'}: ${res.reason}.`, t: game.time });
+        break;
+      }
       const t = lookedTower();
       if (t) {
         const res = assignGarrison(game, t, e.shiftKey ? -1 : 1);
-        if (!res.ok && !e.shiftKey) game.log.unshift({ text: `Cannot garrison: ${res.reason}.`, t: game.time });
+        if (!res.ok && !e.shiftKey && !e.repeat) game.log.unshift({ text: `Cannot garrison: ${res.reason}.`, t: game.time });
       }
       break;
     }
@@ -297,6 +362,9 @@ window.addEventListener('keydown', (e) => {
     case 'F2': toggleFly(); break;
     case 'F3': debugFlags.info = !debugFlags.info; break;
     case 'F4': teleportKeep(); break;
+    case 'F6': debugFlags.los = !debugFlags.los; break;
+    case 'F7': cycleWeather(game, e.shiftKey); break;
+    case 'F8': debugFlags.intel = !debugFlags.intel; break;
     default: break;
   }
 });
@@ -335,6 +403,8 @@ for (const button of document.querySelectorAll('[data-dbg]')) {
     else if (key === 'spawn') debugSpawn();
     else if (key === 'spawnpause') game.debug.spawnPaused = !game.debug.spawnPaused;
     else if (key === 'regen') { startRun(randomSeed(), game.archetypeKey); }
+    else if (key === 'weather') cycleWeather(game);
+    else if (key === 'weatherFast') cycleWeather(game, true);
     refreshDebugButtons();
   });
 }
@@ -507,12 +577,19 @@ function debugInfo(g) {
   const p = g.player;
   const heading = headingDegrees(p.facing.x, p.facing.y);
   const hit = look.hit ? `${look.hit.x.toFixed(1)}, ${look.hit.y.toFixed(1)}` : '—';
+  const wx = weatherState(g);
+  const pop = populationState(g);
+  const tower = look.target?.kind === 'tower' ? look.target.ref : g.towers.find((t) => t.id === g.player.perchId);
   el.textContent = [
     `tile ${p.x.toFixed(2)}, ${p.y.toFixed(2)}  world ${(p.x * S).toFixed(1)}, ${camera.position.y.toFixed(1)}, ${(p.y * S).toFixed(1)}`,
     `heading ${heading.toFixed(0)}°  pitch ${(pitch * 57.3).toFixed(0)}°  ${fly.on ? 'FLY' : ''}`,
     `crosshair tile ${hit}  target ${look.target ? look.target.kind : '—'}`,
     `fps ${fps.toFixed(0)}  draw calls ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k`,
-    `enemies ${g.enemies.length}  phase ${g.phase} ${g.phaseLeft.toFixed(1)}s`,
+    `enemies ${g.enemies.length}  phase ${g.phase} ${g.phaseLeft.toFixed(1)}s  assault in ${assaultIn(g).toFixed(0)}s  wave ${g.wave}  from ${(g.spawnSides || []).join('+')}`,
+    `weather ${wx.kind} ${(wx.blend * 100).toFixed(0)}%  vis ${wx.visibility.toFixed(2)}  next ${Number.isFinite(wx.timeLeft) ? wx.timeLeft.toFixed(0) : '-'}s`,
+    `people ${pop.total}/${pop.support}  work ${pop.workers}  guard ${pop.garrison}  free ${pop.free}${pop.shortage ? `  SHORTAGE grace ${pop.graceLeft.toFixed(0)}s` : pop.growthIn != null ? `  next in ${pop.growthIn.toFixed(0)}s` : ''}`,
+    `jobs ${buildingState(g).filter((b) => !b.destroyed).map((b) => `${b.type[0]}${b.id}:${b.workers}/${b.slots}`).join(' ') || '-'}`,
+    tower ? `tower #${tower.id} target ${tower.targetId ?? '-'}  nest ${tower.nestTargetId ?? '-'}  cd ${Math.max(0, tower.shotCd).toFixed(2)}  garrison ${tower.garrison || 0}${tower.alarmUntil > g.time ? '  ALARM' : ''}` : 'tower -',
   ].join('\n');
 }
 
@@ -526,7 +603,15 @@ function frame(now) {
   fps += ((dt > 0 ? 1 / dt : 60) - fps) * 0.05;
   if (!game || !world) { renderer.render(scene, camera); return; }
   stepGame(dt);
+  renderFrame();
+}
+
+function renderFrame() {
+  // Stats cover the world pass only; the weapon pass is drawn after reading them.
+  renderer.info.autoReset = true;
   renderer.render(scene, camera);
+  renderer.info.autoReset = false;
+  if (game && game.status === 'playing') viewModel.render(renderer);
 }
 
 function stepGame(dt, { render = true } = {}) {
@@ -557,9 +642,19 @@ function stepGame(dt, { render = true } = {}) {
   }
   updateCamera(g, dt);
   updateLook(g);
+  // D112: weather changes what the eye can see; D113: the weapon in hand.
+  const sky = weather.update(g, g.paused ? 0 : dt, camera);
+  audio.setAmbience({ rain: g.paused ? 0 : sky.rain, wind: g.paused ? 0 : sky.wind });
+  if (sky.thunder && !g.paused) audio.playEvents([{ type: 'thunder', x: g.player.x, y: g.player.y }], g.player, false);
+  const moving = !g.paused && Math.hypot(g.player.vx || 0, g.player.vy || 0) > 0.5 ? 1 : 0;
+  viewModel.update(g, g.paused ? 0 : dt, { moving, sprint: keys.has('ShiftLeft') || keys.has('ShiftRight'), hidden: fly.on, dim: sky.dim });
   world.entities.sync(g, g.paused ? 0 : dt);
-  const inspectTower = !ui.buildMode && look.target?.kind === 'tower' && look.target.ref.built
-    && Math.hypot(look.target.ref.x - g.player.x, look.target.ref.y - g.player.y) <= WORLD3D.interactRange ? look.target.ref : null;
+  // The firing annulus shows for the Tower you look at, or the one you stand on.
+  const perched = g.player.perchId != null ? g.towers.find((t) => t.id === g.player.perchId) : null;
+  const inspectTower = ui.buildMode ? null
+    : look.target?.kind === 'tower' && look.target.ref.built
+      && Math.hypot(look.target.ref.x - g.player.x, look.target.ref.y - g.player.y) <= WORLD3D.interactRange ? look.target.ref
+      : perched && perched.built ? perched : null;
   world.overlays.update(g, {
     buildMode: ui.buildMode, buildType: ui.buildType, site: ui.site,
     wall: ui.wall, inspectTower, debug: debugFlags,
@@ -574,7 +669,7 @@ function stepGame(dt, { render = true } = {}) {
   hudAt += dt;
   if (render && (hudAt > 0.08 || g.paused)) {
     hudAt = 0;
-    updateHud(g, look, ui);
+    updateHud(g, look, ui, debugFlags);
     debugInfo(g);
     refreshDebugButtons();
   }
@@ -612,6 +707,8 @@ window.holdfast = {
       window.dispatchEvent(new KeyboardEvent('keyup', { code, shiftKey: shift }));
     },
     primary: () => primaryAction(),
+    weapon: (w) => switchWeapon(game, w),
+    weather: (kind, instant = false) => setWeather(game, kind, { duration: 240, blendSeconds: instant ? 0 : undefined, forced: true }),
     cancel: () => cancelStep(),
     interact: () => interact(),
     ui: () => ({ buildMode: ui.buildMode, buildType: ui.buildType, site: ui.site && { x: ui.site.x, y: ui.site.y, ok: ui.site.check.ok, reasons: ui.site.check.reasons },
@@ -619,7 +716,7 @@ window.holdfast = {
     /** Advance simulation + scene by N fixed steps (renders the last one). */
     step(seconds, dt = 1 / 30) {
       for (let t = 0; t < seconds; t += dt) stepGame(dt, { render: t + dt >= seconds });
-      renderer.render(scene, camera);
+      renderFrame();
     },
     camera: () => ({ x: camera.position.x, y: camera.position.y, z: camera.position.z, yaw, pitch }),
     stats: () => ({ ...world.entities.stats(), calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, fps }),
@@ -638,6 +735,8 @@ window.holdfast = {
     wallState: () => wallState(game),
     nestState: () => nestState(game),
     garrisonState: () => garrisonState(game),
+    populationState: () => populationState(game),
+    weatherState: () => weatherState(game),
     resourceState: () => resourceState(game),
     keepState: () => keepState(game),
     forceNextWave: () => forceNextWave(game),

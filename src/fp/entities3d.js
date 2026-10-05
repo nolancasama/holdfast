@@ -3,10 +3,12 @@
 // writes gameplay fields, and adds renderer-only effects (debris, dust, shots).
 
 import * as THREE from 'three';
-import { WORLD3D, WALL, TOWER } from '../config.js';
+import { MAP, T, WORLD3D, WALL, TOWER, WATCH } from '../config.js';
 import { heightAt } from './space.js';
-import { towerConnectivity } from '../game.js';
-import { MAT, makeTower, makeKeep, makeWallSegment, makeFarm, makeQuarry, makeMine, makeNest, makeEnemy } from './models.js';
+import { turretYaw } from './sight.js';
+import { towerConnectivity, assaultIn } from '../game.js';
+import { weatherParams } from '../weather.js';
+import { MAT, makeTower, makeKeep, makeWallSegment, makeFarm, makeQuarry, makeMine, makeNest, makeEnemy, makeWorker } from './models.js';
 
 const S = WORLD3D.tileMeters;
 const STONE = new THREE.Color('#b1a898');
@@ -26,6 +28,19 @@ function softTexture() {
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
+}
+
+/** The nearest Forest tile within `r` tiles (for birds), or null. */
+function forestNear(map, x, y, r) {
+  let best = null;
+  for (let k = 0; k < 24; k++) {
+    const tx = Math.floor(x + (Math.random() - 0.5) * 2 * r);
+    const ty = Math.floor(y + (Math.random() - 0.5) * 2 * r);
+    if (tx < 0 || ty < 0 || tx >= MAP.w || ty >= MAP.h || map.kind[ty * MAP.w + tx] !== T.FOREST) continue;
+    const d = Math.hypot(tx - x, ty - y);
+    if (!best || d < best.d) best = { x: tx + 0.5, y: ty + 0.5, d };
+  }
+  return best;
 }
 
 /** Lowest ground under a circular footprint, so bases never float. */
@@ -62,16 +77,29 @@ export function createEntityLayer(scene, field) {
   shotLines.frustumCulled = false;
   root.add(shotLines);
   const shots = [];
-  // WebGL lines are one pixel wide, so each shot also carries a glowing bolt.
+  // WebGL lines are one pixel wide, so each shot also carries a glowing bolt
+  // and (D109) a solid streak several metres long, readable from 20-30 m.
   const boltMat = new THREE.SpriteMaterial({ map: tex, color: '#ffe7a8', blending: THREE.AdditiveBlending, depthWrite: false, transparent: true });
   const bolts = [];
+  const streaks = [];
+  const streakGeo = new THREE.CylinderGeometry(0.1, 0.1, 1, 5, 1, true);
+  streakGeo.translate(0, 0.5, 0); // origin at the tail; +Y towards the head
   for (let k = 0; k < 64; k++) {
     const b = new THREE.Sprite(boltMat);
-    b.scale.setScalar(0.9);
+    b.scale.setScalar(1.3);
     b.visible = false;
     root.add(b);
     bolts.push(b);
+    const st = new THREE.Mesh(streakGeo, new THREE.MeshBasicMaterial({
+      color: '#ffe7a8', transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    st.visible = false;
+    st.frustumCulled = false;
+    root.add(st);
+    streaks.push(st);
   }
+  const UP = new THREE.Vector3(0, 1, 0);
+  const tmpDir = new THREE.Vector3();
 
   const MAX_PARTICLES = 2400;
   const partGeo = new THREE.BufferGeometry();
@@ -84,7 +112,42 @@ export function createEntityLayer(scene, field) {
   root.add(partPoints);
   const localParticles = []; // { x, y, z, vx, vy, vz, t, life, color, gravity }
 
-  const DUST_MAX = 600;
+  // D111: birds scattering from woods - a far cue that something is moving.
+  const BIRDS = 160;
+  const birdGeo = new THREE.BufferGeometry();
+  birdGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BIRDS * 3), 3));
+  const birdPoints = new THREE.Points(birdGeo, new THREE.PointsMaterial({ color: '#1d1a18', size: 0.55, transparent: true, opacity: 0.9, depthWrite: false }));
+  birdPoints.frustumCulled = false;
+  root.add(birdPoints);
+  const birds = [];
+  let flockClock = 2;
+  let warnFlockDone = false;
+  function spawnFlock(x, y, fromX, fromY) {
+    const away = Math.atan2(y - fromY, x - fromX);
+    const base = heightAt(field, x, y) + 6;
+    for (let k = 0; k < 14 && birds.length < BIRDS; k++) {
+      const a = away + (Math.random() - 0.5) * 1.2;
+      const sp = 7 + Math.random() * 4;
+      birds.push({ x: x * S + (Math.random() - 0.5) * 6, y: base + Math.random() * 3, z: y * S + (Math.random() - 0.5) * 6,
+        vx: Math.cos(a) * sp, vy: 3 + Math.random() * 2.5, vz: Math.sin(a) * sp, t: 0, life: 9 + Math.random() * 3, ph: Math.random() * 6 });
+    }
+  }
+  function updateBirds(dt) {
+    const bp = birdGeo.getAttribute('position');
+    let n = 0;
+    for (let i = birds.length - 1; i >= 0; i--) {
+      const b = birds[i];
+      b.t += dt;
+      if (b.t >= b.life) { birds.splice(i, 1); continue; }
+      b.vy *= 1 - 0.35 * dt;
+      b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+      bp.setXYZ(n++, b.x, b.y + Math.sin(b.t * 14 + b.ph) * 0.25, b.z);
+    }
+    birdGeo.setDrawRange(0, n);
+    bp.needsUpdate = true;
+  }
+
+  const DUST_MAX = 1200;
   const dustGeo = new THREE.BufferGeometry();
   dustGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(DUST_MAX * 3), 3));
   const dustPoints = new THREE.Points(dustGeo, new THREE.PointsMaterial({
@@ -133,13 +196,14 @@ export function createEntityLayer(scene, field) {
     if (d < 30) shake = Math.min(1, shake + amount * (1 - d / 30));
   };
 
-  function spawnFlash(pos, scale = 1.6) {
+  function spawnFlash(pos, scale = 1.6, life = 0.08) {
     const f = flashes[flashCursor++ % flashes.length];
     f.sprite.position.copy(pos);
     f.sprite.scale.setScalar(scale);
     f.sprite.visible = true;
     f.t = 0;
-    f.life = 0.08;
+    f.life = life;
+    f.scale = scale;
   }
 
   function spawnRing(x, y, radiusTiles, color, life) {
@@ -213,17 +277,26 @@ export function createEntityLayer(scene, field) {
       // Turret tracks its current target (enemy or nest).
       const target = enemyById.get(t.targetId) || nestById.get(t.nestTargetId);
       if (target && t.built) {
-        const want = Math.atan2(-(target.x - t.x), -(target.y - t.y));
+        const want = turretYaw(t, target);
         let diff = want - u.gun.rotation.y;
         diff = Math.atan2(Math.sin(diff), Math.cos(diff));
         u.gun.rotation.y += diff * 0.35;
       }
+      // D109: recoil kicks the turret back along its barrel, then settles.
+      const kick = u.gun.userData.kick || 0;
+      u.gun.position.x = Math.sin(u.gun.rotation.y) * kick * 0.28;
+      u.gun.position.z = Math.cos(u.gun.rotation.y) * kick * 0.28;
+      u.gun.userData.kick = Math.max(0, kick - 0.12);
+      // D111: a Tower whose lookouts see the army streams a red pennant.
+      const alarmed = t.alarmUntil > g.time;
       if (!t.keep) {
         const conn = towerConnectivity(g, t);
-        u.pennant.material = conn === 'outpost' ? MAT.bannerOutpost : MAT.bannerConnected;
-        u.pennant.rotation.y = Math.sin(g.time * 2 + t.id) * 0.3;
+        u.pennant.material = alarmed ? MAT.bannerAlarm : conn === 'outpost' ? MAT.bannerOutpost : MAT.bannerConnected;
+        u.pennant.rotation.y = Math.sin(g.time * (alarmed ? 11 : 2) + t.id) * (alarmed ? 0.5 : 0.3);
+        u.pennant.scale.setScalar(alarmed ? 1.5 : 1);
       } else {
-        u.flag.rotation.y = Math.sin(g.time * 1.6) * 0.18;
+        u.flag.material = alarmed ? MAT.bannerAlarm : MAT.banner;
+        u.flag.rotation.y = Math.sin(g.time * (alarmed ? 9 : 1.6)) * (alarmed ? 0.4 : 0.18);
       }
       u.soldiers.forEach((s, k) => { s.visible = t.built && (t.garrison || 0) > k; });
       // Your own turret would fill the view while you stand on its platform.
@@ -341,6 +414,27 @@ export function createEntityLayer(scene, field) {
         u.rows.scale.y = b.built ? 1 + Math.sin(g.time * 1.3 + b.id) * 0.05 : 0.4;
       }
       if (b.type === 'quarry' && u.crane && b.built) u.crane.rotation.y = Math.sin(g.time * 0.5 + b.id) * 0.6;
+      // D110: cosmetic workers at their posts - a figure per assigned worker.
+      if (!u.crew) {
+        u.crew = [];
+        const tool = b.type === 'farm' ? 'hoe' : b.type === 'quarry' ? 'hammer' : 'pick';
+        const spots = b.type === 'farm' ? [[1.2, 0.8]] : b.type === 'quarry' ? [[0.6, -0.4], [1.9, -0.6]] : [[-0.6, 1.5], [0.8, 1.6]];
+        for (const [sx, sz] of spots) {
+          const w = makeWorker(tool);
+          w.position.set(sx, 0, sz);
+          w.rotation.y = Math.atan2(-sx, -sz) + Math.PI;
+          w.visible = false;
+          obj.add(w);
+          u.crew.push(w);
+        }
+      }
+      u.crew.forEach((w, k) => {
+        w.visible = b.built && (b.workers || 0) > k;
+        if (!w.visible) return;
+        const ph = g.time * (b.type === 'farm' ? 2.2 : 3.4) + k * 1.7 + b.id;
+        w.userData.arm.rotation.x = Math.sin(ph) * (b.type === 'farm' ? 0.45 : 0.8) - 0.2;
+        w.userData.body.rotation.x = b.type === 'farm' ? 0.25 + Math.sin(ph) * 0.12 : Math.max(0, Math.sin(ph)) * 0.15;
+      });
       if (b.flash > 0) obj.position.y = footprintBase(field, b.x, b.y, 0.9) + Math.sin(g.time * 60) * 0.05;
     }
     for (const [id, obj] of buildings) {
@@ -482,8 +576,11 @@ export function createEntityLayer(scene, field) {
     const t = g.towers.find((o) => Math.abs(o.x - x) < 1e-6 && Math.abs(o.y - y) < 1e-6);
     const obj = t && towers.get(t.id);
     if (obj) {
-      const m = obj.userData.gun.userData.muzzle.clone();
-      obj.userData.gun.localToWorld(m);
+      const gun = obj.userData.gun;
+      gun.updateWorldMatrix(true, false);
+      const m = gun.userData.muzzle.clone();
+      gun.localToWorld(m);
+      gun.userData.kick = 1; // D109: recoil
       return m;
     }
     return new THREE.Vector3(x * S, heightAt(field, x, y) + WORLD3D.towerHeight + 1, y * S);
@@ -493,11 +590,19 @@ export function createEntityLayer(scene, field) {
     for (const tr of g.tracers) {
       if (tr._seen) continue;
       tr._seen = true;
-      const from = muzzleOf(g, tr.x0, tr.y0);
-      const to = new THREE.Vector3(tr.x1 * S, heightAt(field, tr.x1, tr.y1) + 0.8, tr.y1 * S);
-      const color = new THREE.Color(tr.color || '#cfd6e0').lerp(new THREE.Color('#ffd27a'), 0.4);
-      if (shots.length < MAX_SHOTS) shots.push({ from, to, t: 0, life: Math.max(0.1, from.distanceTo(to) / 55), color });
-      spawnFlash(from, 1.4);
+      const player = tr.kind === 'bolt';
+      const from = tr.from3d ? new THREE.Vector3(tr.from3d.x, tr.from3d.y, tr.from3d.z) : muzzleOf(g, tr.x0, tr.y0);
+      const to = new THREE.Vector3(tr.x1 * S, heightAt(field, tr.x1, tr.y1) + (tr.z1 ?? 0.9), tr.y1 * S);
+      const color = new THREE.Color(tr.color || '#cfd6e0').lerp(new THREE.Color('#ffd27a'), player ? 0.1 : 0.4);
+      if (shots.length < MAX_SHOTS) {
+        shots.push({ from, to, t: 0, life: Math.max(0.08, from.distanceTo(to) / (player ? 90 : 60)), color, player, impact: tr.hit !== false });
+      }
+      if (!player) {
+        // D109: a muzzle flash big enough to read at 30 m, and a breath of smoke.
+        spawnFlash(from, 3.2, 0.12);
+        localParticles.push({ x: from.x, y: from.y, z: from.z, vx: (Math.random() - 0.5) * 0.6, vy: 0.9, vz: (Math.random() - 0.5) * 0.6,
+          t: 0, life: 0.7, color: new THREE.Color('#bdb6a8'), gravity: 0.4 });
+      }
     }
     for (const p of g.particles) {
       if (p._seen) continue;
@@ -523,24 +628,45 @@ export function createEntityLayer(scene, field) {
       const s = shots[i];
       s.t += dt;
       if (s.t >= s.life) {
-        // Impact spark at the target end.
-        puff(s.to.x / S, s.to.z / S, s.to.y - heightAt(field, s.to.x / S, s.to.z / S), '#ffe2a0', 4, 3);
+        // Impact: a bright spark and a short flash where the shot lands.
+        if (s.impact) {
+          puff(s.to.x / S, s.to.z / S, s.to.y - heightAt(field, s.to.x / S, s.to.z / S), '#fff0b8', s.player ? 6 : 9, 4);
+          spawnFlash(s.to, s.player ? 1.2 : 1.9, 0.1);
+        }
         shots.splice(i, 1);
         continue;
       }
       const a = Math.min(1, s.t / s.life);
-      const b = Math.max(0, a - 0.35);
-      sp.setXYZ(n * 2, s.from.x + (s.to.x - s.from.x) * b, s.from.y + (s.to.y - s.from.y) * b, s.from.z + (s.to.z - s.from.z) * b);
-      sp.setXYZ(n * 2 + 1, s.from.x + (s.to.x - s.from.x) * a, s.from.y + (s.to.y - s.from.y) * a, s.from.z + (s.to.z - s.from.z) * a);
+      const len = s.from.distanceTo(s.to) || 1;
+      const b = Math.max(0, a - (s.player ? 1.6 : 4.5) / len);
+      const ax = s.from.x + (s.to.x - s.from.x) * a;
+      const ay = s.from.y + (s.to.y - s.from.y) * a;
+      const az = s.from.z + (s.to.z - s.from.z) * a;
+      const bx = s.from.x + (s.to.x - s.from.x) * b;
+      const by = s.from.y + (s.to.y - s.from.y) * b;
+      const bz = s.from.z + (s.to.z - s.from.z) * b;
+      sp.setXYZ(n * 2, bx, by, bz);
+      sp.setXYZ(n * 2 + 1, ax, ay, az);
       sc.setXYZ(n * 2, s.color.r * 0.3, s.color.g * 0.3, s.color.b * 0.3);
       sc.setXYZ(n * 2 + 1, s.color.r, s.color.g, s.color.b);
       if (n < bolts.length) {
         bolts[n].visible = true;
-        bolts[n].position.set(s.from.x + (s.to.x - s.from.x) * a, s.from.y + (s.to.y - s.from.y) * a, s.from.z + (s.to.z - s.from.z) * a);
+        bolts[n].position.set(ax, ay, az);
+        bolts[n].scale.setScalar(s.player ? 0.5 : 1.3);
+        const st = streaks[n];
+        tmpDir.set(ax - bx, ay - by, az - bz);
+        const sl = tmpDir.length();
+        st.visible = sl > 0.01;
+        if (st.visible) {
+          st.position.set(bx, by, bz);
+          st.quaternion.setFromUnitVectors(UP, tmpDir.divideScalar(sl));
+          st.scale.set(s.player ? 0.6 : 1, sl, s.player ? 0.6 : 1);
+          st.material.color.copy(s.color);
+        }
       }
       n++;
     }
-    for (let k = n; k < bolts.length; k++) bolts[k].visible = false;
+    for (let k = n; k < bolts.length; k++) { bolts[k].visible = false; streaks[k].visible = false; }
     shotGeo.setDrawRange(0, n * 2);
     sp.needsUpdate = true;
     sc.needsUpdate = true;
@@ -549,6 +675,7 @@ export function createEntityLayer(scene, field) {
       if (!f.sprite.visible) continue;
       f.t += dt;
       if (f.t >= f.life) f.sprite.visible = false;
+      else f.sprite.scale.setScalar((f.scale || 1.6) * (1 - 0.5 * f.t / f.life));
     }
     for (const r of rings) {
       if (!r.mesh.visible) continue;
@@ -615,16 +742,48 @@ export function createEntityLayer(scene, field) {
     pp.needsUpdate = true;
     pc.needsUpdate = true;
 
-    // D101 warning: dust raised at the road mouths an assault will use.
-    if (g.phase === 'warning' || g.phase === 'combat') {
+    // D111: the assault is read from the world, not the HUD. Dust rises at the
+    // road mouths it will use, thickening as it nears, then hangs over the
+    // marching columns. Rain wets the ground and keeps the dust down.
+    const wx = weatherParams(g);
+    const damp = 1 - 0.7 * Math.min(1, wx.rain);
+    const lead = g.phase === 'prep' ? WATCH.mouthDustLead - assaultIn(g) : 0;
+    const mouthRate = g.phase === 'warning' ? 14 : g.phase === 'combat' && g.pendingSpawns?.length ? 8
+      : lead > 0 ? 3 + 9 * (lead / WATCH.mouthDustLead) : 0;
+    if (mouthRate > 0) {
       const mouths = (g.spawnSides || []).flatMap((side) => g.map.spawns?.[side] || []);
       for (const mouth of mouths) {
-        if (dust.length >= DUST_MAX || Math.random() > dt * (g.phase === 'warning' ? 14 : 6)) continue;
+        if (dust.length >= DUST_MAX || Math.random() > dt * mouthRate * damp) continue;
         const x = mouth.x + 0.5 + (Math.random() - 0.5) * 6;
         const y = mouth.y + 0.5 + (Math.random() - 0.5) * 6;
         dust.push({ x: x * S, y: heightAt(field, x, y) + 2, z: y * S, vy: 3 + Math.random() * 3, t: 0, life: 6 + Math.random() * 4 });
       }
     }
+    if (g.phase === 'combat') {
+      for (const e of g.enemies) {
+        if (e.wild || dust.length >= DUST_MAX) continue;
+        if (Math.random() > dt * (e.type === 'heavy' ? 1.6 : 0.55) * damp) continue;
+        dust.push({ x: e.x * S + (Math.random() - 0.5) * 3, y: heightAt(field, e.x, e.y) + 1.2, z: e.y * S + (Math.random() - 0.5) * 3,
+          vy: 2 + Math.random() * 2, t: 0, life: 5 + Math.random() * 3 });
+      }
+      // Birds put up from woods the army passes.
+      flockClock -= dt;
+      if (flockClock <= 0) {
+        flockClock = 3 + Math.random() * 4;
+        const army = g.enemies.filter((e) => !e.wild);
+        const e = army[Math.floor(Math.random() * army.length)];
+        const wood = e && forestNear(g.map, e.x, e.y, 5);
+        if (wood) spawnFlock(wood.x, wood.y, e.x, e.y);
+      }
+    } else if (g.phase === 'warning' && !warnFlockDone) {
+      warnFlockDone = true;
+      const mouths = (g.spawnSides || []).flatMap((side) => g.map.spawns?.[side] || []);
+      const m = mouths[Math.floor(Math.random() * mouths.length)];
+      const wood = m && forestNear(g.map, m.x, m.y, 14);
+      if (wood) spawnFlock(wood.x, wood.y, m.x, m.y);
+    }
+    if (g.phase !== 'warning') warnFlockDone = false;
+    updateBirds(dt);
     const dp = dustGeo.getAttribute('position');
     let q = 0;
     for (let i = dust.length - 1; i >= 0; i--) {

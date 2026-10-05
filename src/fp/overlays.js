@@ -6,6 +6,7 @@
 import * as THREE from 'three';
 import { MAP, WORLD3D, TOWER, NEST } from '../config.js';
 import { heightAt } from './space.js';
+import { debugTowerSight } from './sight.js';
 import { towerStats, towerMinRange, enemyKeepField } from '../game.js';
 import { makeTower, makeFarm, makeQuarry, makeMine, setGroupMaterial, ghostMaterial } from './models.js';
 import { disposeTree } from './terrain3d.js';
@@ -184,6 +185,40 @@ export function createOverlays(scene, field) {
         debugRoot.add(inst);
       }
     }
+    if (flags.los) {
+      // D109: each nearby Tower's sight lines - green to its target, red to an
+      // in-annulus enemy it cannot see (ending where the line is blocked).
+      const pts = [];
+      const cols = [];
+      const push = (a, b, c) => {
+        pts.push(a.x * S, a.z, a.y * S, b.x * S, b.z, b.y * S);
+        cols.push(c.r, c.g, c.b, c.r, c.g, c.b);
+      };
+      const green = new THREE.Color('#5dff7a');
+      const red = new THREE.Color('#ff4a3a');
+      const grey = new THREE.Color('#6a5a5a');
+      for (const t of g.towers) {
+        if (!t.built || Math.hypot(t.x - p.x, t.y - p.y) > 45) continue;
+        const range = towerStats(g, t).range;
+        const minR = towerMinRange(g, t);
+        for (const e of g.enemies) {
+          const d = Math.hypot(e.x - t.x, e.y - t.y);
+          if (d < minR || d > range) continue;
+          const tr = debugTowerSight(g.map, field, t, e.x, e.y, e);
+          if (tr.clear) push(tr.from, tr.to, e.id === t.targetId ? green : grey);
+          else { push(tr.from, tr.at, red); push(tr.at, tr.to, grey); }
+        }
+      }
+      if (pts.length) {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+        geo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+        const lines = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false, transparent: true }));
+        lines.renderOrder = 9;
+        lines.userData.ownGeo = true;
+        debugRoot.add(lines);
+      }
+    }
     if (flags.paths) {
       const field2 = enemyKeepField(g, 'swarm');
       if (field2) {
@@ -289,9 +324,10 @@ export function createOverlays(scene, field) {
       if (!showFoot) clearFootprint();
 
       const flags = view.debug || {};
-      const any = flags.ranges || flags.nests || flags.blockers || flags.paths;
+      const any = flags.ranges || flags.nests || flags.blockers || flags.paths || flags.los;
+      const every = flags.los ? 0.12 : 0.5;
       if (!any && debugRoot.children.length) rebuildDebug(g, {});
-      else if (any && (g.time - debugAt > 0.5 || g.time < debugAt)) { debugAt = g.time; rebuildDebug(g, flags); }
+      else if (any && (g.time - debugAt > every || g.time < debugAt)) { debugAt = g.time; rebuildDebug(g, flags); }
     },
   };
 }
