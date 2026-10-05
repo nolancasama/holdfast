@@ -49,6 +49,10 @@ export function createGame(seedString, archetypeKey, mapOverride = null) {
     occupiedTowerId: null,
     shelter: { towerId: null, progress: 0, required: PLAYER.shelterTime },
     input: { mx: 0, my: 0, melee: false, repair: false },
+    // D101: presentation-selected rules. The 2D classic keeps the defaults;
+    // the first-person shell builds at the crosshair and treats towers as solid.
+    rules: { buildReach: BUILD.reach, solidTowers: false },
+    repairFocus: null,
     playerField: null, playerFieldAt: -99,
     blockerGrid: new Array(MAP.w * MAP.h).fill(null),
     blockerVersion: 0,
@@ -172,6 +176,13 @@ export function recomputeVisibility(g, force = false) {
 
   for (let i = 0; i < g.fog.visible.length; i++) {
     if (g.fog.visible[i]) g.fog.explored[i] = 1;
+  }
+  // D101: in first person the player sees much farther than live tactical
+  // vision; terrain in sight is remembered on the minimap (explored only, so
+  // tower targeting and live hostile information are unchanged).
+  const explore = g.rules?.exploreRadius || 0;
+  if (explore > VISION.player) {
+    for (const i of tilesVisibleFrom(g.map, g.player.x, g.player.y, explore)) g.fog.explored[i] = 1;
   }
   cache.playerTile = playerTile;
   cache.towerSignature = towerSignature;
@@ -443,8 +454,9 @@ export function tryBuild(g, x, y, buildType = g.buildType || 'tower') {
   const type = normalizeBuildType(buildType);
   const check = canPlaceAt(g, x, y, type);
   if (g.paused) return { ...check, ok: false, reason: 'paused', reasons: [...check.reasons, 'paused'] };
-  if (Math.hypot(g.player.x - x, g.player.y - y) > BUILD.reach + 1e-6) {
-    const reason = 'stand at the site to build';
+  const reach = g.rules?.buildReach ?? BUILD.reach;
+  if (Math.hypot(g.player.x - x, g.player.y - y) > reach + 1e-6) {
+    const reason = reach > BUILD.reach ? 'move closer to the site' : 'stand at the site to build';
     return { ...check, ok: false, reason, reasons: [...check.reasons, reason] };
   }
   if (!check.ok) return check;
@@ -1363,7 +1375,50 @@ export function playerSpeed(g) {
     * (hasEquipment(g, 'boots') ? DROP.equipment.boots.playerSpeed : 1);
   const road = inBounds(tx, ty) && g.map.road[idx(tx, ty)] ? PLAYER.roadSpeedMult : 1;
   const cost = moveCostAt(g.map, tx, ty);
-  return PLAYER.speed * speedBoost * road / (Number.isFinite(cost) ? cost : 1);
+  // D101: first-person walk/sprint gait; the 2D classic never sets it.
+  const gait = Number.isFinite(g.input?.speedMult) ? g.input.speedMult : 1;
+  return PLAYER.speed * speedBoost * road * gait / (Number.isFinite(cost) ? cost : 1);
+}
+
+/**
+ * D101: climb onto a finished tower's platform. The player's logical position
+ * becomes the tower centre (so occupancy and its bonuses apply) until they
+ * climb down; a collapse still hurts anyone inside the footprint (D6).
+ */
+export function perchOnTower(g, towerOrId) {
+  const t = typeof towerOrId === 'object' ? towerOrId : g.towers.find((o) => o.id === towerOrId);
+  if (!t || !t.built || t.hp <= 0 || t.destroyed) return { ok: false, reason: 'no finished tower' };
+  if (dist(g.player, t) > PLAYER.presenceRadius + t.radius) return { ok: false, reason: 'too far away' };
+  g.player.perchId = t.id;
+  g.player.x = t.x;
+  g.player.y = t.y;
+  return { ok: true, tower: t };
+}
+
+/** Climb down on the side the player faces, onto the nearest open ground. */
+export function leavePerch(g, facing = g.player.facing) {
+  const p = g.player;
+  const t = g.towers.find((o) => o.id === p.perchId);
+  p.perchId = null;
+  if (!t) return { ok: true };
+  const base = Math.atan2(facing?.y || 0, facing?.x || 1);
+  for (let k = 0; k < 16; k++) {
+    const a = base + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
+    const r = t.radius + PLAYER.radius + 0.35;
+    const x = t.x + Math.cos(a) * r;
+    const y = t.y + Math.sin(a) * r;
+    const tx = Math.floor(x);
+    const ty = Math.floor(y);
+    if (!inBounds(tx, ty) || !isPassable(g.map, tx, ty)) continue;
+    // Same openness as moveWithCollision: only solid wall and nest tiles block.
+    const blocker = g.blockerGrid[idx(tx, ty)];
+    if (blocker && blocker.kind !== 'tower' && !(blocker.kind === 'wall' && blocker.structure.gate)) continue;
+    if (g.towers.some((o) => o !== t && Math.hypot(o.x - x, o.y - y) < o.radius + PLAYER.radius)) continue;
+    p.x = x;
+    p.y = y;
+    return { ok: true };
+  }
+  return { ok: true };
 }
 
 function updatePlayer(g, dt) {
@@ -1377,9 +1432,15 @@ function updatePlayer(g, dt) {
   const len = Math.hypot(mx, my);
   const wasX = p.x;
   const wasY = p.y;
-  if (len > 0) {
+  // D101: a first-person look direction is the facing, independent of motion.
+  if (g.input.facing) p.facing = { x: g.input.facing.x, y: g.input.facing.y };
+  if (p.perchId != null) {
+    const perch = g.towers.find((o) => o.id === p.perchId);
+    if (!perch || perch.hp <= 0 || perch.destroyed || !perch.built) leavePerch(g);
+    else { p.x = perch.x; p.y = perch.y; }
+  } else if (len > 0) {
     mx /= len; my /= len;
-    p.facing = { x: mx, y: my };
+    if (!g.input.facing) p.facing = { x: mx, y: my };
     moveWithCollision(g, p, mx * speed * dt, my * speed * dt, PLAYER.radius);
   }
   // Actual achieved velocity, so hunters lead the player's real path rather
@@ -1474,9 +1535,13 @@ function moveWithCollision(g, ent, dx, dy, radius) {
       if (!isPassable(g.map, tx, ty)) return false;
       if (structureBlocks(tx, ty)) return false;
     }
-    if (ent.def) {
+    if (ent.def || g.rules?.solidTowers) {
       for (const tower of g.towers) {
-        if (Math.hypot(nx - tower.x, ny - tower.y) < radius + tower.radius) return false;
+        const limit = radius + tower.radius;
+        const d = Math.hypot(nx - tower.x, ny - tower.y);
+        // D101: a player already overlapping (spawned or climbed down there)
+        // may always move outward, so solid towers can never trap them.
+        if (d < limit && !(!ent.def && d >= Math.hypot(ent.x - tower.x, ent.y - tower.y))) return false;
       }
     }
     return true;
@@ -2518,6 +2583,10 @@ function inRepairReach(g, s) {
 export function repairTarget(g) {
   // Half an hp of slack: float build steps must not read as damage.
   const needs = (s) => s && (s.destroyed ? !!s.wall : s.hp < s.maxHp - 0.5);
+  // D101: in first person the structure under the crosshair wins when in reach.
+  const focus = g.repairFocus;
+  if (focus && needs(focus) && inRepairReach(g, focus)
+    && (focus.wall ? focus.present && !focus.cancelled : !focus.destroyed && focus.hp > 0)) return focus;
   const occupied = g.towers.find((o) => o.id === g.occupiedTowerId);
   if (needs(occupied)) return occupied;
   const selected = g.towers.find((o) => o.id === g.selected)

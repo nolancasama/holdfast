@@ -1686,3 +1686,107 @@ full map width and puts commands where RTS players look for them.
 **Rejected:** keeping the 320px right side panel, which read as a debug tool
 and took map width; an overlaid translucent console, which would hide the
 player and require camera offsets.
+
+### D101 — First-person 3D presentation over the unchanged tile simulation
+**Date:** 2026-10-05.
+**Decision:** normal play is first person in Three.js (vendored r186 module in
+`vendor/`, loaded through an import map; no build step, no physics engine).
+`src/game.js` remains the authority and still runs on the 208x104 tile grid,
+flow fields and break-cost walls. The new `src/fp/` layer only reads sim state
+and writes `g.input`: `space.js` (pure, Node-tested: tile<->world mapping,
+height field, terrain raycast, ray-cylinder picking, Wall anchor rules,
+compass maths), `terrain3d.js` (ground, water, road ribbons, instanced forest,
+reeds, boulders, deposits), `models.js` (primitive Keep, Tower, Wall segment,
+postern, Farm, Quarry, Mine, Nest, Swarm/Runner/Heavy/Feral), `entities3d.js`
+(id->mesh sync, construction growth, damage tint, turret tracking, shots,
+debris, dust, shake), `overlays.js` (ghosts, draped range annulus, wall
+preview, debug views), `hud.js` (DOM HUD + minimap) and `main.js` (pointer
+lock, input, picking, build flows, frame loop, automation handle). There is no
+overhead camera; the minimap is navigation and intelligence only.
+**Why:** the brief asks whether physically inhabiting the fortress is more
+fun. Keeping the simulation intact preserves every tested rule (blind spots,
+Tower-only walls, Keep targeting, nests, garrison, assault timing) and lets
+the 3D layer be judged on presentation and interaction alone.
+**Rejected:** rewriting navigation in 3D (the X/Z ground plane is enough);
+Cannon/Rapier (sim collision already exists); a god-view toggle (forbidden by
+the brief).
+
+### D102 — World scale and gait
+**Decision:** 1 tile = 2 m (`WORLD3D.tileMeters`). Eye 1.7 m; Tower 9 m tall,
+3.8 m wide; Keep 15 m with turrets, 5 m wide; Walls 3.2 m high, so the player
+cannot see over them from the ground. Elevation bands are 2.2 m apart and
+box-blurred into slopes; cliff interiors rise 5.5 m; water is depressed.
+First-person gait multiplies `PLAYER.speed` (5.3 t/s): walk x0.75 (~8 m/s),
+Shift sprint x1.2 (~12.7 m/s); the D75 road bonus (x1.25) stacks. No stamina.
+The map size is unchanged: Keep to map edge is ~26 s walking, ~13 s
+sprinting on a road; the farthest Gold is ~15 s sprinting in a straight line.
+**Why:** 2 m tiles make the sim's footprints read as buildings at eye height.
+The 2D speed felt like a sprint at this scale, so walking is slower and sprint
+restores (and slightly exceeds) the old pace, which keeps the 15 s warning a
+real race from far sites.
+**Rejected:** 1 tile = 1 m (Towers would be 1.9 m wide); shrinking the map
+before hand-play.
+
+### D103 — Climbing a Tower is the vantage point
+**Decision:** `E` on a finished Tower or the Keep within reach climbs onto its
+platform (`perchOnTower`): the player's logical position becomes the Tower
+centre, so D7 occupancy applies, melee is impossible, and a collapse still
+deals D6 damage. The camera stands at the parapet the player faces and the
+Tower's own turret is hidden. `E` again climbs down on the facing side onto
+open ground (`leavePerch`). Walls can be planned from a perch because the
+player is "at" that Tower.
+**Why:** 3.2 m walls hide the field from the ground, and the brief wants the
+player to watch assaults, crossfire and blind spots. Occupancy already meant
+"standing in the Tower"; this makes that literal without manual gunnery.
+**Rejected:** climbable walls or parkour (forbidden); lowering walls below eye
+height (walls would stop feeling protective); a Tower gunner mode (deferred by
+the brief).
+
+### D104 — Crosshair building
+**Decision:** keys 1-5 select Tower, Wall, Farm, Quarry, Gold Mine (press
+again or Q / right-click to back out). The ground under the crosshair is
+snapped to a tile centre; if that tile is invalid, the best valid tile among
+its 8 neighbours is used. The site must be within `BUILD.lookReach` = 6 tiles
+(12 m) of the player (`g.rules.buildReach`); the 2D classic keeps 1.5. Looking
+at a deposit snaps a Quarry or Mine to it. A Tower ghost shows its footprint, a
+red blind-zone disc and a blue firing annulus draped over the terrain; the
+same annulus appears when inspecting a finished Tower within 7 tiles. Wall
+mode rings every eligible Tower (never the Keep), click picks Tower A, looking
+at Tower B previews ghost segments with length, segment count and Stone cost,
+and a second click builds. Clicking the Keep shows "Walls must connect two
+Towers." Repair (hold R) works on the structure under the crosshair when in
+reach (`g.repairFocus`), never remotely.
+**Why:** placement must be fast, forgiving and predictable, and range is hard
+to judge in first person without a ground overlay.
+**Rejected:** free placement without snapping; remote building from the
+minimap.
+
+### D105 — Releasing the mouse pauses
+**Decision:** losing pointer lock (Esc) pauses the simulation and opens the
+pause card (controls, sound, seed, debug tools). Clicking Resume or the canvas
+relocks and resumes. `P` toggles the same state.
+**Why:** a first-person player cannot look or aim without the lock, so the
+assault clock should not run while they cannot play.
+**Rejected:** an unpaused free-cursor mode, which would let the assault clock
+run while the player cannot play.
+
+### D106 — Exploration memory follows sight, live vision does not
+**Decision:** with `g.rules.exploreRadius` = 16 tiles, terrain in line of
+sight is remembered as explored on the minimap. Live visibility (VISION.player
+8, tower vision) is unchanged, so tower targeting, nest siege and live hostile
+dots on the minimap behave as before. All enemies and nests are rendered in 3D
+regardless of fog; terrain, trees and atmospheric distance fog decide what the
+eye sees.
+**Why:** an 8-tile memory radius left the minimap blank while the player could
+plainly see 100 m in first person.
+**Rejected:** a fog-of-war plane in the world; widening live vision, which
+would change combat balance.
+
+### D107 — The 2D shell stays as `classic.html`
+**Decision:** the old top-down page is preserved at `classic.html` (with
+`src/main.js`, `render.js`, `ui.js`) and linked from the start screen. It
+uses default `g.rules`, so its behaviour is unchanged.
+**Why:** the success test is a comparison: first person must be better than
+"the same game, harder to control". An A/B on the same seed is the most direct
+way to judge it.
+**Rejected:** deleting the 2D renderer now.

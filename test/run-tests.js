@@ -10,6 +10,7 @@ import {
 import { computeField } from '../src/flowfield.js';
 import { runPreserved } from './preserved-tests.js';
 import { runFortress } from './fortress-tests.js';
+import { runFirstPerson } from './fp-tests.js';
 import {
   createGame, update, canPlaceAt, tryBuild, tryUpgrade, towerStats,
   spawnGroupAt, isTileExplored, resourceState,
@@ -648,6 +649,9 @@ check('read-only building/resource states are detached summaries', () => {
 
 // Phase-2 walls, break-cost pathing and wall repair (D81-D83).
 runFortress({ check, assert, gameOn, flatMap, rich, run });
+
+// D101 first-person shell: 3D-space math and the sim rules it selects.
+runFirstPerson({ check, assert, gameOn, flatMap, rich, run, maps, seeds: SEEDS });
 
 // Preserved-system checks (roads, fog, LOS, upgrades, stuck recovery, audio...).
 const preserved = runPreserved(maps, SEEDS);

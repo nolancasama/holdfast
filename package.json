@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "2D top-down tower-defense/survival prototype: presence makes a tower strong and makes it a target.",
+  "description": "First-person fortress-defense prototype (Three.js) over a tile simulation; the 2D classic remains at classic.html.",
   "scripts": {
     "test": "node test/run-tests.js",
     "start": "node serve.js",

@@ -50,7 +50,9 @@ export function createAudioSystem() {
     const n = now(); if (!shouldRateLimit(lastAt, event.type, n)) return; lastAt[event.type] = n;
     const c = context; if (active >= AUDIO.voiceCap) return; active++;
     const playerX = event.playerX ?? 0; const distance = Math.hypot((event.x || 0) - playerX, (event.y || 0) - (event.playerY ?? 0));
-    const pan = c.createStereoPanner(); pan.pan.value = Math.max(-1, Math.min(1, ((event.x || 0) - playerX) / AUDIO.farDistance));
+    // D101: with a listener right vector (first person), pan by facing, not by map x.
+    const lateral = event.rightX != null ? ((event.x || 0) - playerX) * event.rightX + ((event.y || 0) - (event.playerY ?? 0)) * event.rightY : (event.x || 0) - playerX;
+    const pan = c.createStereoPanner(); pan.pan.value = Math.max(-1, Math.min(1, lateral / Math.max(6, Math.min(AUDIO.farDistance, distance || 1))));
     const out = c.createGain(); out.gain.value = Math.max(0.08, 1 - distance / AUDIO.farDistance); out.connect(pan); pan.connect(master);
     const osc = c.createOscillator(); const gain = c.createGain(); const start = c.currentTime;
     const reminder = event.type === 'collapsingReminder'; const kind = reminder ? 'collapsing' : event.type;
@@ -73,7 +75,7 @@ export function createAudioSystem() {
     osc.onended = () => { active = Math.max(0, active - 1); };
   }
   return {
-    gesture, playEvents(events, player, paused = false) { if (paused) { stopSustained(); return; } for (const e of selectVoices(events, active)) play({ ...e, playerX: player.x, playerY: player.y }); },
+    gesture, playEvents(events, player, paused = false, right = null) { if (paused) { stopSustained(); return; } for (const e of selectVoices(events, active)) play({ ...e, playerX: player.x, playerY: player.y, ...(right ? { rightX: right.x, rightY: right.y } : {}) }); },
     setEnabled(v) { enabled = !!v; if (!enabled) stopSustained(); persist(); applyGain(); }, setMuted(v) { muted = !!v; persist(); applyGain(); }, setVolume(v) { volume = Math.max(0, Math.min(1, Number(v))); persist(); applyGain(); },
     get state() { return { enabled, muted, volume, active }; }, suspendForPause() { stopSustained(); if (context && context.state === 'running') context.suspend().catch(() => {}); }, resumeAfterPause() { if (enabled) gesture(); },
   };

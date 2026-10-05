@@ -164,6 +164,37 @@ export const PLAYER = {
 
 export const BUILD = {
   reach: 1.5,
+  // D101: in first person the site is where the crosshair meets the ground,
+  // so the player must be this close to it (tiles), not standing on it.
+  lookReach: 6,
+};
+
+// D101: first-person presentation. The simulation stays in tiles on the old
+// x/y grid; the 3D world maps tile (x, y) to Three.js (x * tileMeters, height,
+// y * tileMeters). North is -Z (decreasing tile y). Every 3D size derives from
+// tileMeters so towers, walls and enemies share one scale.
+export const WORLD3D = {
+  tileMeters: 2,
+  eyeHeight: 1.7,             // metres above the ground
+  elevStep: 2.2,              // metres per elevation band (Low/Normal/High)
+  smoothPasses: 3,            // box-blur passes on the walkable height field
+  cliffHeight: 5.5,           // metres a cliff interior rises above its band
+  shallowDepth: 0.55,
+  deepDepth: 1.8,
+  fov: 75,
+  // Player speed multipliers applied to PLAYER.speed (5.3 tiles/s = 10.6 m/s).
+  walkMult: 0.75,             // ~8 m/s walk
+  sprintMult: 1.2,            // ~12.7 m/s sprint; roads stack on top (D75)
+  interactRange: 7,           // tiles: inspect / garrison / upgrade prompts
+  exploreRadius: 16,          // tiles of terrain in sight remembered on the minimap
+  pickRange: 40,              // tiles: wall anchor B and inspection rays
+  towerHeight: 9,             // metres
+  keepHeight: 15,
+  wallHeight: 3.2,
+  wallThickness: 1.3,
+  drawDistance: 330,          // metres (camera far / atmospheric fog end)
+  fogNear: 70,
+  mouseSensitivity: 0.0022,
 };
 
 export const VISION = {
@@ -466,7 +497,7 @@ export const AUDIO = {
   rateLimits: {
     towerFire: 0.075, enemyHit: 0.16, enemyDeath: 0.11, towerHit: 0.18,
     heavyTowerHit: 0.22, breach: 0.12, heavyBreach: 0.2, towerUnderAttack: 2.5,
-    wallHit: 0.14, heavyWallHit: 0.2, wallBreak: 0.25, collapsing: 0.75, repair: 0.16, default: 0.08,
+    wallHit: 0.14, heavyWallHit: 0.2, wallBreak: 0.25, collapsing: 0.75, repair: 0.16, nestAmbient: 3.0, default: 0.08,
   },
   limiter: { threshold: -12, ratio: 16 },
   envelope: { attack: 0.008, normal: 0.09, occupied: 0.16, urgent: 0.14, noiseLow: 0.09, noiseHigh: 0.035 },
@@ -481,6 +512,7 @@ export const AUDIO = {
     towerUnderAttack: [105, .32, 'sawtooth'], waveWarning: [185, .40, 'sawtooth'],
     waveStart: [230, .32, 'sawtooth'], finalWave: [155, .48, 'sawtooth'], victory: [660, .38, 'triangle'], playerDeath: [110, .44, 'sawtooth'],
     nestAgitated: [120, .38, 'sawtooth'], nestDestroyed: [42, 1.1, 'sawtooth'], supplyDeficit: [300, .30, 'square'],
+    nestAmbient: [58, .9, 'sawtooth'],   // D101: low growl near an undestroyed nest
   },
   dropFrequencies: { temporary: 620, supply: 310, equipment: 880 },
   // D47: positive confirmations RISE in pitch; everything else falls. A falling

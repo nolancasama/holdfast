@@ -1,17 +1,20 @@
 # Holdfast
 
-A 2D top-down fortress-defense **prototype**. It exists to answer one
-question, not to look good: is building and defending territory fun?
+A first-person fortress-defense **prototype** built with Three.js. It exists to
+answer one question, not to look good: does physically inhabiting, building,
+expanding and defending a fortress make the game more fun?
 
-> Start with a Keep. Claim useful land. Build a fortress. Protect what makes
-> the fortress worth having. Hold until the walls fail.
+> Start at the Keep. Walk into the wilderness. Claim Stone, Gold and farmland.
+> Raise Towers and join them with Walls. Get home before the assault arrives.
 
-Explore a 208x104 procedural map, raise farms, quarries and mines, and place
-towers whose automatic links shape the walls. Stone builds, Gold upgrades
-weapons, and Food feeds the soldiers you garrison in towers. Towers cannot
-shoot at their own base, so they must cover each other. Wilderness nests guard
-the best Gold and Stone and must be besieged with towers. Ten waves march on
-the Keep; walls redirect them into tower fire until a Heavy smashes a breach.
+Walk a 208x104-tile (416 x 208 m) procedural world, build farms, quarries and
+mines, place Towers and deliberately join them with Walls (never to the Keep).
+Stone builds, Gold upgrades weapons, Food feeds the soldiers you garrison.
+Towers cannot shoot at their own base, so they must cover each other.
+Wilderness Nests guard the best sites and must be besieged with Towers. Ten
+assaults march on the Keep; climb a Tower to watch them hit what you built.
+
+The previous top-down version is still playable at `classic.html`.
 
 ## Run it
 
@@ -35,21 +38,22 @@ npm test                  # headless terrain, pathing, LOS and simulation checks
 
 | | |
 |---|---|
-| `WASD` / arrows | move |
-| `B` | build menu (Tower, Farm, Quarry, Gold Mine); `Enter`/click builds where you stand |
-| **click** | select a tower or building |
-| `R` (hold) | repair what is in reach (or rebuild wall rubble) — costs Stone |
-| `1` | weapon upgrade (at the tower; Stone + Gold) |
-| `G` / `Shift+G` | assign / withdraw a soldier on the selected tower (needs Food support) |
-| wheel / `-` `=` | zoom |
-| `Space` | weak melee swing |
-| `P` | pause |
-| `Esc` | cancel build mode |
-| `F1` | debug panel |
+| `WASD` · mouse | move · look (click the view to capture the mouse) |
+| `Shift` | sprint (roads are faster still) |
+| `E` | climb onto / down from the Tower or Keep you face |
+| `1`–`5` | build Tower · Wall · Farm · Quarry · Gold Mine (again or `Q` to cancel) |
+| **click** | place the ghost / pick Wall Towers A then B · otherwise a weak swing |
+| **right-click** | step back (Wall corner, then build mode) |
+| `R` (hold) | repair what you look at, in reach — costs Stone |
+| `G` / `Shift+G` | assign / withdraw a soldier on the Tower you face |
+| `U` | weapon upgrade (beside the Tower; Stone + Gold) |
+| `T` | start the next assault early |
+| `Esc` / `P` | release the mouse and pause (menu, sound, debug) |
 
-Debug keys: `M` resources · `N` next wave · `Y` spawn a group at the cursor ·
-`K` damage selected tower · `J` destroy it · `H` path overlay · `U` road debug · `V` fog debug ·
-`L` pause spawning · `O` regenerate the map.
+Debug: `F2` fly/no-clip · `F3` coordinates · `F4` teleport to Keep · `M`
+resources · `N` next assault · `Y` spawn at crosshair · `K`/`J` damage/destroy
+the Tower you face · `H` path field · `L` pause spawning · `O` regenerate. The
+pause card also toggles Tower ranges, Nest territory and Wall nav blockers.
 
 Extra reports: `npm run economy-sim` (opening economy), `npm run wave-report`
 (ten-wave pressure against scripted fortresses), `npm run road-report` (road
@@ -63,16 +67,24 @@ Survive 10 waves. The run is lost if the Keep falls or you die.
 
 | File | Job |
 |---|---|
-| `src/config.js` | every tunable number, nothing else |
+| `src/config.js` | every tunable number, nothing else (`WORLD3D` holds the 3D scale) |
 | `src/rng.js` | seeded PRNG, value noise, fbm |
 | `src/terrain.js` | multi-pass generation, the validation gate, line of sight |
 | `src/flowfield.js` | shared Dijkstra distance fields and steering |
-| `src/game.js` | the whole simulation |
-| `src/render.js` | camera-culled canvas drawing and the minimap |
-| `src/ui.js` | DOM HUD |
-| `src/main.js` | bootstrap, input, frame loop, debug handle |
+| `src/game.js` | the whole simulation, on the tile grid |
+| `src/fp/space.js` | tile <-> world mapping, height field, raycasts, picking (pure, tested) |
+| `src/fp/terrain3d.js` · `models.js` | static world meshes · primitive models |
+| `src/fp/entities3d.js` · `overlays.js` | sim -> mesh sync and effects · build/debug overlays |
+| `src/fp/hud.js` · `main.js` | DOM HUD and minimap · first-person bootstrap, input, frame loop |
+| `src/render.js` · `ui.js` · `main.js` | the 2D classic (`classic.html`) |
+| `vendor/three.*.js` | Three.js r186 (MIT), loaded through an import map |
 
-Four things are worth knowing before you change anything:
+Five things are worth knowing before you change anything:
+
+**The 3D world is a view of the 2D simulation.** One tile is 2 m; tile (x, y)
+is world (x*2, height, y*2) with north at -Z. Gameplay state lives only in
+`src/game.js`; `src/fp/` reads it and writes `g.input`. Presentation rules the
+first-person shell needs are opt-in through `g.rules`.
 
 **Terrain is authored, then validated.** Generation runs in deliberate passes —
 elevation, a carved river with explicit fords, cliff ridges with deliberate
