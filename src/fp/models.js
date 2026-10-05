@@ -124,7 +124,11 @@ export function makeTower() {
   return g;
 }
 
-/** Keep: tall octagonal donjon with corner turrets and a banner. */
+/**
+ * Keep: tall octagonal donjon with a low crenellated roof and a banner. D108:
+ * no corner turrets or spires - the roof is the best early observation point,
+ * so nothing taller than the parapet stands between the player and the horizon.
+ */
 export function makeKeep() {
   const g = new THREE.Group();
   const r = KEEP.radius * S;
@@ -133,13 +137,12 @@ export function makeKeep() {
   const body = new THREE.Group();
   body.add(mesh(new THREE.CylinderGeometry(r * 1.02, r * 1.1, h, 8), mat, 0, h / 2, 0));
   body.add(mesh(new THREE.BoxGeometry(1.4, 2.4, 0.4), MAT.woodDark, 0, 1.2, r * 1.03));
+  // Shallow buttresses keep the silhouette strong from the ground without
+  // rising above the roof walk.
   for (let k = 0; k < 4; k++) {
     const a = (k / 4) * Math.PI * 2 + Math.PI / 4;
-    const tx = Math.cos(a) * r * 0.95;
-    const tz = Math.sin(a) * r * 0.95;
-    // Turrets stop just above the roof walk so they frame, not block, the view.
-    body.add(mesh(new THREE.CylinderGeometry(0.8, 0.95, h + 0.9, 8), mat, tx, (h + 0.9) / 2, tz));
-    body.add(mesh(new THREE.ConeGeometry(1.05, 2.0, 8), MAT.roof, tx, h + 0.9 + 1.0, tz));
+    body.add(mesh(new THREE.CylinderGeometry(0.7, 0.95, h * 0.72, 8), mat,
+      Math.cos(a) * r * 0.98, h * 0.36, Math.sin(a) * r * 0.98));
   }
   for (let k = 0; k < 8; k++) {
     const a = (k / 8) * Math.PI * 2 + Math.PI / 8;
@@ -156,8 +159,9 @@ export function makeKeep() {
   gun.position.y = 0.6;
   gun.scale.setScalar(1.25);
   top.add(gun);
-  top.add(mesh(new THREE.CylinderGeometry(0.08, 0.08, 7, 5), MAT.wood, 0, 4.1, r * 0.5, false));
-  const flag = mesh(new THREE.PlaneGeometry(3.2, 1.8, 6, 1), MAT.banner, 1.6, 6.6, r * 0.5, false);
+  // Banner on a thin pole at the parapet edge; the cloth flies above eye height.
+  top.add(mesh(new THREE.CylinderGeometry(0.08, 0.08, 7, 5), MAT.wood, 0, 4.1, r * 1.0, false));
+  const flag = mesh(new THREE.PlaneGeometry(3.2, 1.8, 6, 1), MAT.banner, 1.6, 6.6, r * 1.0, false);
   top.add(flag);
   g.add(top);
   g.userData = { body, top, gun, flag, shaftMat: mat, height: h + 0.6, radius: r, soldiers: [] };
