@@ -1,7 +1,7 @@
 # Holdfast current state
 
-Last updated: 2026-10-05 (expansion pacing D97 and manual walls D98,
-implemented in the working tree, awaiting hand-play)
+Last updated: 2026-10-05 (expansion pacing D97, Tower-only manual walls D99,
+classic RTS interface D100; committed, awaiting human hand-play)
 
 ## What this is
 
@@ -18,7 +18,8 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
   Turn-penalised router, line-of-sight straightening, hard validation (no
   self-crossing, loops, knots, hairpins; spacing; turn budget). Enemies spawn
   only at road mouths (1-2 per side). `U` toggles the road debug overlay.
-- **Keep (D77/D86):** 2,000 hp; wall anchor; min range 3.2.
+- **Keep (D77/D86/D99):** 2,000 hp; the protected goal, not a wall endpoint;
+  min range 3.2.
 - **Enemies (D78/D82/D85):** march on the Keep on per-type break-cost flow
   fields; Swarm detours, Heavy breaks walls. Fields rebuild on the next frame
   after a geometry change, one type per frame, coalesced while busy (D90/D95).
@@ -27,11 +28,17 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
   is known from expansion start. A 4 s aftermath follows a cleared wave;
   `START NEXT WAVE` shortens expansion/warning to at most 4 s, with no reward
   for either waiting or starting early.
-- **Manual walls (D98):** `Build Wall` selects two finished Tower/Keep anchors,
+- **Manual walls (D98/D99):** `Build Wall` selects two finished Towers,
   previews tiles, segments, Stone cost, connectivity and refusal reasons, then
-  confirms construction. Tower placement never creates or charges for walls.
+  confirms construction. The Keep is not an endpoint. Tower placement never
+  creates or charges for walls. A Tower is `connected` when it belongs to a
+  wall-linked network of at least two Towers; otherwise it is an `outpost`.
   Walls retain grow-from-anchor construction, rubble/repair rules and
   coalesced path-field invalidation.
+- **Interface (D100):** RTS layout: top resource bar, phase plaque, bottom
+  console (minimap canvas / selection panel / 5x3 command card with hotkeys
+  Q tower, X wall, F farm, C quarry, E mine, B build, 1, G, Enter, Esc), menu
+  drawer (F10) holding controls, sound, seed and debug (F1).
 - **Blind spot (D93):** towers fire only between 2.8 and max range (Keep
   3.2); `towerMinRange` reads `t.closeDefense` for a future upgrade. Range
   display hatches the blind zone.
@@ -49,18 +56,22 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
 
 ## Verification
 
-- D97/D98 `npm test`: **220 passed, 0 failed**.
+- D99 `npm test`: **221 passed, 0 failed**.
 - `npm run road-report`: 40 seeds, 0 hard road defects, 0 readability
   defects, generation median 783 ms.
 - Nest probe: a lone tower dies to ferals in its blind spot (27-42 s); two
   supporting towers destroy the nest in 68 s at full health (4 seeds).
-- `npm run economy-sim`: passed; each finished Tower is followed by an
-  explicit 4-segment Keep link (Tower starts at 0.0 s and 3.6 s), Farm and
-  Quarry start at 7.2 s, first Gold Mine at 123.9 s (8/8 seeds).
+- `npm run economy-sim`: passed; Tower 1 starts at 0.0 s, Tower 2 at 3.6 s,
+  then a 9-segment Tower-to-Tower wall costs 54 Stone; Farm and Quarry start
+  at 7.2 s and the first Gold Mine at 137.2 s (8/8 seeds).
 - `npm run wave-report`: passed; outposts fall waves 1-4, fortress falls waves
-  8-10, and fortress+ falls waves 8-10. BRAVO has no valid fortress layout;
-  the other five seeds run both explicit fan/ring profiles.
-- D97/D98 browser hand-play: pending.
+  3-10, and fortress+ wins 1/5 valid layouts and otherwise falls waves 9-10.
+  BRAVO has no valid fortress layout; all built walls are Tower-only arcs/rings.
+- D99/D100 scripted browser pass (Playwright, real clicks/keys, 1280x720 and
+  1600x900): two Towers create no wall; clicking the Keep in wall mode is
+  refused with "Walls must connect two Towers."; Tower A -> Tower B previews
+  5 segments / 30 Stone; Enter charges 30 Stone and the wall completes; no
+  page errors. Human hand-play: pending.
 
 ## Known risks / open questions
 
@@ -75,6 +86,11 @@ survive ten waves that march on the Keep. Defeat: Keep falls or player dies.
    wave report shows unchanged pressure, but hand-play should confirm.
 5. The effect of manual wall spending on opening tempo and late-wave repair
    pressure needs hand-play confirmation.
+6. D99 weakened the scripted 3-Tower arc: wave-report `fortress` now falls on
+   waves 3-10 (was 8-10 with Keep spokes). A perimeter needs more Towers, so
+   tower cost and wall length may need retuning after hand-play.
+7. The D100 map viewport is shorter (about 480 px at 720p) because the console
+   is opaque; judge whether the default zoom shows enough ground.
 
 ## Next steps
 

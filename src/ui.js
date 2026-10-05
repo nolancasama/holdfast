@@ -1,10 +1,10 @@
 // DOM HUD for the fortress rework (D77-D80/D83).
 
-import { ARCHETYPES, TOWER, PLAYER, BUILDINGS, WAVE, DROP } from './config.js';
+import { ARCHETYPES, TOWER, PLAYER, BUILDINGS, WAVE, DROP, WALL } from './config.js';
 import {
   towerStats, upgradeCost, repairCostPerHp, towerCost, dangerState,
   upgradeState, upgradeRateMult, towerAlarmState, stuckState, playerBuildSite, resourceState,
-  assaultIn, wallPlan, towerConnectivity, towerMinRange, garrisonState, garrisonSlots, farmSupport,
+  assaultIn, wallPlan, towerMinRange, garrisonState, garrisonSlots, farmSupport,
 } from './game.js';
 
 export const $ = (id) => document.getElementById(id);
@@ -163,7 +163,17 @@ function updateSelection(g) {
   const sel = building || tower;
   $('sel-empty').hidden = !!sel;
   $('sel-body').hidden = !sel;
-  if (!sel) return;
+  // D100: tower commands occupy fixed command-card slots, shown only for a tower.
+  $('cmd').classList.toggle('has-tower', !!tower);
+  const portrait = g.buildMode ? g.buildType || 'tower'
+    : building ? building.type : tower ? (tower.keep ? 'keep' : 'tower') : 'player';
+  const portraitEl = $('sel-portrait');
+  if (portraitEl.dataset.kind !== portrait) {
+    portraitEl.dataset.kind = portrait;
+    portraitEl.innerHTML = `<svg><use href="#i-${portrait}"/></svg>`;
+  }
+  portraitEl.style.color = portrait === 'player' ? g.arch.color || '' : '';
+  if (!sel) { $('sel-title').textContent = 'Commander'; return; }
 
   const frac = Math.max(0, sel.hp / sel.maxHp);
   const buildingSelected = !!building;
@@ -177,7 +187,6 @@ function updateSelection(g) {
   $('sel-hpbar').style.width = `${frac * 100}%`;
   $('sel-hpbar').style.background = frac < 0.34 ? 'var(--red)' : frac < 0.6 ? 'var(--gold)' : 'var(--green)';
 
-  $('up-weapon').hidden = buildingSelected;
   $('sel-upgrade').hidden = true;
   $('sel-garrison-row').hidden = buildingSelected;
   $('sel-garrison-note').hidden = buildingSelected;
@@ -212,9 +221,10 @@ function updateSelection(g) {
       $('sel-upgrade-rate').textContent = mult > 1 ? `Engineer x${mult.toFixed(1)}` : '';
     }
     const upgradeLocal = Math.hypot(g.player.x - tower.x, g.player.y - tower.y) <= PLAYER.presenceRadius;
-    setUpgradeButton($('up-weapon'), '[1] Weapon upgrade', upgradeCost(tower, 'weapon'), g,
+    setUpgradeButton($('up-weapon'), upgradeCost(tower, 'weapon'), g,
       tower.built && !g.paused && !upgrading && upgradeLocal);
-    $('up-weapon').title = upgradeLocal ? '' : `Move within ${PLAYER.presenceRadius} tiles to upgrade.`;
+    $('up-weapon').dataset.reason = upgrading ? 'Upgrade in progress.'
+      : upgradeLocal ? '' : `Move within ${PLAYER.presenceRadius} tiles to upgrade.`;
   }
 
   const perHp = repairCostPerHp(g);
@@ -232,7 +242,12 @@ function updateBuild(g) {
   $('build-toggle').disabled = g.paused;
   const wallMode = g.buildMode && g.buildType === 'wall';
   $('build-confirm').disabled = g.paused || !g.buildMode || !g.buildCheck?.ok || (wallMode && g.wallAnchorB == null);
-  $('build-confirm').textContent = wallMode ? 'Build wall [Enter]' : 'Build here [Enter]';
+  $('build-confirm').querySelector('.lbl').textContent = wallMode ? 'wall' : 'build';
+  $('build-confirm').dataset.tip = wallMode ? 'Build wall' : 'Build here';
+  $('build-cancel').disabled = !g.buildMode;
+  $('build-toggle').classList.toggle('active', !!g.buildMode);
+  // D100: the centre console panel shows construction feedback while building.
+  $('app').classList.toggle('building', !!g.buildMode);
   $('build-state').textContent = g.buildMode ? `— ${LABEL[g.buildType || 'tower'].toUpperCase()}` : '';
   $('build-state').className = g.buildMode ? 'good' : 'muted';
   for (const type of ['tower', 'farm', 'quarry', 'mine']) {
@@ -241,37 +256,41 @@ function updateBuild(g) {
     try { check = playerBuildSite(g, type)?.check; } catch { check = null; }
     const cost = check?.cost ?? (type === 'tower' ? towerCost(g) : null);
     const reasons = check?.reasons || [];
-    $(`build-${type}-cost`).textContent = check && !check.ok ? reasons[0] || 'blocked' : costText(cost);
-    button.disabled = g.paused || (check && !check.ok);
-    button.style.borderColor = g.buildMode && g.buildType === type ? 'var(--gold)' : '';
-    button.title = check && !check.ok ? reasons.join(', ') : '';
+    const blocked = !!(check && !check.ok);
+    $(`build-${type}-cost`).textContent = costText(cost);
+    button.disabled = g.paused || blocked;
+    button.classList.toggle('blocked', blocked);
+    button.classList.toggle('active', g.buildMode && g.buildType === type);
+    button.dataset.reason = blocked ? reasons.join(', ') || 'blocked' : '';
   }
   $('build-wall').disabled = g.paused;
-  $('build-wall').style.borderColor = wallMode ? 'var(--gold)' : '';
-  $('build-wall-cost').textContent = 'anchors';
+  $('build-wall').classList.toggle('active', wallMode);
+  $('build-wall-cost').textContent = `${WALL.costStonePerSegment} S/seg`;
 
   const info = $('build-info');
   if (wallMode) {
     const a = g.towers.find((tower) => tower.id === g.wallAnchorA);
     const b = g.towers.find((tower) => tower.id === g.wallAnchorB);
     if (!a) {
-      info.innerHTML = 'Click a finished <b>Tower</b> or the <b>Keep</b> for anchor A.';
+      info.innerHTML = 'Click a finished <b>Tower</b> for corner A.';
     } else if (!b) {
-      info.innerHTML = `Anchor A: <b>${a.keep ? 'KEEP' : `Tower #${a.id}`}</b><br />Click a different finished anchor for B. Escape/right-click goes back.`;
+      info.innerHTML = `<b>Tower #${a.id}</b> selected. Click a second <b>Tower</b>.<br />Escape/right-click goes back.`;
     } else {
-      const plan = g.buildCheck || wallPlan(g, a.id, b.id);
+      const plan = wallPlan(g, a.id, b.id);
       const near = [a, b].some((tower) => Math.hypot(g.player.x - tower.x, g.player.y - tower.y)
         <= PLAYER.presenceRadius + tower.radius);
       const reasons = [...(plan.reasons || [])];
       if (!near) reasons.push('stand at one of the two towers to start the wall');
-      const connected = towerConnectivity(g, a) !== 'outpost' || towerConnectivity(g, b) !== 'outpost';
       info.innerHTML = [
-        `${a.keep ? 'KEEP' : `Tower #${a.id}`} → ${b.keep ? 'KEEP' : `Tower #${b.id}`}`,
+        `Tower #${a.id} → Tower #${b.id}`,
         `${plan.segments?.length || 0} segments · ${plan.skipped || 0} cliff/water skipped · ${Math.ceil(plan.cost?.stone || 0)} Stone`,
-        `<span class="${connected ? 'good' : 'warn'}">${connected ? 'CONNECTED' : 'OUTPOST'}</span>`,
+        '<span class="good">CONNECTED</span>',
         plan.ok && near ? '<span class="good">Valid wall — press Enter or click Build wall.</span>'
           : `<span class="warn">Blocked: ${[...new Set(reasons)].join(', ') || 'invalid wall'}</span>`,
       ].join('<br />');
+    }
+    if (g.wallNotice?.until > g.time) {
+      info.innerHTML += `${info.innerHTML ? '<br />' : ''}<span class="warn">${g.wallNotice.text}</span>`;
     }
   } else if (g.buildMode && g.buildCheck) {
     const check = g.buildCheck;
@@ -291,16 +310,15 @@ function updateBuild(g) {
     }
     info.innerHTML = lines.join('<br />');
   } else {
-    info.innerHTML = 'Choose a structure and build nearby, or choose <b>Wall [X]</b> and select two finished anchors. Farms need fertile ground; quarries and mines need an unclaimed site.';
+    info.innerHTML = 'Choose a structure and build nearby, or choose <b>Wall [X]</b> and select two finished Towers. Farms need fertile ground; quarries and mines need an unclaimed site.';
   }
 }
 
-function setUpgradeButton(button, label, cost, g, enabled) {
-  if (cost === null) {
-    button.disabled = true; button.innerHTML = `${label}<span class="cost">MAX</span>`; return;
-  }
+function setUpgradeButton(button, cost, g, enabled) {
+  const slot = button.querySelector('.cost');
+  if (cost === null) { button.disabled = true; slot.textContent = 'MAX'; return; }
   button.disabled = !enabled || !canAfford(g, cost);
-  button.innerHTML = `${label}<span class="cost">${costText(cost)}</span>`;
+  slot.textContent = costText(cost);
 }
 
 export function updateMapInfo(g) {

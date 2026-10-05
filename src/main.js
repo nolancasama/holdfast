@@ -83,6 +83,15 @@ function resize() {
   canvas.width = view.w * dpr;
   canvas.height = view.h * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // D100: the minimap lives in its own canvas in the bottom console frame.
+  const mini = $('minimap');
+  const miniRect = mini.getBoundingClientRect();
+  view.miniW = Math.round(miniRect.width);
+  view.miniH = Math.round(miniRect.height);
+  mini.width = view.miniW * dpr;
+  mini.height = view.miniH * dpr;
+  view.miniCtx = view.miniW > 0 && view.miniH > 0 ? mini.getContext('2d') : null;
+  view.miniCtx?.setTransform(dpr, 0, 0, dpr, 0, 0);
   updateCamera();
 }
 window.addEventListener('resize', resize);
@@ -138,15 +147,21 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.code === 'F1') { e.preventDefault(); toggleDebug(); return; }
+  if (e.code === 'F10') { e.preventDefault(); toggleMenu(); return; }
   if ((e.code === 'Minus' || e.code === 'NumpadSubtract') && !e.repeat) { setZoom(view.zoom - 2); return; }
   if ((e.code === 'Equal' || e.code === 'NumpadAdd') && !e.repeat) { setZoom(view.zoom + 2); return; }
-  if (e.code === 'Escape') { cancelBuildStep(); return; }
+  if (e.code === 'Escape') { if (!$('menu').hidden) toggleMenu(false); else cancelBuildStep(); return; }
   if (e.code === 'KeyV' && !e.repeat) { game.debug.showFog = !game.debug.showFog; return; }
   if (game.paused) return;
 
   switch (e.code) {
     case 'KeyB': setBuildMode(!game.buildMode); break;
     case 'KeyX': if (!e.repeat) setBuildMode(true, 'wall'); break;
+    // D100 command-card hotkeys; a blocked structure stays unselectable, as with its button.
+    case 'KeyQ': if (!e.repeat) commandClick('build-tower'); break;
+    case 'KeyF': if (!e.repeat) commandClick('build-farm'); break;
+    case 'KeyC': if (!e.repeat) commandClick('build-quarry'); break;
+    case 'KeyE': if (!e.repeat) commandClick('build-mine'); break;
     case 'KeyT': if (!e.repeat) startWaveEarly(game); break;
     case 'Enter': confirmBuild(); break;
     case 'Digit1': upgradeSelected('weapon'); break;
@@ -284,7 +299,7 @@ function wallAnchorAt(point) {
   let best = null;
   let bestDistance = TOWER.radius + 0.9;
   for (const tower of game.towers) {
-    if (!tower.built || tower.hp <= 0 || tower.destroyed) continue;
+    if (tower.keep || !tower.built || tower.hp <= 0 || tower.destroyed) continue;
     const distance = Math.hypot(tower.x - point.x, tower.y - point.y);
     if (distance < bestDistance) { best = tower; bestDistance = distance; }
   }
@@ -292,8 +307,14 @@ function wallAnchorAt(point) {
 }
 
 function selectWallAnchor(point) {
+  const keep = game.towers.find((tower) => tower.keep);
+  if (keep && Math.hypot(keep.x - point.x, keep.y - point.y) < (keep.radius ?? TOWER.radius) + 0.9) {
+    game.wallNotice = { text: 'Walls must connect two Towers.', until: game.time + 2.5 };
+    return;
+  }
   const anchor = wallAnchorAt(point);
   if (!anchor) return;
+  game.wallNotice = null;
   if (game.wallAnchorA == null) game.wallAnchorA = anchor.id;
   else if (anchor.id !== game.wallAnchorA) game.wallAnchorB = anchor.id;
   lastBuildPlayerTile = '';
@@ -346,8 +367,44 @@ function toggleDebug() {
   const body = $('debug-body');
   body.classList.toggle('open');
   game.debug.open = body.classList.contains('open');
+  if (game.debug.open) toggleMenu(true);
 }
 $('debug-toggle').onclick = toggleDebug;
+
+// ---------------------------------------------------------------------------
+// D100 console: menu drawer, command-card tooltips
+// ---------------------------------------------------------------------------
+
+function toggleMenu(open = $('menu').hidden) {
+  $('menu').hidden = !open;
+}
+$('menu-toggle').onclick = () => toggleMenu();
+$('menu-close').onclick = () => toggleMenu(false);
+
+function commandClick(id) {
+  const button = $(id);
+  if (button && !button.disabled) button.click();
+}
+
+let tipTarget = null;
+function refreshTooltip() {
+  const tip = $('tooltip');
+  if (!tipTarget || !tipTarget.isConnected) { tip.hidden = true; return; }
+  const d = tipTarget.dataset;
+  const cost = tipTarget.querySelector('.cost')?.textContent || '';
+  const html = `<div class="tt-name">${d.tip}${d.key ? ` <kbd>${d.key}</kbd>` : ''}</div>`
+    + (cost && /\d/.test(cost) ? `<div class="tt-cost">${cost}</div>` : '')
+    + (d.desc ? `<div class="tt-desc">${d.desc}</div>` : '')
+    + (d.reason ? `<div class="tt-reason">${d.reason}</div>` : '');
+  if (tip.innerHTML !== html) tip.innerHTML = html;
+  tip.hidden = false;
+  const r = tipTarget.getBoundingClientRect();
+  const w = tip.offsetWidth;
+  tip.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w))}px`;
+  tip.style.top = `${Math.max(8, r.top - tip.offsetHeight - 8)}px`;
+}
+$('cmd').addEventListener('mouseover', (e) => { tipTarget = e.target.closest('[data-tip]'); refreshTooltip(); });
+$('cmd').addEventListener('mouseleave', () => { tipTarget = null; refreshTooltip(); });
 
 function togglePause() {
   const paused = setPaused(game);
@@ -395,6 +452,7 @@ $('build-farm').onclick = () => setBuildMode(true, 'farm');
 $('build-quarry').onclick = () => setBuildMode(true, 'quarry');
 $('build-mine').onclick = () => setBuildMode(true, 'mine');
 $('build-confirm').onclick = confirmBuild;
+$('build-cancel').onclick = cancelBuildStep;
 $('up-weapon').onclick = () => upgradeSelected('weapon');
 $('garrison-plus').onclick = () => garrisonSelected(1);
 $('garrison-minus').onclick = () => garrisonSelected(-1);
@@ -492,7 +550,7 @@ function frame(now) {
   draw(ctx, game, layers, view);
 
   hudAccum += dt;
-  if (hudAccum > 0.08) { hudAccum = 0; updateHud(game); }
+  if (hudAccum > 0.08) { hudAccum = 0; updateHud(game); refreshTooltip(); }
 
   if (game.status !== 'playing' && !endShown) {
     endShown = true;

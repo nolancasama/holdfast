@@ -2,18 +2,18 @@
 // production code; the scripted player teleports between build sites so the
 // report measures the economy rather than travel execution.
 
-import { MAP, NEST, WALL } from '../src/config.js';
+import { MAP, NEST, TOWER, WALL } from '../src/config.js';
 import {
   createGame, canPlaceAt, tryBuild, tryBuildWall, wallPlan, towerConnectivity, update, foodSupport,
 } from '../src/game.js';
 
 const SEEDS = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 'HOTEL'];
-// D98: towers and their deliberate Keep links are separate purchases.
+// D98-D99: towers and their deliberate Tower links are separate purchases.
 const ORDER = ['tower', 'tower', 'farm', 'quarry', 'mine'];
 const STEP = 0.1;
 const DURATION = 300;
 
-function findSite(g, type) {
+function findSite(g, type, wallFrom = null) {
   const keep = g.towers.find((t) => t.keep);
   const candidates = [];
   for (let y = 1; y < MAP.h - 1; y++) for (let x = 1; x < MAP.w - 1; x++) {
@@ -29,7 +29,15 @@ function findSite(g, type) {
     const check = canPlaceAt(g, wx, wy, type);
     // Keep geography/occupancy valid while temporarily ignoring affordability.
     const onlyCost = check.reasons.length === 1 && /^need /i.test(check.reasons[0]);
-    if (check.ok || onlyCost) candidates.push({ x: wx, y: wy, distance, check });
+    if (!(check.ok || onlyCost)) continue;
+    if (type === 'tower' && wallFrom) {
+      const probe = { id: -1, x: wx, y: wy, radius: TOWER.radius, built: true, hp: 1, maxHp: 1 };
+      g.towers.push(probe);
+      const plan = wallPlan(g, wallFrom.id, probe.id);
+      g.towers.pop();
+      if (!plan.ok && !plan.reasons.every((reason) => /^need /i.test(reason))) continue;
+    }
+    candidates.push({ x: wx, y: wy, distance, check });
   }
   candidates.sort((a, b) => a.distance - b.distance || a.y - b.y || a.x - b.x);
   return candidates[0] || null;
@@ -53,21 +61,33 @@ function simulate(seed) {
   let orderIndex = 0;
   let pendingSite = null;
   let pendingTower = null;
+  let previousTower = null;
 
   for (let elapsed = 0; elapsed <= DURATION + 1e-6; elapsed += STEP) {
     while (orderIndex < ORDER.length) {
       const type = ORDER[orderIndex];
       if (pendingTower) {
         if (!pendingTower.tower.built) break;
-        const keep = g.towers.find((t) => t.keep);
-        const plan = wallPlan(g, keep.id, pendingTower.tower.id);
+        if (!previousTower) {
+          timings[`${pendingTower.key}Links`] = 0;
+          timings[`${pendingTower.key}Segments`] = 0;
+          timings[`${pendingTower.key}WallStone`] = 0;
+          timings[`${pendingTower.key}TotalStone`] = pendingTower.towerStone;
+          timings[`${pendingTower.key}Status`] = towerConnectivity(g, pendingTower.tower);
+          previousTower = pendingTower.tower;
+          pendingTower = null;
+          orderIndex++;
+          pendingSite = null;
+          continue;
+        }
+        const plan = wallPlan(g, previousTower.id, pendingTower.tower.id);
         if (!plan.ok) {
           if (plan.reasons.every((reason) => /^need /i.test(reason))) break;
-          throw new Error(`${seed}: cannot join ${pendingTower.key} to Keep: ${plan.reasons.join(', ')}`);
+          throw new Error(`${seed}: cannot join ${pendingTower.key} to previous Tower: ${plan.reasons.join(', ')}`);
         }
         g.player.x = pendingTower.tower.x;
         g.player.y = pendingTower.tower.y;
-        const result = tryBuildWall(g, keep.id, pendingTower.tower.id);
+        const result = tryBuildWall(g, previousTower.id, pendingTower.tower.id);
         if (!result.ok) throw new Error(`${seed}: ${pendingTower.key} wall changed during build`);
         const link = g.walls[g.walls.length - 1];
         timings[`${pendingTower.key}Links`] = 1;
@@ -75,12 +95,15 @@ function simulate(seed) {
         timings[`${pendingTower.key}WallStone`] = plan.cost.stone;
         timings[`${pendingTower.key}TotalStone`] = pendingTower.towerStone + plan.cost.stone;
         timings[`${pendingTower.key}Status`] = towerConnectivity(g, pendingTower.tower);
+        const previousKey = `tower${orderIndex}`;
+        timings[`${previousKey}Status`] = towerConnectivity(g, previousTower);
+        previousTower = pendingTower.tower;
         pendingTower = null;
         orderIndex++;
         pendingSite = null;
         continue;
       }
-      const site = pendingSite || findSite(g, type);
+      const site = pendingSite || findSite(g, type, type === 'tower' ? previousTower : null);
       if (!site) throw new Error(`${seed}: no valid ${type} site for scripted opening`);
       pendingSite = site;
       const current = canPlaceAt(g, site.x, site.y, type);
@@ -115,7 +138,7 @@ function median(values) {
 }
 
 const runs = SEEDS.map(simulate);
-console.log('D98 scripted opening (seconds affordable/built; manual Keep links charged separately)');
+console.log('D99 scripted opening (seconds affordable/built; manual Tower links charged separately)');
 const COLS = ['tower1', 'tower2', 'farm', 'quarry', 'mine'];
 console.log('| Seed | Tower 1 (links/segs, wall/total Stone) | Tower 2 (links/segs, wall/total Stone) | Farm | Quarry | Gold Mine |');
 console.log('|---|---:|---:|---:|---:|---:|');

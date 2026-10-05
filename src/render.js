@@ -4,7 +4,7 @@ import { MAP, T, TOWER, PLAYER, DROP, RENDER, VISION, BREACH, WALL, NEST } from 
 import { idx, inBounds, isPassable, hasLineOfSight } from './terrain.js';
 import { polylineTurns } from './roads.js';
 import {
-  towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
+  wallPlan, towerConnectivity, towerMinRange, towerStats, repairTarget, garrisonSlots,
 } from './game.js';
 
 const TP = RENDER.baseTilePx;
@@ -936,13 +936,26 @@ function miniPoint(ctx, rect, x, y, color, size = 2) {
   ctx.fillStyle = color; ctx.fillRect(px - size / 2, py - size / 2, size, size);
 }
 
-function drawMinimap(ctx, g, layers, view) {
-  const mini = updateMinimapTerrain(g, layers);
+function minimapRect(view) {
+  // D100: fit the whole map into the console frame's own canvas.
+  if (view.miniCtx) {
+    const scale = Math.min(view.miniW / MAP.w, view.miniH / MAP.h);
+    const w = MAP.w * scale;
+    const h = MAP.h * scale;
+    return { w, h, x: (view.miniW - w) / 2, y: (view.miniH - h) / 2 };
+  }
   const maxW = Math.min(RENDER.minimapWidthPx || 260, Math.max(150, view.w * 0.27));
   const height = Math.min(RENDER.minimapHeightPx || 130, maxW * MAP.h / MAP.w);
-  const rect = { w: maxW, h: height, x: view.w - maxW - 10, y: view.h - height - 10 };
+  return { w: maxW, h: height, x: view.w - maxW - 10, y: view.h - height - 10 };
+}
+
+function drawMinimap(mainCtx, g, layers, view) {
+  const mini = updateMinimapTerrain(g, layers);
+  const ctx = view.miniCtx || mainCtx;
+  const rect = minimapRect(view);
   ctx.save();
-  ctx.fillStyle = 'rgba(2,3,5,0.94)'; ctx.fillRect(rect.x - 3, rect.y - 3, rect.w + 6, rect.h + 6);
+  if (view.miniCtx) { ctx.fillStyle = '#020304'; ctx.fillRect(0, 0, view.miniW, view.miniH); }
+  else { ctx.fillStyle = 'rgba(2,3,5,0.94)'; ctx.fillRect(rect.x - 3, rect.y - 3, rect.w + 6, rect.h + 6); }
   ctx.imageSmoothingEnabled = false; ctx.drawImage(mini.canvas, rect.x, rect.y, rect.w, rect.h);
 
   for (const site of [...(g.map.stoneSites || []), ...(g.map.goldSites || [])]) {
@@ -1008,7 +1021,7 @@ function drawMinimap(ctx, g, layers, view) {
       ctx.closePath(); ctx.fill();
     }
   }
-  ctx.strokeStyle = '#697384'; ctx.strokeRect(rect.x - 0.5, rect.y - 0.5, rect.w + 1, rect.h + 1);
+  if (!view.miniCtx) { ctx.strokeStyle = '#697384'; ctx.strokeRect(rect.x - 0.5, rect.y - 0.5, rect.w + 1, rect.h + 1); }
   ctx.restore();
   layers.minimapState = { ...rect, exploredTiles: mini.exploredTiles };
 }
@@ -1161,12 +1174,23 @@ function previewLinkTiles(link) {
 function drawWallPreview(ctx, g, view) {
   const a = g.towers.find((tower) => tower.id === g.wallAnchorA);
   const b = g.towers.find((tower) => tower.id === g.wallAnchorB);
+  const candidates = g.towers.filter((tower) => !tower.keep && tower.built && tower.hp > 0 && !tower.destroyed);
+  const candidateKey = [g.wallAnchorA ?? '', g.blockerVersion || 0, g.walls?.length || 0,
+    candidates.map((tower) => tower.id).join(','), Math.floor(g.res?.stone || 0), Math.floor(g.res?.gold || 0)].join('|');
+  if (g.wallPreviewCandidateKey !== candidateKey) {
+    g.wallPreviewCandidateKey = candidateKey;
+    g.wallPreviewCandidates = new Map(a ? candidates
+      .filter((tower) => tower !== a)
+      .map((tower) => [tower.id, wallPlan(g, a.id, tower.id).ok]) : []);
+  }
   ctx.save();
-  for (const tower of g.towers) {
-    if (!tower.built || tower.hp <= 0 || tower.destroyed) continue;
-    const chosen = tower === a || tower === b;
-    ctx.strokeStyle = chosen ? '#ffd666' : 'rgba(123,225,150,0.72)';
-    ctx.lineWidth = localPx(view, chosen ? 4 : 2);
+  for (const tower of candidates) {
+    const chosenA = tower === a;
+    const chosenB = tower === b;
+    const reachable = !a || g.wallPreviewCandidates?.get(tower.id);
+    ctx.strokeStyle = chosenA ? '#ffd666'
+      : reachable ? 'rgba(123,225,150,0.72)' : 'rgba(255,90,90,0.42)';
+    ctx.lineWidth = localPx(view, chosenA || chosenB ? 4 : 2);
     ctx.beginPath(); ctx.arc(tower.x * TP, tower.y * TP, (tower.radius + 0.28) * TP, 0, Math.PI * 2); ctx.stroke();
   }
   if (!a || !b) { ctx.restore(); return; }

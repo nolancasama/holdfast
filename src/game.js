@@ -978,14 +978,17 @@ function towerComponents(g) {
 
 function recomputeTowerConnectivity(g) {
   const components = towerComponents(g);
-  const keepComponent = components.get(g.keepId);
+  const componentSizes = new Map();
+  for (const component of components.values()) {
+    componentSizes.set(component, (componentSizes.get(component) || 0) + 1);
+  }
   const next = Object.create(null);
   for (const t of g.towers) next[t.id] = t.keep ? 'keep'
-    : components.get(t.id) === keepComponent ? 'connected' : 'outpost';
+    : componentSizes.get(components.get(t.id)) >= 2 ? 'connected' : 'outpost';
   g.towerConnectivityCache = next;
 }
 
-/** D89 cached graph accessor. The graph itself changes only with links/deaths. */
+/** D99 cached wall-network accessor. The graph itself changes only with links/deaths. */
 export function towerConnectivity(g, towerOrId) {
   const id = typeof towerOrId === 'object' ? towerOrId?.id : towerOrId;
   const t = g.towers.find((o) => o.id === id);
@@ -1007,6 +1010,7 @@ export function wallPlan(g, aId, bId) {
   const reasons = [];
   const result = { ok: false, reasons, a: aId, b: bId, tiles: [], segments: [], skipped: 0, length: 0,
     cost: { stone: 0, gold: 0 } };
+  if (a?.keep || b?.keep) reasons.push('Walls must connect two Towers.');
   if (!a || !b) { reasons.push('choose two towers'); return result; }
   if (a === b) { reasons.push('choose a different tower'); return result; }
   if (!a.built || !b.built) reasons.push('both towers must be finished');

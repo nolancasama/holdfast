@@ -129,14 +129,16 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     assert(towerConnectivity(g, a) === 'outpost', 'unwalled tower is not an outpost');
   });
 
-  check('D98 manual wall grows from anchor and connects its tower', () => {
+  check('D98/D99 manual wall grows between Towers and connects both', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const a = tower(g, k.x + 10, k.y); finish(g, a);
-    const plan = wallPlan(g, k.id, a.id);
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 18, k.y); finish(g, a, b);
+    const plan = wallPlan(g, a.id, b.id);
+    assert(plan.ok, `Tower-to-Tower wall refused: ${plan.reasons}`);
     const before = g.res.stone;
-    const link = wall(g, k, a);
+    const link = wall(g, a, b);
     assert(g.res.stone === before - plan.cost.stone, 'manual wall charge differs from preview');
+    assert(plan.cost.stone === WALL.costStonePerSegment * plan.segments.length, 'manual wall cost is not per segment');
     assert(link.segments.every((s) => !s.present), 'manual wall appeared all at once');
     g.player.x = k.x - 30; g.player.y = k.y;
     update(g, link.duration * 0.45);
@@ -144,52 +146,70 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     assert(present.length > 0 && present.length < link.segments.length, 'manual wall did not grow progressively');
     run(g, link.duration + 0.5);
     assert(link.built && presentSegments(g, link).length === link.segments.length, 'manual wall did not finish');
-    assert(towerConnectivity(g, a) === 'connected', 'manual wall did not update connectivity');
+    assert(towerConnectivity(g, a) === 'connected' && towerConnectivity(g, b) === 'connected',
+      'manual wall did not connect both towers');
+  });
+
+  check('D99 Keep is never a wall endpoint and refusal charges nothing', () => {
+    const g = gameOn(); rich(g);
+    const k = g.towers[0];
+    const a = tower(g, k.x + 8, k.y); finish(g, a);
+    for (const [aId, bId] of [[a.id, k.id], [k.id, a.id], [k.id, k.id]]) {
+      const plan = wallPlan(g, aId, bId);
+      assert(!plan.ok && plan.reasons[0] === 'Walls must connect two Towers.',
+        `Keep endpoint refusal wrong: ${plan.reasons}`);
+    }
+    const stone = g.res.stone;
+    g.player.x = a.x; g.player.y = a.y;
+    const result = tryBuildWall(g, a.id, k.id);
+    assert(!result.ok && result.reasons[0] === 'Walls must connect two Towers.', 'tryBuildWall accepted the Keep');
+    assert(g.walls.length === 0 && g.res.stone === stone, 'refused Keep wall created or charged');
   });
 
   // --- D81 validity -----------------------------------------------------------
 
-  check('D81 wall needs two finished towers, within length, not duplicated', () => {
+  check('D81/D99 wall needs two finished Towers, within length, not duplicated', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const a = tower(g, k.x + 10, k.y);
-    let plan = wallPlan(g, k.id, a.id);
-    assert(!plan.ok && plan.reasons.includes('both towers must be finished'), `unfinished anchor accepted: ${plan.reasons}`);
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 18, k.y);
     finish(g, a);
-    plan = wallPlan(g, k.id, a.id);
+    let plan = wallPlan(g, a.id, b.id);
+    assert(!plan.ok && plan.reasons.includes('both towers must be finished'), `unfinished anchor accepted: ${plan.reasons}`);
+    finish(g, b);
+    plan = wallPlan(g, a.id, b.id);
     assert(plan.ok, `valid wall refused: ${plan.reasons}`);
-    assert(!wallPlan(g, k.id, 9999).ok, 'a non-tower endpoint was accepted');
-    assert(!wallPlan(g, k.id, k.id).ok, 'a tower was allowed to wall to itself');
-    const far = tower(g, k.x - 14, k.y); finish(g, far);
-    assert(wallPlan(g, k.id, far.id).reasons.some((r) => r.startsWith('too long')), 'over-length wall not refused');
-    wall(g, k, a);
-    assert(wallPlan(g, a.id, k.id).reasons.includes('these towers are already joined'), 'duplicate link accepted');
+    assert(!wallPlan(g, a.id, 9999).ok, 'a non-tower endpoint was accepted');
+    assert(!wallPlan(g, a.id, a.id).ok, 'a tower was allowed to wall to itself');
+    const far = tower(g, k.x - 10, k.y); finish(g, far);
+    assert(wallPlan(g, a.id, far.id).reasons.some((r) => r.startsWith('too long')), 'over-length wall not refused');
+    wall(g, a, b);
+    assert(wallPlan(g, b.id, a.id).reasons.includes('these towers are already joined'), 'duplicate link accepted');
   });
 
   check('D81 wall refuses crossing another tower, an economic building or an existing wall', () => {
     const setup = () => {
       const g = gameOn(); rich(g);
       const k = g.towers[0];
-      const a = tower(g, k.x + 12, k.y); finish(g, a);
-      return { g, k, a };
+      const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 20, k.y); finish(g, a, b);
+      return { g, k, a, b };
     };
     {
-      const { g, k, a } = setup();
-      const m = tower(g, k.x + 6, k.y + 8); finish(g, m);
+      const { g, k, a, b } = setup();
+      const m = tower(g, k.x + 14, k.y + 8); finish(g, m);
       m.y = k.y; // stand it on the line
-      assert(wallPlan(g, k.id, a.id).reasons.includes('crosses another tower'), 'crossing a tower accepted');
+      assert(wallPlan(g, a.id, b.id).reasons.includes('crosses another tower'), 'crossing a tower accepted');
     }
     {
-      const { g, k, a } = setup();
-      g.buildings.push({ id: 77, type: 'farm', x: k.x + 4.5, y: k.y, hp: 10, maxHp: 10, built: true, destroyed: false, rate: 0 });
-      assert(wallPlan(g, k.id, a.id).reasons.includes('crosses an economic building'), 'crossing a building accepted');
+      const { g, k, a, b } = setup();
+      g.buildings.push({ id: 77, type: 'farm', x: k.x + 14, y: k.y, hp: 10, maxHp: 10, built: true, destroyed: false, rate: 0 });
+      assert(wallPlan(g, a.id, b.id).reasons.includes('crosses an economic building'), 'crossing a building accepted');
     }
     {
-      const { g, k, a } = setup();
-      const n = tower(g, k.x + 6, k.y - 6); const s2 = tower(g, k.x + 6, k.y + 6);
+      const { g, k, a, b } = setup();
+      const n = tower(g, k.x + 14, k.y - 6); const s2 = tower(g, k.x + 14, k.y + 6);
       finish(g, n, s2);
       wall(g, n, s2);
-      assert(wallPlan(g, k.id, a.id).reasons.includes('crosses an existing wall'), 'crossing a wall accepted');
+      assert(wallPlan(g, a.id, b.id).reasons.includes('crosses an existing wall'), 'crossing a wall accepted');
     }
   });
 
@@ -197,19 +217,19 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     const map = flatMap();
     const g = gameOn(map); rich(g);
     const k = g.towers[0];
-    const a = tower(g, k.x + 12, k.y); finish(g, a);
-    const plan = wallPlan(g, k.id, a.id);
-    // Keep footprint spans x-1..x+1, tower footprint x+11..x+13: segments x+2..x+10.
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 20, k.y); finish(g, a, b);
+    const plan = wallPlan(g, a.id, b.id);
+    // Tower footprints span x+7..x+9 and x+19..x+21: segments x+10..x+18.
     assert(plan.segments.length === 9, `expected 9 segments, got ${plan.segments.length}`);
     assert(plan.cost.stone === 9 * WALL.costStonePerSegment && !plan.cost.food && !plan.cost.gold, `cost ${JSON.stringify(plan.cost)}`);
-    map.kind[idx(Math.floor(k.x) + 5, Math.floor(k.y))] = T.CLIFF;
-    map.kind[idx(Math.floor(k.x) + 6, Math.floor(k.y))] = T.DEEP;
-    const skipped = wallPlan(g, k.id, a.id);
+    map.kind[idx(Math.floor(k.x) + 11, Math.floor(k.y))] = T.CLIFF;
+    map.kind[idx(Math.floor(k.x) + 12, Math.floor(k.y))] = T.DEEP;
+    const skipped = wallPlan(g, a.id, b.id);
     assert(skipped.skipped === 2 && skipped.segments.length === 7, `skips ${skipped.skipped}, segments ${skipped.segments.length}`);
     assert(skipped.cost.stone === 7 * WALL.costStonePerSegment, 'skipped tiles were charged');
     const stone = g.res.stone;
-    g.player.x = k.x; g.player.y = k.y;
-    const link = tryBuildWall(g, k.id, a.id).link;
+    g.player.x = a.x; g.player.y = a.y;
+    const link = tryBuildWall(g, a.id, b.id).link;
     assert(g.res.stone === stone - skipped.cost.stone, 'Stone not deducted exactly');
     assert(Math.abs(link.duration - (WALL.buildBase + WALL.buildPerTile * 7)) < 1e-9, 'build time does not scale with segments');
   });
@@ -229,20 +249,20 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
   check('D81 wall cannot be started away from both anchors; unaffordable is refused', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const a = tower(g, k.x + 10, k.y); finish(g, a);
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 18, k.y); finish(g, a, b);
     g.player.x = k.x; g.player.y = k.y - 20;
-    assert(!tryBuildWall(g, k.id, a.id).ok && !g.walls.length, 'remote wall started');
-    g.player.x = k.x; g.player.y = k.y;
+    assert(!tryBuildWall(g, a.id, b.id).ok && !g.walls.length, 'remote wall started');
+    g.player.x = a.x; g.player.y = a.y;
     g.res.stone = 5;
-    const r = tryBuildWall(g, k.id, a.id);
+    const r = tryBuildWall(g, a.id, b.id);
     assert(!r.ok && r.reasons.some((x) => x.startsWith('need')), 'unaffordable wall started');
   });
 
   check('D98 an unfinished wall grows segment by segment and is fragile', () => {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
-    const a = tower(g, k.x + 10, k.y); finish(g, a);
-    const link = wall(g, k, a);
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 18, k.y); finish(g, a, b);
+    const link = wall(g, a, b);
     assert(!link.built, 'wall finished instantly');
     assert(link.segments.every((s) => !s.present && !g.blockerGrid[s.i]), 'planned segments blocked before appearing');
     g.player.x = k.x - 30; g.player.y = k.y;
@@ -261,8 +281,9 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     link.segments[2].hp = link.segments[2].maxHp - 1e-9;
     assert(repairTarget(g) === null, 'float residue below max hp reads as damage');
     const g2 = gameOn(); rich(g2);
-    const a2 = tower(g2, g2.towers[0].x + 10, g2.towers[0].y); finish(g2, a2);
-    const link2 = wall(g2, g2.towers[0], a2);
+    const k2 = g2.towers[0];
+    const a2 = tower(g2, k2.x + 8, k2.y); const b2 = tower(g2, k2.x + 18, k2.y); finish(g2, a2, b2);
+    const link2 = wall(g2, a2, b2);
     link2.progress = 1 - 1e-12;
     for (const s2 of link2.segments) s2.hp = s2.maxHp - 1e-7;
     update(g2, 0.01);
@@ -610,13 +631,13 @@ export function runFortress({ check, assert, gameOn, flatMap, rich, run }) {
     const g = gameOn(); rich(g);
     const k = g.towers[0];
     // Only towers anchor walls; the cost grows with every segment.
-    const a = tower(g, k.x + 8, k.y); finish(g, a);
-    const b = tower(g, k.x + 8 + 12, k.y); finish(g, b);
-    const short = wallPlan(g, k.id, a.id);
-    const long = wallPlan(g, a.id, b.id);
+    const a = tower(g, k.x + 8, k.y); const b = tower(g, k.x + 16, k.y); const c = tower(g, k.x + 28, k.y);
+    finish(g, a, b, c);
+    const short = wallPlan(g, a.id, b.id);
+    const long = wallPlan(g, b.id, c.id);
     assert(long.cost.stone > short.cost.stone, 'longer wall is not dearer');
-    assert(!wallPlan(g, k.id, b.id).ok, 'a wall spanning past the length cap was allowed');
-    assert(typeof tryBuildWall(g, k.id, null).ok === 'boolean' && !g.walls.length, 'wall without a second anchor');
+    assert(!wallPlan(g, a.id, c.id).ok, 'a wall spanning past the length cap was allowed');
+    assert(typeof tryBuildWall(g, a.id, null).ok === 'boolean' && !g.walls.length, 'wall without a second anchor');
     void TOWER; void PLAYER; void buildingState; void towerStats; void repairTarget;
   });
 }

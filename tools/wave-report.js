@@ -1,8 +1,8 @@
-// D89-D98 wave-pressure report. Real wave rolls, spawning, pathing, combat,
+// D89-D99 wave-pressure report. Real wave rolls, spawning, pathing, combat,
 // walls and repair; a scripted player sits in the Keep holding Repair. Three
 // defences exercise deliberate manual-wall layouts:
 //   outposts  - the Keep plus two isolated towers with no walls
-//   fortress  - three inner towers joined as a Keep-centred fan,
+//   fortress  - three inner towers joined as an arc around the Keep,
 //               upgraded to W1 on wave 4 and W2 on wave 7
 //   fortress+ - the same, plus three towers extending the wall around the Keep
 // All get a farm and a quarry at the nearest valid sites, then live on the
@@ -59,7 +59,7 @@ function towerSiteNear(g, x, y) {
   return candidates.find((p) => canPlaceAt(g, p.x, p.y, 'tower').ok) || null;
 }
 
-/** Three adjacent towers can be joined as two Keep-centred triangles. */
+/** Three adjacent towers can be joined as an arc protecting the Keep. */
 function innerNetwork(g) {
   const keep = g.towers[0];
   const radius = 7.4;
@@ -102,11 +102,8 @@ function buildWall(g, a, b) {
   return tryBuildWall(g, a.id, b.id).ok;
 }
 
-/** D98: explicitly build the fan/ring after all anchor towers are finished. */
-function buildFortressWalls(g, keep, towers, extended) {
-  const spokes = [[keep, towers[0]], [keep, towers[1]], [keep, towers[2]]];
-  const spokeCount = spokes.filter(([a, b]) => a && b && buildWall(g, a, b)).length;
-  if (spokeCount < 2) return false;
+/** D99: explicitly build a Tower-only arc/ring after all towers are finished. */
+function buildFortressWalls(g, towers, extended) {
   const perimeter = [[towers[0], towers[1]], [towers[1], towers[2]]];
   if (extended) {
     perimeter.push([towers[2], towers[3]], [towers[3], towers[4]],
@@ -114,8 +111,7 @@ function buildFortressWalls(g, keep, towers, extended) {
   }
   // Terrain or another segment can invalidate an individual perimeter edge;
   // keep the valid explicit links instead of discarding the whole seed.
-  for (const [a, b] of perimeter) if (a && b) buildWall(g, a, b);
-  return true;
+  return perimeter.filter(([a, b]) => a && b && buildWall(g, a, b)).length >= 2;
 }
 
 function setup(seed, profile) {
@@ -149,7 +145,7 @@ function setup(seed, profile) {
   }
   if (!finishConstruction(g)) return null;
   if (profile.startsWith('fortress')
-      && !buildFortressWalls(g, keep, towers, profile === 'fortress+')) return null;
+      && !buildFortressWalls(g, towers, profile === 'fortress+')) return null;
   if (!finishConstruction(g)) return null;
   for (const type of ['farm', 'quarry']) {
     const site = nearestSite(g, type);

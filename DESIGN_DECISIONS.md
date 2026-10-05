@@ -1653,3 +1653,36 @@ choices. Separating towers from links makes the cost and intended defensive
 shape legible before either commitment.
 **Rejected:** automatic links on Tower placement, because they spend Stone the
 player did not choose to spend.
+
+### D99 — Walls connect Towers only
+**Decision:** manual walls connect a finished Tower to a different finished
+Tower. The Keep is no longer a wall endpoint: it is what the perimeter
+protects. Connectivity keeps the `keep` / `connected` / `outpost` states, but
+`connected` now means that a Tower belongs to a wall network containing at
+least two Towers; it no longer means linked to the Keep component. Tower
+placement remains wall-free and charges only the Tower cost.
+**Why:** requiring Tower-to-Tower links encourages a real perimeter instead of
+a Keep-centred hub.
+**Rejected:** retaining the Keep as a hub, because it produces degenerate
+spoke layouts; migrating old Keep walls, because no save system exists, so
+refusal in `wallPlan` is sufficient.
+
+### D100 — Classic RTS interface
+**Decision:** the in-game UI follows the layout strategy players know from Age
+of Empires, StarCraft and Warcraft III. An opaque top resource bar shows Stone,
+Gold, Garrison and HP with icons, status pills, Menu and Pause. The D97 phase
+plaque hangs from it at top centre, with alert banners beneath. A full-width
+bottom console holds the minimap (its own canvas) on the left, a selection
+panel in the centre and a 5x3 command card on the right. The selection panel
+has a portrait and two-column stats, shows a commander summary when nothing is
+selected, and shows construction feedback in build mode. The command card has
+icons, hotkey badges, costs and RTS tooltips with refusal reasons. New build
+hotkeys: Q tower, F farm, C quarry, E gold mine; X, B and the other existing
+keys are unchanged. Controls, sound, seed and debug moved into a Menu drawer
+(F10; F1 still opens debug). The map viewport sits between the bars, so the
+camera math is unchanged.
+**Why:** strategy players read this layout without instruction. It frees the
+full map width and puts commands where RTS players look for them.
+**Rejected:** keeping the 320px right side panel, which read as a debug tool
+and took map width; an overlaid translucent console, which would hide the
+player and require camera offsets.

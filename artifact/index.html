@@ -1,144 +1,339 @@
 <title>Holdfast</title>
 <style>
+  /* D100: classic RTS chrome - top resource bar, bottom console (minimap /
+     selection / command card), menu drawer. The map viewport sits between. */
+  @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&display=swap');
   :root {
-    --bg: #0d1016;
-    --panel: #161b24;
-    --panel2: #1d2430;
-    --line: #2b3342;
-    --text: #dfe6f0;
-    --dim: #8c97a8;
-    --gold: #ffd666;
-    --green: #7be196;
-    --red: #ff6b6b;
-    --blue: #7fb6ff;
+    --bg: #0a0908;
+    --stone-hi: #3a342b;
+    --stone: #2a251f;
+    --stone-lo: #18150f;
+    --wood: #1f1810;
+    --bronze-hi: #e5c47e;
+    --bronze: #a8834a;
+    --bronze-lo: #5a4426;
+    --line: #463b2a;
+    --text: #e8dec8;
+    --dim: #9d927c;
+    --parch: #efe2c2;
+    --gold: #f2c95c;
+    --green: #8fd46a;
+    --red: #ec5a4b;
+    --blue: #86b9ff;
+    --stone-col: #c9cfd4;
+    --top-h: 40px;
+    --console-h: 200px;
+    --display: 'Cinzel', 'Trajan Pro', Georgia, 'Times New Roman', serif;
+    --ui: 'Segoe UI', system-ui, -apple-system, Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    background: var(--bg);
-    color: var(--text);
-    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.4 var(--ui); overflow: hidden;
+    font-variant-numeric: tabular-nums;
   }
+  svg.i { width: 1em; height: 1em; fill: currentColor; flex: none; vertical-align: -0.14em; }
+  #icons { position: absolute; width: 0; height: 0; overflow: hidden; }
+
   #boot-error {
     position: fixed; inset: 0; display: grid; place-items: center;
     background: var(--bg); z-index: 100; padding: 30px; text-align: center;
   }
   /* An id selector outranks the UA [hidden] rule, so restate it. */
-  #boot-error[hidden], .overlay[hidden] { display: none !important; }
+  [hidden], #boot-error[hidden], .overlay[hidden] { display: none !important; }
   #boot-error code {
-    display: inline-block; background: var(--panel2); padding: 6px 10px;
-    border-radius: 5px; color: var(--gold); margin: 4px;
+    display: inline-block; background: var(--stone); padding: 6px 10px;
+    border-radius: 3px; color: var(--gold); margin: 4px;
   }
 
-  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
-  #stage { position: relative; overflow: hidden; background: #000; }
-  canvas#game { display: block; width: 100%; height: 100%; }
-  #minimap-note {
-    position: absolute; right: 10px; bottom: 142px; pointer-events: none;
-    color: var(--dim); font-size: 10px; text-shadow: 0 1px 2px #000;
+  /* ---- shared chrome ---- */
+  .chrome {
+    background:
+      repeating-linear-gradient(115deg, rgba(255,255,255,0.012) 0 2px, transparent 2px 7px),
+      linear-gradient(180deg, var(--stone-hi), var(--stone) 38%, var(--stone-lo));
   }
-
-  /* ---- top bar ---- */
-  #topbar {
-    position: absolute; top: 0; left: 0; right: 0;
-    display: flex; gap: 2px; padding: 8px; pointer-events: none; flex-wrap: wrap;
+  .frame {
+    position: relative; border: 1px solid var(--bronze-lo); border-radius: 3px;
+    background: linear-gradient(180deg, rgba(0,0,0,0.42), rgba(0,0,0,0.6));
+    box-shadow: inset 0 0 0 1px #0c0a07, inset 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(229,196,126,0.08);
   }
-  .chip {
-    background: rgba(18,22,30,0.88); border: 1px solid var(--line);
-    border-radius: 5px; padding: 5px 10px; white-space: nowrap;
+  .frame::before, .frame::after {
+    content: ''; position: absolute; width: 9px; height: 9px; pointer-events: none;
+    border: 2px solid var(--bronze); opacity: 0.85;
   }
-  .chip b { color: var(--gold); font-weight: 700; }
-  #pause-toggle { pointer-events: auto; width: auto; margin: 0; padding: 5px 10px; text-align: center; }
-  #pause-toggle.on { color: #171208; background: var(--gold); border-color: var(--gold); font-weight: 700; }
-  .chip.phase-combat { border-color: var(--red); }
-  .chip.phase-warning { border-color: var(--gold); animation: pulse 0.7s infinite alternate; }
-  .chip.phase-prep { border-color: var(--green); }
-  #hud-tower-alarm { color: var(--red); border-color: var(--red); font-weight: 700; animation: pulse 0.45s infinite alternate; }
-  @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
-
-  /* ---- event log ---- */
-  #log {
-    position: absolute; right: 8px; bottom: 150px; width: 330px;
-    display: flex; flex-direction: column-reverse; gap: 2px; pointer-events: none;
-  }
-  #log div {
-    background: rgba(12,15,20,0.82); border-left: 2px solid var(--line);
-    padding: 3px 8px; font-size: 12px; color: var(--dim);
-  }
-  #log div:last-child { color: var(--text); border-left-color: var(--gold); }
-
-  /* ---- side panel ---- */
-  #side {
-    background: var(--panel); border-left: 1px solid var(--line);
-    display: flex; flex-direction: column; overflow-y: auto;
-  }
-  .sec { border-bottom: 1px solid var(--line); padding: 10px 12px; }
-  .sec h2 {
-    margin: 0 0 7px; font-size: 11px; letter-spacing: 0.1em;
-    text-transform: uppercase; color: var(--dim); font-weight: 600;
+  .frame::before { top: -2px; left: -2px; border-right: 0; border-bottom: 0; }
+  .frame::after { bottom: -2px; right: -2px; border-left: 0; border-top: 0; }
+  h2 {
+    margin: 0; font: 700 13px/1.2 var(--display); letter-spacing: 0.06em;
+    color: var(--parch); text-shadow: 0 1px 0 #000;
   }
   .row { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
-  .row span:last-child { color: var(--text); font-weight: 600; }
-  .row span:first-child { color: var(--dim); }
-  .bar { height: 7px; background: #0b0e13; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; margin: 5px 0; }
-  .bar > i { display: block; height: 100%; background: var(--green); }
-  button {
-    font: inherit; background: var(--panel2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px;
-    cursor: pointer; width: 100%; text-align: left; margin-top: 4px;
+  .row > span:last-child { color: var(--text); font-weight: 600; text-align: right; }
+  .row > span:first-child, .row > label { color: var(--dim); }
+  .bar {
+    height: 8px; background: #0a0806; border: 1px solid #3b3122; border-radius: 1px;
+    overflow: hidden; margin: 4px 0; box-shadow: inset 0 1px 2px #000;
   }
-  button:hover:not(:disabled) { background: #26303e; border-color: #3d4a5d; }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-  button .cost { float: right; color: var(--gold); }
-  .keys { color: var(--dim); font-size: 11px; }
+  .bar > i { display: block; height: 100%; background: var(--green); box-shadow: inset 0 1px 0 rgba(255,255,255,0.25); }
+  button {
+    font: inherit; color: var(--text); cursor: pointer;
+    background: linear-gradient(180deg, #3a3228, #241e17);
+    border: 1px solid var(--bronze-lo); border-radius: 3px; padding: 5px 9px;
+    box-shadow: inset 0 1px 0 rgba(255,236,190,0.12), 0 1px 2px rgba(0,0,0,0.6);
+  }
+  button:hover:not(:disabled) { border-color: var(--bronze); background: linear-gradient(180deg, #4a3f30, #2c241b); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.42; cursor: not-allowed; filter: grayscale(0.7); }
+  button .cost { color: var(--gold); }
+  kbd {
+    font: 700 10px/1 var(--ui); color: var(--gold); background: rgba(0,0,0,0.55);
+    border: 1px solid var(--bronze-lo); border-radius: 2px; padding: 2px 3px;
+  }
+  .keys { color: var(--dim); font-size: 11.5px; }
   .keys b { color: var(--text); font-weight: 600; }
   .warn { color: var(--red); }
   .good { color: var(--green); }
   .muted { color: var(--dim); }
+
+  /* ---- layout ---- */
+  #app { display: grid; grid-template-rows: var(--top-h) 1fr var(--console-h); height: 100vh; height: 100dvh; }
+  #stage { position: relative; overflow: hidden; background: #000; min-height: 0; }
+  canvas#game { display: block; width: 100%; height: 100%; }
+
+  /* ---- top resource bar ---- */
+  #topbar {
+    display: flex; align-items: center; gap: 4px; padding: 0 8px; z-index: 6;
+    border-bottom: 2px solid var(--bronze-lo); box-shadow: 0 2px 0 #000, 0 4px 10px rgba(0,0,0,0.6);
+    white-space: nowrap; min-width: 0;
+  }
+  .brand { font: 800 15px/1 var(--display); letter-spacing: 0.14em; color: var(--bronze-hi); margin-right: 10px; text-shadow: 0 1px 0 #000; }
+  .res {
+    display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+    background: linear-gradient(180deg, rgba(0,0,0,0.5), rgba(0,0,0,0.3));
+    border: 1px solid #3b3122; border-radius: 2px; box-shadow: inset 0 1px 3px #000;
+  }
+  .res svg.i { font-size: 17px; }
+  .res b { font-size: 15px; font-weight: 700; color: var(--parch); min-width: 2.2em; }
+  .res .rate { font-size: 11px; color: var(--dim); }
+  .res.stone svg { color: var(--stone-col); }
+  .res.gold svg { color: var(--gold); }
+  .res.food svg { color: #d7a35a; }
+  .res.hp svg { color: var(--red); }
+  .spacer { flex: 1; }
+  .pill { font-size: 11.5px; font-weight: 600; padding: 3px 9px; border: 1px solid #3b3122; border-radius: 2px; background: rgba(0,0,0,0.35); }
+  #topbar button { height: 28px; padding: 0 10px; display: flex; align-items: center; gap: 6px; }
+  #pause-toggle.on { color: #1a1306; background: linear-gradient(180deg, #ffe08a, var(--gold)); border-color: var(--gold); font-weight: 700; }
+
+  /* ---- phase plaque (hangs from the top bar) ---- */
+  .phase-block {
+    position: absolute; z-index: 4; top: 0; left: 50%; transform: translateX(-50%);
+    min-width: 300px; padding: 6px 18px 8px; text-align: center; pointer-events: none;
+    background: linear-gradient(180deg, var(--stone-lo), #0f0d0a);
+    border: 2px solid var(--green); border-top: 0; border-radius: 0 0 10px 10px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.7), inset 0 0 0 1px #000;
+  }
+  #hud-phase { display: block; font: 800 17px/1.15 var(--display); letter-spacing: 0.14em; }
+  #hud-timer { display: block; font-size: 15px; color: var(--gold); font-weight: 700; letter-spacing: 0.04em; }
+  #hud-wave, #hud-incoming { font-size: 12px; color: var(--text); }
+  #hud-incoming { font-weight: 700; color: var(--red); }
+  #hud-wave::after { content: ' · '; color: var(--dim); }
+  #start-wave { display: block; margin: 5px auto 0; padding: 3px 10px; font: 700 11px/1.3 var(--display); letter-spacing: 0.08em; pointer-events: auto; }
+  .phase-block.phase-warning { color: var(--red); border-color: var(--red); animation: warning-pulse 1.2s ease-in-out infinite alternate; }
+  .phase-block.phase-warning.urgent { animation: urgent-pulse 0.38s ease-in-out infinite alternate; }
+  .phase-block.phase-combat { border-color: var(--red); }
+  .phase-block.phase-aftermath { border-color: var(--gold); }
+  .phase-block.paused { border-color: var(--gold); animation: none; }
+  @keyframes pulse { from { opacity: 0.6 } to { opacity: 1 } }
+  @keyframes warning-pulse { from { box-shadow: 0 4px 14px rgba(0,0,0,.7); } to { box-shadow: 0 0 20px rgba(255,70,70,.5); } }
+  @keyframes urgent-pulse { from { transform: translateX(-50%) scale(1); } to { transform: translateX(-50%) scale(1.045); box-shadow: 0 0 24px rgba(255,55,55,.72); } }
+
+  /* ---- alert banners ---- */
+  #alerts {
+    position: absolute; z-index: 3; top: 104px; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px; pointer-events: none;
+  }
+  .alert {
+    font: 700 12px/1.2 var(--display); letter-spacing: 0.08em; padding: 5px 14px;
+    background: rgba(14,10,8,0.9); border: 1px solid var(--line); border-radius: 2px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.6); white-space: nowrap;
+  }
+  #hud-tower-alarm { color: var(--red); border-color: var(--red); animation: pulse 0.45s infinite alternate; }
+  #hud-effects { font-family: var(--ui); letter-spacing: 0; }
+
+  /* ---- event log ---- */
+  #log {
+    position: absolute; left: 8px; bottom: 8px; width: 360px; max-width: calc(100% - 16px);
+    display: flex; flex-direction: column-reverse; gap: 2px; pointer-events: none;
+  }
+  #log div {
+    background: linear-gradient(90deg, rgba(10,8,6,0.85), rgba(10,8,6,0.35));
+    border-left: 2px solid var(--line); padding: 2px 8px; font-size: 12px; color: var(--dim);
+    text-shadow: 0 1px 1px #000;
+  }
+  #log div:last-child { color: var(--parch); border-left-color: var(--gold); }
+
+  /* ---- bottom console ---- */
+  #console {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px;
+    padding: 8px; z-index: 6; min-width: 0;
+    border-top: 2px solid var(--bronze-lo); box-shadow: 0 -2px 0 #000, 0 -4px 12px rgba(0,0,0,0.6);
+  }
+  #mm-frame { width: calc((var(--console-h) - 18px) * 2); max-width: 32vw; padding: 3px; }
+  #minimap { display: block; width: 100%; height: 100%; }
+
+  /* selection / player / build panel (centre) */
+  #selpanel { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; padding: 9px 10px; min-width: 0; overflow: hidden; }
+  .portrait {
+    width: 84px; height: 84px; display: grid; place-items: center; font-size: 50px; color: var(--parch);
+    background: radial-gradient(circle at 50% 35%, #3d3528, #120f0b 75%);
+    border: 2px solid var(--bronze); border-radius: 3px;
+    box-shadow: inset 0 0 12px #000, 0 0 0 1px #000;
+  }
+  .portrait svg { width: 52px; height: 52px; fill: currentColor; filter: drop-shadow(0 2px 2px #000); }
+  #sel-left .bar { margin-top: 7px; }
+  #sel-left .hpnum { text-align: center; font-size: 11.5px; font-weight: 700; }
+  .sel-main { min-width: 0; overflow-y: auto; }
+  .sel-main h2 { font-size: 15px; margin-bottom: 3px; }
+  #sel-empty, #sel-body, #build-panel { max-width: 620px; }
+  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 18px; font-size: 12px; line-height: 1.32; }
+  .stats .row { border-bottom: 1px solid rgba(70,59,42,0.45); }
+  .sel-notes { margin-top: 4px; line-height: 1.3; }
+  .sel-notes.split { display: flex; gap: 14px; flex-wrap: wrap; }
+  #build-panel { display: none; }
+  #app.building #build-panel { display: block; }
+  #app.building #sel-empty, #app.building #sel-body, #app.building #sel-title { display: none !important; }
+  #build-info { font-size: 12.5px; color: var(--text); margin-top: 4px; line-height: 1.5; }
+  #build-state { font-size: 12px; }
+
+  /* command card (right) */
+  #cmd { padding: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(5, 56px); grid-auto-rows: 52px; gap: 5px; }
+  .cbtn, .slot { position: relative; width: 56px; height: 52px; padding: 0; border-radius: 2px; }
+  .slot { background: rgba(0,0,0,0.35); border: 1px solid #241d14; box-shadow: inset 0 1px 4px #000; }
+  .cbtn {
+    display: grid; place-items: center; text-align: center; overflow: hidden;
+    background: radial-gradient(circle at 50% 30%, #4a3f30, #1d1812 80%);
+    border: 1px solid var(--bronze); box-shadow: inset 0 0 0 1px #000, inset 0 2px 0 rgba(255,236,190,0.16), 0 1px 3px #000;
+  }
+  .cbtn svg.i { font-size: 26px; margin-top: -9px; color: var(--parch); filter: drop-shadow(0 1px 1px #000); }
+  .cbtn kbd { position: absolute; top: 2px; left: 2px; padding: 1px 3px; font-size: 9.5px; }
+  .cbtn .cost {
+    position: absolute; left: 1px; right: 1px; bottom: 2px; font-size: 9.5px; font-weight: 700; line-height: 1.1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 1px #000;
+  }
+  .cbtn.blocked .cost { color: #d99a8e; }
+  .cbtn.active { border-color: var(--gold); box-shadow: inset 0 0 0 1px #000, 0 0 0 2px var(--gold), 0 0 10px rgba(242,201,92,0.5); }
+  .cbtn.ok svg.i { color: var(--green); }
+  .cbtn.danger svg.i { color: var(--red); }
+  #cmd:not(.has-tower) .tower-cmd { visibility: hidden; }
+
+  /* RTS tooltip */
+  #tooltip {
+    position: fixed; z-index: 30; max-width: 280px; padding: 8px 10px; pointer-events: none;
+    background: linear-gradient(180deg, #221c15, #120f0b); border: 1px solid var(--bronze);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.8), inset 0 0 0 1px #000; font-size: 12px;
+  }
+  #tooltip .tt-name { font: 700 13px/1.2 var(--display); color: var(--parch); }
+  #tooltip .tt-cost { color: var(--gold); font-weight: 700; margin-top: 3px; }
+  #tooltip .tt-desc { color: var(--dim); margin-top: 3px; }
+  #tooltip .tt-reason { color: var(--red); margin-top: 3px; }
+
+  /* ---- menu drawer ---- */
+  #menu {
+    position: fixed; z-index: 25; top: calc(var(--top-h) + 6px); right: 8px; bottom: calc(var(--console-h) + 6px);
+    width: 340px; max-width: calc(100vw - 16px); overflow-y: auto; padding: 0;
+    border: 1px solid var(--bronze); box-shadow: 0 8px 30px rgba(0,0,0,0.85), inset 0 0 0 1px #000;
+  }
+  #menu header { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--bronze-lo); }
+  #menu header h2 { font-size: 16px; }
+  .sec { border-bottom: 1px solid var(--line); padding: 10px 12px; }
+  .sec h2 { font-size: 11.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--bronze-hi); margin-bottom: 7px; }
   #debug-body { display: none; }
   #debug-body.open { display: block; }
-  #debug-body button { width: auto; margin-right: 4px; }
+  #debug-body button { margin: 0 4px 4px 0; }
+  #sfx-mute { margin-top: 6px; width: 100%; }
 
   /* ---- overlays ---- */
   .overlay {
-    position: absolute; inset: 0; display: grid; place-items: center;
-    background: rgba(8,10,14,0.92); z-index: 20; padding: 20px;
+    position: fixed; inset: 0; display: grid; place-items: center; z-index: 40; padding: 20px;
+    background: radial-gradient(ellipse at center, rgba(30,24,16,0.9), rgba(5,4,3,0.97));
   }
-  .overlay[hidden] { display: none; }
-  .card { max-width: 760px; width: 100%; }
-  .card h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: 0.02em; }
-  .card p.lede { color: var(--dim); margin: 0 0 18px; }
+  .card {
+    max-width: 780px; width: 100%; padding: 26px 28px; max-height: 100%; overflow-y: auto;
+    border: 1px solid var(--bronze); box-shadow: 0 10px 40px #000, inset 0 0 0 1px #000, inset 0 0 0 4px rgba(168,131,74,0.18);
+  }
+  .card h1 { margin: 0 0 4px; font: 800 34px/1.1 var(--display); letter-spacing: 0.12em; color: var(--bronze-hi); text-shadow: 0 2px 0 #000; }
+  .card p.lede { color: var(--dim); margin: 0 0 18px; font-size: 14px; }
   .picks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .pick {
-    background: var(--panel); border: 2px solid var(--line); border-radius: 7px;
-    padding: 12px; cursor: pointer;
+    background: linear-gradient(180deg, rgba(0,0,0,0.25), rgba(0,0,0,0.5)); border: 1px solid var(--line);
+    border-radius: 3px; padding: 12px; cursor: pointer; box-shadow: inset 0 0 0 1px #000;
   }
-  .pick:hover, .pick.on { border-color: var(--gold); }
-  .pick h3 { margin: 0 0 4px; font-size: 15px; }
+  .pick:hover, .pick.on { border-color: var(--gold); box-shadow: inset 0 0 0 1px #000, 0 0 0 1px var(--gold), 0 0 14px rgba(242,201,92,0.25); }
+  .pick h3 { margin: 0 0 4px; font: 700 16px/1.2 var(--display); letter-spacing: 0.05em; }
   .pick ul { margin: 8px 0 0; padding-left: 16px; color: var(--dim); font-size: 12px; }
-  .seedrow { display: flex; gap: 8px; align-items: center; margin: 16px 0 10px; }
+  .seedrow { display: flex; gap: 8px; align-items: center; margin: 16px 0 10px; flex-wrap: wrap; }
   .seedrow input {
-    font: inherit; background: var(--panel2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 4px; padding: 6px 9px; width: 160px;
+    font: inherit; background: #0d0b08; color: var(--text);
+    border: 1px solid var(--bronze-lo); border-radius: 2px; padding: 6px 9px; width: 160px;
   }
-  .start { background: var(--gold); color: #171208; border: none; font-weight: 700; padding: 10px; text-align: center; }
-  .start:hover { background: #ffe08a; }
-
-  @media (prefers-reduced-motion: reduce) { .chip.phase-warning, #hud-tower-alarm { animation: none; } }
-  button:focus-visible, .start:focus-visible, .seedrow input:focus-visible {
-    outline: 2px solid var(--gold); outline-offset: 2px;
+  .start {
+    width: 100%; margin-top: 4px; padding: 11px; text-align: center;
+    font: 800 15px/1 var(--display); letter-spacing: 0.16em; color: #1a1306;
+    background: linear-gradient(180deg, #ffe08a, var(--gold) 55%, #b88a2e); border: 1px solid #fff0b8;
   }
+  .start:hover:not(:disabled) { background: linear-gradient(180deg, #fff0b8, #ffd76e 55%, #c99a3a); border-color: #fff; }
+  #end-title { font-size: 30px; }
+  #end-stats .row { border-bottom: 1px solid var(--line); padding: 3px 0; }
 
-  /* Phone width: stack the HUD under the battlefield so nothing scrolls sideways. */
-  @media (max-width: 720px) {
-    #app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
-    #stage { height: 58vh; height: 58dvh; }
-    #side { border-left: none; border-top: 1px solid var(--line); max-height: 42vh; max-height: 42dvh; }
+  @media (prefers-reduced-motion: reduce) { .phase-block.phase-warning, #hud-tower-alarm { animation: none; } }
+  button:focus-visible, .start:focus-visible, .seedrow input:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  /* Narrower screens: drop the rates and brand first, then the minimap. */
+  @media (max-width: 1180px) {
+    .res .rate, .brand { display: none; }
+    #mm-frame { max-width: 26vw; }
+  }
+  @media (max-width: 760px) {
+    :root { --console-h: 236px; }
+    #topbar { overflow-x: auto; }
+    #topbar .pill { display: none; }
+    #console { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+    #mm-frame { display: none; }
+    #cmd { order: -1; justify-self: center; }
+    .grid { grid-template-columns: repeat(5, 52px); grid-auto-rows: 40px; }
+    .cbtn, .slot { width: 52px; height: 40px; }
+    .cbtn svg.i { font-size: 18px; }
+    #selpanel { grid-template-columns: minmax(0, 1fr); }
+    #sel-left { display: none; }
     .picks { grid-template-columns: 1fr; }
     #log { display: none; }
+    .phase-block { min-width: 0; width: max-content; max-width: calc(100% - 16px); }
   }
 </style>
+<svg id="icons" aria-hidden="true">
+  <symbol id="i-stone" viewBox="0 0 24 24"><path d="M3 15l3-6 6-2 6 3 3 6-3 4H7z" opacity=".9"/><path d="M8 11l4-1 3 2-1 3-4 1-3-2z" fill="#000" opacity=".25"/></symbol>
+  <symbol id="i-gold" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5.6" fill="#000" opacity=".22"/><path d="M11 8h2v8h-2z" fill="#000" opacity=".35"/></symbol>
+  <symbol id="i-food" viewBox="0 0 24 24"><path d="M12 2l7 3v6c0 5-3 9-7 11-4-2-7-6-7-11V5z"/><path d="M12 5l4 1.7V11c0 3-1.6 5.6-4 7z" fill="#000" opacity=".25"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21C5 15 2 12 2 8a5 5 0 0110-1 5 5 0 0110 1c0 4-3 7-10 13z"/></symbol>
+  <symbol id="i-tower" viewBox="0 0 24 24"><path d="M5 2h3v2h2V2h4v2h2V2h3v6l-2 2v12H7V10L5 8z"/><path d="M10 22v-4a2 2 0 014 0v4z" fill="#000" opacity=".45"/><path d="M11 11h2v3h-2z" fill="#000" opacity=".45"/></symbol>
+  <symbol id="i-keep" viewBox="0 0 24 24"><path d="M2 9h3V7h2v2h2V5h2V3h2v2h2v4h2V7h2v2h3v13H2z"/><path d="M10 22v-5a2 2 0 014 0v5z" fill="#000" opacity=".45"/><path d="M5 12h2v3H5zm12 0h2v3h-2z" fill="#000" opacity=".4"/></symbol>
+  <symbol id="i-wall" viewBox="0 0 24 24"><path d="M2 6h3V4h3v2h3V4h2v2h3V4h3v2h3v15H2z"/><path d="M2 10h20v1H2zm0 5h20v1H2zM8 6v4h1V6zm7 0v4h1V6zM5 11v4h1v-4zm6 0v4h1v-4zm7 0v4h1v-4zM8 16v5h1v-5zm7 0v5h1v-5z" fill="#000" opacity=".4"/></symbol>
+  <symbol id="i-farm" viewBox="0 0 24 24"><path d="M11.2 22V9h1.6v13z"/><path d="M12 9C8.5 9 7.5 6 7.5 3.5 11 3.5 12 6 12 9zm0 0c3.5 0 4.5-3 4.5-5.5C13 3.5 12 6 12 9zm0 5.5c-3.5 0-4.5-3-4.5-5.5 3.5 0 4.5 2.5 4.5 5.5zm0 0c3.5 0 4.5-3 4.5-5.5-3.5 0-4.5 2.5-4.5 5.5zm0 5c-3.5 0-4.5-3-4.5-5.5 3.5 0 4.5 2.5 4.5 5.5zm0 0c3.5 0 4.5-3 4.5-5.5-3.5 0-4.5 2.5-4.5 5.5z"/></symbol>
+  <symbol id="i-quarry" viewBox="0 0 24 24"><path d="M3 21l9.5-9.5 1.6 1.6L4.6 22.6z"/><path d="M8 4c4-2 9-1.5 13 2l-1.4 1.4C17 5.6 14 4.8 11 5.5l3.5 3.5-2 2L8.5 7C7.6 9.8 8.4 12.8 10 15L8.6 16.4C5.4 12.6 5 7.6 8 4z"/></symbol>
+  <symbol id="i-mine" viewBox="0 0 24 24"><path d="M2 21h20l-3-7H5z"/><path d="M6 13l2-5h8l2 5z" opacity=".85"/><circle cx="9" cy="17.5" r="1.6" fill="#000" opacity=".35"/><circle cx="14.5" cy="18" r="1.3" fill="#000" opacity=".35"/><path d="M12 2l1.4 2.8L16 5.5l-2 2 .5 2.8L12 9l-2.5 1.3.5-2.8-2-2 2.6-.7z"/></symbol>
+  <symbol id="i-sword" viewBox="0 0 24 24"><path d="M20 2h2v2L10 16l-2-2z"/><path d="M5 13l6 6-1.5 1.5-1.8-1.8-3 3L3 20l3-3-1.8-1.8z"/><path d="M14 4l2-2v3zm6 6l2-2h-3z" opacity=".7"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 2l7 3v6c0 5-3 9-7 11-4-2-7-6-7-11V5z" opacity=".35"/><path d="M11 7h2v4h4v2h-4v4h-2v-4H7v-2h4z"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M12 2l7 3v6c0 5-3 9-7 11-4-2-7-6-7-11V5z" opacity=".35"/><path d="M7 11h10v2H7z"/></symbol>
+  <symbol id="i-hammer" viewBox="0 0 24 24"><path d="M13 3l8 8-2.5 2.5-2-2L7 21l-4-4 9.5-9.5-2-2z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M9 16.2l-4.2-4.2-1.4 1.4L9 19 21 7l-1.4-1.4z"/></symbol>
+  <symbol id="i-cross" viewBox="0 0 24 24"><path d="M18.3 5.7L12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7l-1.4-1.4L9.2 12 2.9 5.7l1.4-1.4 6.3 6.3 6.3-6.3z"/></symbol>
+  <symbol id="i-repair" viewBox="0 0 24 24"><path d="M21 7a5 5 0 01-6.6 4.7L6 20a2 2 0 01-2.8-2.8l8.3-8.4A5 5 0 0117 3l-3 3 1 3 3 1z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M10 2h4l.6 2.6 1.8.8 2.3-1.4 2.8 2.8-1.4 2.3.8 1.8L23 11v4l-2.6.6-.8 1.8 1.4 2.3-2.8 2.8-2.3-1.4-1.8.8L14 24h-4l-.6-2.6-1.8-.8-2.3 1.4-2.8-2.8 1.4-2.3-.8-1.8L1 15v-4l2.6-.6.8-1.8L3 6.3 5.8 3.5l2.3 1.4 1.8-.8zM12 9a4 4 0 100 8 4 4 0 000-8z"/></symbol>
+  <symbol id="i-player" viewBox="0 0 24 24"><path d="M12 2a4 4 0 014 4v1h-8V6a4 4 0 014-4zM7 8h10l-1 4h-8zM6 13h12l2 9H4z"/></symbol>
+</svg>
+
 <div id="boot-error" hidden>
   <div>
     <h1>Holdfast needs a local web server</h1>
@@ -150,139 +345,146 @@
 </div>
 
 <div id="app">
+  <header id="topbar" class="chrome">
+    <span class="brand">HOLDFAST</span>
+    <div class="res stone" title="Stone: towers, walls, buildings and repair"><svg class="i"><use href="#i-stone"/></svg><b id="hud-stone">0</b><span class="rate" id="hud-stone-rate">+0.00/s</span></div>
+    <div class="res gold" title="Gold: weapon upgrades and Gold Mines"><svg class="i"><use href="#i-gold"/></svg><b id="hud-gold">0</b><span class="rate" id="hud-gold-rate">+0.00/s</span></div>
+    <div class="res food" title="Garrison: soldiers garrisoned / soldiers fed by Farms"><svg class="i"><use href="#i-food"/></svg><b id="hud-food">0/0</b><span class="rate" id="hud-food-rate">fed by farms</span></div>
+    <div class="res hp" title="Player health"><svg class="i"><use href="#i-heart"/></svg><b id="hud-hp">100</b></div>
+    <span class="spacer"></span>
+    <span class="pill" id="hud-occ">Unoccupied</span>
+    <span class="pill" id="hud-danger">OPEN GROUND</span>
+    <button id="menu-toggle" title="Menu [F10]"><svg class="i"><use href="#i-gear"/></svg>Menu</button>
+    <button id="pause-toggle">[P] Pause</button>
+  </header>
+
   <div id="stage">
     <canvas id="game"></canvas>
 
-    <div id="topbar">
-      <div class="chip" title="Food supports soldiers: garrisoned / supported">Garrison <b id="hud-food">0/0</b> <span class="muted" id="hud-food-rate">fed by farms</span></div>
-      <div class="chip" id="hud-deficit" hidden>SUPPLY DEFICIT</div>
-      <div class="chip">Stone <b id="hud-stone">0</b> <span class="muted" id="hud-stone-rate">+0.00/s</span></div>
-      <div class="chip">Gold <b id="hud-gold">0</b> <span class="muted" id="hud-gold-rate">+0.00/s</span></div>
-      <div class="chip" id="hud-phase-chip">Wave <b id="hud-wave">1</b> · <span id="hud-phase">PREP</span> <b id="hud-timer"></b></div>
-      <div class="chip">HP <b id="hud-hp">100</b></div>
-      <button id="pause-toggle">[P] Pause</button>
-      <div class="chip" id="hud-occ">Unoccupied</div>
-      <div class="chip" id="hud-danger">SAFE DURING PREP</div>
-      <div class="chip" id="hud-tower-alarm" hidden>TOWER UNDER ATTACK</div>
-      <div class="chip muted" id="hud-seed">seed</div>
-      <div class="chip" id="hud-effects" hidden></div>
+    <div class="phase-block phase-prep" id="hud-phase-chip">
+      <span id="hud-phase">EXPANSION</span>
+      <span id="hud-timer">NEXT ASSAULT 02:00</span>
+      <span id="hud-wave">WAVE 1</span><span id="hud-incoming">Incoming: UNKNOWN</span>
+      <button id="start-wave">START NEXT WAVE [T]</button>
+    </div>
+
+    <div id="alerts">
+      <div class="alert" id="hud-tower-alarm" hidden>TOWER UNDER ATTACK</div>
+      <div class="alert" id="hud-deficit" hidden>SUPPLY DEFICIT</div>
+      <div class="alert" id="hud-effects" hidden></div>
     </div>
 
     <div id="log"></div>
-    <div id="minimap-note">MINIMAP</div>
-
-    <div class="overlay" id="select-overlay">
-      <div class="card">
-        <h1>Holdfast</h1>
-        <p class="lede">During combat, towers are safe islands and open ground belongs to the enemy. Survive the final wave.</p>
-        <div class="picks" id="picks"></div>
-        <div class="seedrow">
-          <label for="seed-input">Seed</label>
-          <input id="seed-input" maxlength="12" />
-          <button id="reroll" style="width:auto">Reroll</button>
-          <span class="muted">Same seed = same map.</span>
-        </div>
-        <button class="start" id="start-btn">Start run</button>
-        <p class="keys" style="margin-top:14px">
-          <b>WASD</b> move · <b>B</b> build menu · <b>Enter</b>/<b>click</b> build here / select structure ·
-          <b>R</b> hold to repair · <b>1</b> weapon upgrade · <b>G</b> garrison · <b>- / =</b> zoom · <b>Space</b> melee · <b>P</b> pause · <b>F1</b> debug
-        </p>
-      </div>
-    </div>
-
-    <div class="overlay" id="end-overlay" hidden>
-      <div class="card" style="max-width:520px">
-        <h1 id="end-title">Run over</h1>
-        <p class="lede" id="end-sub"></p>
-        <div id="end-stats"></div>
-        <button class="start" id="again-btn" style="margin-top:16px">New run</button>
-      </div>
-    </div>
   </div>
 
-  <div id="side">
-    <div class="sec">
-      <h2>Run</h2>
-      <div class="row"><span>Character</span><span id="p-arch">—</span></div>
-      <div class="row"><span>Player HP</span><span id="p-hp">—</span></div>
-      <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
-      <div class="row"><span>Production</span><span id="p-income">S 0.00 · G 0.00 /s</span></div>
-      <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
-      <div class="row"><span>Buildings</span><span id="p-buildings">0</span></div>
-      <div class="row"><span>Combat danger</span><span id="p-danger">safe during prep</span></div>
-      <div class="row"><span>Equipment</span><span id="p-equipment">None</span></div>
-    </div>
+  <footer id="console" class="chrome">
+    <div id="mm-frame" class="frame"><canvas id="minimap"></canvas></div>
 
-    <div class="sec">
-      <h2 id="sel-title">Selected structure</h2>
-      <div id="sel-empty" class="muted">Click a tower or economic building, or stand in a tower.</div>
-      <div id="sel-body" hidden>
-        <div class="row"><span>State</span><span id="sel-state">—</span></div>
-        <div class="row"><span>Health</span><span id="sel-hp">—</span></div>
-        <div class="bar"><i id="sel-hpbar"></i></div>
-        <div class="row"><span>Production</span><span id="sel-prod">—</span></div>
-        <div class="row"><span>Damage</span><span id="sel-dmg">—</span></div>
-        <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
-        <div class="row"><span>Range</span><span id="sel-range">—</span></div>
-        <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
-        <div class="row" id="sel-garrison-row"><span>Garrison</span><span>
-          <button id="garrison-minus" style="width:auto; padding:0 8px" title="Withdraw a soldier [Shift+G]">−</button>
-          <b id="sel-garrison">0 / 1</b>
-          <button id="garrison-plus" style="width:auto; padding:0 8px" title="Assign a soldier [G]">+</button>
-        </span></div>
-        <div class="keys" id="sel-garrison-note"></div>
-        <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:4px" hidden>
-          <div class="row"><span id="sel-upgrade-label"></span><span id="sel-upgrade-time"></span></div>
-          <div class="bar"><i id="sel-upgrade-bar" style="background:var(--blue)"></i></div>
-          <div id="sel-upgrade-rate" style="text-align:right"></div>
+    <div id="selpanel" class="frame">
+      <div id="sel-left">
+        <div class="portrait" id="sel-portrait"><svg><use href="#i-player"/></svg></div>
+      </div>
+      <div class="sel-main">
+        <h2 id="sel-title">Commander</h2>
+        <div id="sel-empty">
+          <div class="row"><span>Health</span><span id="p-hp">—</span></div>
+          <div class="bar"><i id="p-hpbar" style="width:100%"></i></div>
+          <div class="stats">
+            <div class="row"><span>Class</span><span id="p-arch">—</span></div>
+            <div class="row"><span>Towers</span><span id="p-towers">0</span></div>
+            <div class="row"><span>Danger</span><span id="p-danger">open ground</span></div>
+            <div class="row"><span>Buildings</span><span id="p-buildings">0</span></div>
+            <div class="row"><span>Equipment</span><span id="p-equipment">None</span></div>
+            <div class="row"><span>Production</span><span id="p-income">S 0.00 · G 0.00 /s</span></div>
+          </div>
+          <div class="keys sel-notes">Click a tower or building to select it, or stand in a tower.</div>
         </div>
-        <button id="up-weapon">[1] Weapon upgrade<span class="cost"></span></button>
-        <div class="row" style="margin-top:6px"><span>Repair cost</span><span id="sel-repair">—</span></div>
-        <div class="keys" id="sel-repair-note"></div>
+        <div id="sel-body" hidden>
+          <div class="row"><span id="sel-state">—</span><span id="sel-hp">—</span></div>
+          <div class="bar"><i id="sel-hpbar"></i></div>
+          <div class="stats">
+            <div class="row"><span>Damage</span><span id="sel-dmg">—</span></div>
+            <div class="row"><span>Range</span><span id="sel-range">—</span></div>
+            <div class="row"><span>Fire rate</span><span id="sel-rate">—</span></div>
+            <div class="row"><span>Levels</span><span id="sel-levels">—</span></div>
+            <div class="row"><span>Role</span><span id="sel-prod">—</span></div>
+            <div class="row" id="sel-garrison-row"><span>Garrison</span><b id="sel-garrison">0 / 1</b></div>
+            <div class="row"><span>Repair</span><span id="sel-repair">—</span></div>
+          </div>
+          <div id="sel-upgrade" class="keys" style="color:var(--blue); margin-top:3px" hidden>
+            <div class="row"><span id="sel-upgrade-label"></span><span id="sel-upgrade-time"></span></div>
+            <div class="bar"><i id="sel-upgrade-bar" style="background:var(--blue)"></i></div>
+            <div id="sel-upgrade-rate" style="text-align:right"></div>
+          </div>
+          <div class="sel-notes split">
+            <div class="keys" id="sel-garrison-note"></div>
+            <div class="keys" id="sel-repair-note"></div>
+          </div>
+        </div>
+        <div id="build-panel">
+          <h2>Construction <span id="build-state" class="muted"></span></h2>
+          <div id="build-info">Choose a structure and build nearby.</div>
+        </div>
       </div>
     </div>
 
-    <div class="sec">
-      <h2>Build <span id="build-state" class="muted"></span></h2>
-      <button id="build-toggle">[B] Toggle build mode</button>
-      <div id="build-choices">
-        <button id="build-tower">Tower<span class="cost" id="build-tower-cost"></span></button>
-        <button id="build-farm">Farm<span class="cost" id="build-farm-cost"></span></button>
-        <button id="build-quarry">Quarry<span class="cost" id="build-quarry-cost"></span></button>
-        <button id="build-mine">Gold Mine<span class="cost" id="build-mine-cost"></span></button>
-      </div>
-      <button id="build-confirm" disabled>Build here [Enter]</button>
-      <div id="build-info" class="keys" style="margin-top:6px">Press B, walk to a site, Enter to build here. Towers create their own wall links.</div>
-    </div>
+    <div id="cmd" class="frame">
+      <div class="grid">
+        <button class="cbtn" id="build-tower" data-tip="Build Tower" data-key="Q" data-desc="Defensive tower. Towers are the corners walls connect."><kbd>Q</kbd><svg class="i"><use href="#i-tower"/></svg><span class="cost" id="build-tower-cost"></span></button>
+        <button class="cbtn" id="build-wall" data-tip="Build Wall" data-key="X" data-desc="Select two finished Towers to join them with a wall. The Keep cannot anchor walls."><kbd>X</kbd><svg class="i"><use href="#i-wall"/></svg><span class="cost" id="build-wall-cost"></span></button>
+        <button class="cbtn" id="build-farm" data-tip="Build Farm" data-key="F" data-desc="Feeds garrison soldiers. Needs fertile ground."><kbd>F</kbd><svg class="i"><use href="#i-farm"/></svg><span class="cost" id="build-farm-cost"></span></button>
+        <button class="cbtn" id="build-quarry" data-tip="Build Quarry" data-key="C" data-desc="Produces Stone. Needs an unclaimed stone site."><kbd>C</kbd><svg class="i"><use href="#i-quarry"/></svg><span class="cost" id="build-quarry-cost"></span></button>
+        <button class="cbtn" id="build-mine" data-tip="Build Gold Mine" data-key="E" data-desc="Produces Gold. Needs an unclaimed gold site."><kbd>E</kbd><svg class="i"><use href="#i-mine"/></svg><span class="cost" id="build-mine-cost"></span></button>
 
+        <button class="cbtn tower-cmd" id="up-weapon" data-tip="Weapon upgrade" data-key="1" data-desc="Timed upgrade: more damage. Stand at the tower to start it."><kbd>1</kbd><svg class="i"><use href="#i-sword"/></svg><span class="cost"></span></button>
+        <button class="cbtn tower-cmd" id="garrison-plus" data-tip="Assign soldier" data-key="G" data-desc="+20% fire rate and +15% damage per soldier. Needs free Food support."><kbd>G</kbd><svg class="i"><use href="#i-plus"/></svg><span class="cost">+1</span></button>
+        <button class="cbtn tower-cmd" id="garrison-minus" data-tip="Withdraw soldier" data-key="⇧G" data-desc="Return a soldier to the free pool."><kbd>⇧G</kbd><svg class="i"><use href="#i-minus"/></svg><span class="cost">−1</span></button>
+        <div class="slot"></div>
+        <div class="slot"></div>
+
+        <button class="cbtn" id="build-toggle" data-tip="Build mode" data-key="B" data-desc="Toggle construction at your position."><kbd>B</kbd><svg class="i"><use href="#i-hammer"/></svg><span class="cost">build</span></button>
+        <div class="cbtn" id="repair-hint" data-tip="Repair" data-key="R" data-desc="Hold R near a damaged structure to repair it with Stone."><kbd>R</kbd><svg class="i"><use href="#i-repair"/></svg><span class="cost">hold</span></div>
+        <div class="slot"></div>
+        <button class="cbtn ok" id="build-confirm" data-tip="Confirm" data-key="Enter" disabled><kbd>↵</kbd><svg class="i"><use href="#i-check"/></svg><span class="cost lbl">build</span></button>
+        <button class="cbtn danger" id="build-cancel" data-tip="Cancel" data-key="Esc" data-desc="Step back: clear wall corner B, then A, then leave build mode." disabled><kbd>Esc</kbd><svg class="i"><use href="#i-cross"/></svg><span class="cost">cancel</span></button>
+      </div>
+    </div>
+  </footer>
+
+  <aside id="menu" class="chrome" hidden>
+    <header><h2>Menu</h2><button id="menu-close" title="Close [Esc]">Close</button></header>
     <div class="sec">
       <h2>Controls</h2>
       <div class="keys">
-        <b>WASD</b> move · <b>B</b> build · <b>Enter</b>/<b>click</b> build here/select<br />
-        <b>R</b> hold repair · <b>1</b> weapon upgrade · <b>G</b> / <b>Shift+G</b> garrison +/− · <b>- / =</b> or wheel zoom · <b>Space</b> melee<br />
-        <b>P</b> pause · <b>Esc</b> cancel build · <b>F1</b> debug panel
+        <b>WASD</b> move · <b>Space</b> melee · <b>R</b> hold repair · <b>- / =</b> or wheel zoom<br />
+        <b>B</b> build mode · <b>Q</b> tower · <b>X</b> wall · <b>F</b> farm · <b>C</b> quarry · <b>E</b> gold mine<br />
+        <b>Enter</b>/<b>click</b> build/select · <b>Esc</b>/<b>right-click</b> step back<br />
+        <b>1</b> weapon upgrade · <b>G</b> / <b>Shift+G</b> garrison +/− · <b>T</b> start wave early<br />
+        <b>P</b> pause · <b>F10</b> menu · <b>F1</b> debug
       </div>
     </div>
-
     <div class="sec">
       <h2>Sound effects</h2>
       <div class="row"><label for="sfx-volume">SFX volume</label><input id="sfx-volume" type="range" min="0" max="1" step="0.05" value="0.62" /></div>
       <button id="sfx-mute">Mute SFX</button>
     </div>
-
+    <div class="sec">
+      <h2>Map</h2>
+      <div class="keys" id="hud-seed">seed</div>
+    </div>
     <div class="sec">
       <h2 style="cursor:pointer" id="debug-toggle">Debug tools [F1] ▾</h2>
       <div id="debug-body">
-        <button id="d-mat" style="width:auto">+500 Resources</button>
-        <button id="d-wave" style="width:auto">Next wave</button>
-        <button id="d-spawn" style="width:auto">Spawn group at cursor</button>
-        <button id="d-dmg" style="width:auto">Damage tower 25%</button>
-        <button id="d-kill" style="width:auto">Destroy tower</button>
-        <button id="d-paths" style="width:auto">Toggle paths</button>
-        <button id="d-roads" style="width:auto">Road debug [U]</button>
-        <button id="d-fog" style="width:auto">Show fog debug [V]</button>
-        <button id="d-pause" style="width:auto">Pause spawning</button>
-        <button id="d-regen" style="width:auto">Regenerate map</button>
+        <button id="d-mat">+500 Resources</button>
+        <button id="d-wave">Next wave</button>
+        <button id="d-spawn">Spawn group at cursor</button>
+        <button id="d-dmg">Damage tower 25%</button>
+        <button id="d-kill">Destroy tower</button>
+        <button id="d-paths">Toggle paths</button>
+        <button id="d-roads">Road debug [U]</button>
+        <button id="d-fog">Show fog debug [V]</button>
+        <button id="d-pause">Pause spawning</button>
+        <button id="d-regen">Regenerate map</button>
         <div class="keys" style="margin-top:8px">
           <b>M</b> resources · <b>N</b> next wave · <b>Y</b> spawn · <b>K</b> damage ·
           <b>J</b> destroy · <b>H</b> paths · <b>U</b> roads · <b>V</b> fog · <b>L</b> pause spawns · <b>O</b> regen
@@ -290,6 +492,37 @@
         <div class="keys" id="d-mapinfo" style="margin-top:8px"></div>
         <div class="keys" id="d-stuck" style="margin-top:4px">Stuck: 0 detected / 0 recovered / 0 despawned</div>
       </div>
+    </div>
+  </aside>
+
+  <div id="tooltip" hidden></div>
+
+  <div class="overlay" id="select-overlay">
+    <div class="card chrome">
+      <h1>Holdfast</h1>
+      <p class="lede">Raise Towers, join them with Walls, and keep the perimeter around your Keep standing through ten waves.</p>
+      <div class="picks" id="picks"></div>
+      <div class="seedrow">
+        <label for="seed-input">Seed</label>
+        <input id="seed-input" maxlength="12" />
+        <button id="reroll">Reroll</button>
+        <span class="muted">Same seed = same map.</span>
+      </div>
+      <button class="start" id="start-btn">Start run</button>
+      <p class="keys" style="margin-top:14px">
+        <b>WASD</b> move · <b>B</b> build · <b>Q</b> tower · <b>X</b> wall · <b>F</b> farm · <b>C</b> quarry · <b>E</b> mine · <b>T</b> start wave early ·
+        <b>Enter</b>/<b>click</b> build / select · <b>R</b> hold to repair · <b>1</b> weapon upgrade · <b>G</b> garrison · <b>- / =</b> zoom ·
+        <b>Space</b> melee · <b>P</b> pause · <b>F10</b> menu · <b>F1</b> debug
+      </p>
+    </div>
+  </div>
+
+  <div class="overlay" id="end-overlay" hidden>
+    <div class="card chrome" style="max-width:520px">
+      <h1 id="end-title">Run over</h1>
+      <p class="lede" id="end-sub"></p>
+      <div id="end-stats"></div>
+      <button class="start" id="again-btn" style="margin-top:16px">New run</button>
     </div>
   </div>
 </div>
